@@ -2,6 +2,7 @@ package b2bua
 
 import (
 	"fmt"
+	"net"
 	"sync"
 
 	"github.com/AlchemillaHQ/Difuse-B2BUA/config"
@@ -216,7 +217,7 @@ func NewB2BUA(cfg *config.Config) *B2BUA {
 					&account.AuthInfo{
 						AuthUser: upstream.UpstreamUser,
 						Password: upstream.Password,
-						Realm:    upstream.UpstreamHost,
+						Realm:    realmFromHost(upstream.UpstreamHost),
 					},
 					0,
 					stack,
@@ -359,6 +360,15 @@ func (b *B2BUA) Shutdown() {
 	b.ua.Shutdown()
 }
 
+// realmFromHost returns just the hostname portion of a host-or-host:port string,
+// suitable for use as the SIP digest auth realm.
+func realmFromHost(hostport string) string {
+	if host, _, err := net.SplitHostPort(hostport); err == nil {
+		return host
+	}
+	return hostport
+}
+
 func mustParseUri(raw string) sip.Uri {
 	uri, err := parser.ParseUri(raw)
 	if err != nil {
@@ -424,7 +434,7 @@ func (b *B2BUA) AddUpstreamAccount(localUser, upstreamHost, upstreamUser, passwo
 		&account.AuthInfo{
 			AuthUser: upstreamUser,
 			Password: password,
-			Realm:    upstreamHost,
+			Realm:    realmFromHost(upstreamHost),
 		},
 		3600,
 		b.stack,
