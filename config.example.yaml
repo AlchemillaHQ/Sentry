@@ -1,18 +1,34 @@
 sip:
   udp_addr: "0.0.0.0:5060"
   tcp_addr: "0.0.0.0:5060"
-  # Uncomment to enable TLS/WSS (paths are relative to working directory):
   # tls_addr: "0.0.0.0:5061"
-  # wss_addr: "0.0.0.0:5081"
   # tls_cert: "certs/cert.pem"
   # tls_key:  "certs/key.pem"
-  dns: "8.8.8.8"
-  disable_auth: false
+  external_ip: ""  # Public IP/hostname for SIP Contact headers. Auto-detected if empty.
+  user_agent: "Difuse-B2BUA/1.0"
 
-pprof:
-  # Never expose pprof to 0.0.0.0 in production.
-  addr: "127.0.0.1:6658"
+api:
+  addr: "0.0.0.0:8080"
+  # tls_cert: "certs/api-cert.pem"
+  # tls_key:  "certs/api-key.pem"
+
+database:
+  driver: "sqlite"          # "sqlite" or "postgres"
+  dsn: "difuse.db"          # For postgres: "host=localhost user=difuse password=secret dbname=difuse port=5432 sslmode=disable"
+
+secrets:
+  encryption_key: "change-me-32-byte-key-here!!!!!"  # Exactly 32 bytes for AES-256-GCM
 
 push:
-  apns_cert: "./voip-callkeep.p12"
-  fcm_service_account: "service-account.json"
+  fcm_service_account: ""   # Path to Firebase service account JSON
+  apns_cert: ""             # Path to APNs .p12 certificate
+  apns_key_id: ""
+  apns_team_id: ""
+  apns_bundle_id: ""
+  apns_production: false
+
+pprof:
+  addr: ""                  # e.g. "127.0.0.1:6060". Empty = disabled.
+
+log:
+  level: "info"             # debug, info, warn, error

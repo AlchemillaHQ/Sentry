@@ -1,167 +1,166 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
 
-	"github.com/AlchemillaHQ/Difuse-B2BUA/b2bua"
+	"github.com/AlchemillaHQ/Difuse-B2BUA/api"
+	"github.com/AlchemillaHQ/Difuse-B2BUA/callmanager"
 	"github.com/AlchemillaHQ/Difuse-B2BUA/config"
-	"github.com/c-bata/go-prompt"
-	"github.com/cloudwebrtc/go-sip-ua/pkg/utils"
-	"github.com/ghettovoice/gosip/log"
+	"github.com/AlchemillaHQ/Difuse-B2BUA/db"
+	"github.com/AlchemillaHQ/Difuse-B2BUA/push"
+	"github.com/AlchemillaHQ/Difuse-B2BUA/secrets"
+	"github.com/AlchemillaHQ/Difuse-B2BUA/sipstack"
 )
 
-func completer(d prompt.Document) []prompt.Suggest {
-	s := []prompt.Suggest{
-		{Text: "users", Description: "Show sip accounts"},
-		{Text: "onlines", Description: "Show online sip devices"},
-		{Text: "calls", Description: "Show active calls"},
-		{Text: "set debug on", Description: "Show debug msg in console"},
-		{Text: "set debug off", Description: "Turn off debug msg in console"},
-		{Text: "show loggers", Description: "Print Loggers"},
-		{Text: "exit", Description: "Exit"},
-	}
-	return prompt.FilterHasPrefix(s, d.GetWordBeforeCursor(), true)
-}
-
-func usage() {
-	fmt.Fprintf(os.Stderr, `go pbx version: go-pbx/1.10.0
-Usage: server [-nc]
-
-Options:
-`)
-	flag.PrintDefaults()
-}
-
-func consoleLoop(b2bua *b2bua.B2BUA) {
-
-	fmt.Println("Please select command.")
-	for {
-		t := prompt.Input("CLI> ", completer,
-			prompt.OptionTitle("GO B2BUA 1.0.0"),
-			prompt.OptionHistory([]string{"calls", "users", "onlines"}),
-			prompt.OptionPrefixTextColor(prompt.Yellow),
-			prompt.OptionPreviewSuggestionTextColor(prompt.Blue),
-			prompt.OptionSelectedSuggestionBGColor(prompt.LightGray),
-			prompt.OptionSuggestionBGColor(prompt.DarkGray))
-
-		switch t {
-		case "show loggers":
-			loggers := utils.GetLoggers()
-			for prefix, log := range loggers {
-				fmt.Printf("%v => %v\n", prefix, log.Level())
-			}
-		case "set debug on":
-			b2bua.SetLogLevel(log.DebugLevel)
-			fmt.Printf("Set Log level to debug\n")
-		case "set debug off":
-			b2bua.SetLogLevel(log.InfoLevel)
-			fmt.Printf("Set Log level to info\n")
-		case "users":
-			fallthrough
-		case "ul": /* user list*/
-			accounts := b2bua.GetAccounts()
-			if len(accounts) > 0 {
-				fmt.Printf("Users:\n")
-				fmt.Printf("Username \t Password\n")
-				for user, pass := range accounts {
-					fmt.Printf("%v \t\t %v\n", user, pass)
-				}
-			} else {
-				fmt.Printf("No users\n")
-			}
-		case "calls":
-			fallthrough
-		case "cl": /* call list*/
-			calls := b2bua.Calls()
-			if len(calls) > 0 {
-				fmt.Printf("Calls:\n")
-				for _, call := range calls {
-					fmt.Printf("%v:\n", call.ToString())
-				}
-			} else {
-				fmt.Printf("No active calls\n")
-			}
-		case "onlines":
-			fallthrough
-		case "rr": /* register records*/
-			aors := b2bua.GetRegistry().GetAllContacts()
-			if len(aors) > 0 {
-				for aor, instances := range aors {
-					fmt.Printf("AOR: %v:\n", aor)
-					for _, instance := range instances {
-						fmt.Printf("\t%v, Expires: %d, Source: %v, Transport: %v\n",
-							(*instance).UserAgent,
-							(*instance).RegExpires,
-							(*instance).Source,
-							(*instance).Transport)
-					}
-				}
-			} else {
-				fmt.Printf("No online devices\n")
-			}
-		case "pr": /* pn records*/
-			pnrs := b2bua.GetRFC8599().PNRecords()
-			if len(pnrs) > 0 {
-				fmt.Printf("PN Records:\n")
-				for pn, aor := range pnrs {
-					fmt.Printf("AOR: %v => pn-provider=%v, pn-param=%v, pn-prid=%v\n", aor, pn.Provider, pn.Param, pn.PRID)
-				}
-			} else {
-				fmt.Printf("No pn records\n")
-			}
-		case "exit":
-			fmt.Println("Exit now.")
-			b2bua.Shutdown()
-			return
-		}
-	}
-}
-
 func main() {
-	noconsole := false
-	h := false
-	configPath := "config.yaml"
-	flag.BoolVar(&h, "h", false, "this help")
-	flag.BoolVar(&noconsole, "nc", false, "no console mode")
-	flag.StringVar(&configPath, "config", configPath, "path to config file")
-	flag.Usage = usage
-
+	configPath := flag.String("config", "config.yaml", "Path to config file")
 	flag.Parse()
 
-	if h {
-		flag.Usage()
-		return
-	}
-
-	cfg, err := config.Load(configPath)
+	cfg, err := config.Load(*configPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to load config %q: %v\n", configPath, err)
+		fmt.Fprintf(os.Stderr, "config: %v\n", err)
 		os.Exit(1)
 	}
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
+	// Setup logging
+	var logLevel slog.Level
+	switch cfg.Log.Level {
+	case "debug":
+		logLevel = slog.LevelDebug
+	case "warn":
+		logLevel = slog.LevelWarn
+	case "error":
+		logLevel = slog.LevelError
+	default:
+		logLevel = slog.LevelInfo
+	}
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})))
 
+	// Pprof
+	if cfg.Pprof.Addr != "" {
+		go func() {
+			slog.Info("pprof listening", "addr", cfg.Pprof.Addr)
+			if err := http.ListenAndServe(cfg.Pprof.Addr, nil); err != nil {
+				slog.Error("pprof failed", "error", err)
+			}
+		}()
+	}
+
+	// Database
+	database, err := db.Open(cfg.Database)
+	if err != nil {
+		slog.Error("database failed", "error", err)
+		os.Exit(1)
+	}
+
+	// Encryption key (auto-generated, stored in DB)
+	encKey, err := db.GetOrCreateEncryptionKey(database)
+	if err != nil {
+		slog.Error("encryption key failed", "error", err)
+		os.Exit(1)
+	}
+	box, err := secrets.NewBox(encKey)
+	if err != nil {
+		slog.Error("secrets failed", "error", err)
+		os.Exit(1)
+	}
+
+	// Push notifications
+	pushSender, err := push.NewDispatcher(cfg.Push)
+	if err != nil {
+		slog.Error("push init failed", "error", err)
+		os.Exit(1)
+	}
+
+	// SIP stack
+	stack, err := sipstack.New(cfg.SIP)
+	if err != nil {
+		slog.Error("SIP stack failed", "error", err)
+		os.Exit(1)
+	}
+	defer stack.Close()
+
+	// Upstream registrar
+	registrar := sipstack.NewUpstreamRegistrar(stack)
+	defer registrar.StopAll()
+
+	// Call manager (wires SIP handlers)
+	_ = callmanager.New(database, stack, registrar, pushSender, box)
+
+	// Context for graceful shutdown
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	// Start SIP listeners
 	go func() {
-		fmt.Printf("Start pprof on %s\n", cfg.Pprof.Addr)
-		if err := http.ListenAndServe(cfg.Pprof.Addr, nil); err != nil {
-			fmt.Fprintf(os.Stderr, "pprof server error: %v\n", err)
+		if err := stack.ListenAndServe(ctx); err != nil && ctx.Err() == nil {
+			slog.Error("SIP stack error", "error", err)
+			cancel()
 		}
 	}()
 
-	b := b2bua.NewB2BUA(cfg)
+	// REST API
+	handler := api.NewHandler(database, registrar, box, stack)
+	router := api.SetupRouter(handler)
 
-	if !noconsole {
-		consoleLoop(b)
-		return
+	srv := &http.Server{
+		Addr:    cfg.API.Addr,
+		Handler: router,
 	}
 
-	<-stop
-	b.Shutdown()
+	go func() {
+		slog.Info("REST API listening", "addr", cfg.API.Addr)
+		var err error
+		if cfg.API.TLSCert != "" && cfg.API.TLSKey != "" {
+			err = srv.ListenAndServeTLS(cfg.API.TLSCert, cfg.API.TLSKey)
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
+			slog.Error("API server error", "error", err)
+			cancel()
+		}
+	}()
+
+	// Re-register existing devices from DB on startup
+	go func() {
+		var devices []db.Device
+		database.Find(&devices)
+		for _, d := range devices {
+			pwBytes, err := box.Decrypt(d.UpstreamPassword)
+			if err != nil {
+				slog.Error("decrypt password failed on startup", "device", d.DeviceID, "error", err)
+				continue
+			}
+			reg := &sipstack.UpstreamReg{
+				DeviceID:  d.DeviceID,
+				User:      d.UpstreamUser,
+				Host:      d.UpstreamHost,
+				Port:      d.UpstreamPort,
+				Transport: d.UpstreamTransport,
+				Password:  string(pwBytes),
+				Realm:     d.UpstreamRealm,
+			}
+			if err := registrar.Register(ctx, reg); err != nil {
+				slog.Error("re-register on startup failed", "device", d.DeviceID, "error", err)
+			}
+		}
+		slog.Info("startup re-registration complete")
+	}()
+
+	slog.Info("Difuse B2BUA started")
+	<-ctx.Done()
+	slog.Info("shutting down...")
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*1e9)
+	defer shutdownCancel()
+	srv.Shutdown(shutdownCtx)
 }

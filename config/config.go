@@ -1,76 +1,91 @@
 package config
 
 import (
+	"fmt"
 	"os"
 
 	"gopkg.in/yaml.v3"
 )
 
-// SIPConfig holds all SIP transport settings.
-// Leave TLSAddr or WSSAddr empty to disable that transport.
 type SIPConfig struct {
-	UDPAddr     string `yaml:"udp_addr"`
-	TCPAddr     string `yaml:"tcp_addr"`
-	TLSAddr     string `yaml:"tls_addr"`
-	WSSAddr     string `yaml:"wss_addr"`
-	TLSCert     string `yaml:"tls_cert"`
-	TLSKey      string `yaml:"tls_key"`
-	DNS         string `yaml:"dns"`
-	DisableAuth bool   `yaml:"disable_auth"`
+	UDPAddr    string `yaml:"udp_addr"`
+	TCPAddr    string `yaml:"tcp_addr"`
+	TLSAddr    string `yaml:"tls_addr"`
+	TLSCert    string `yaml:"tls_cert"`
+	TLSKey     string `yaml:"tls_key"`
+	ExternalIP string `yaml:"external_ip"`
+	UserAgent  string `yaml:"user_agent"`
 }
 
-// PprofConfig controls the pprof debug HTTP server.
-// Bind to 127.0.0.1 in production; never expose to 0.0.0.0.
+type APIConfig struct {
+	Addr    string `yaml:"addr"`
+	TLSCert string `yaml:"tls_cert"`
+	TLSKey  string `yaml:"tls_key"`
+}
+
+type DatabaseConfig struct {
+	Driver string `yaml:"driver"`
+	DSN    string `yaml:"dsn"`
+}
+
+type SecretsConfig struct {
+	EncryptionKey string `yaml:"encryption_key"`
+}
+
+type PushConfig struct {
+	FCMServiceAccount string `yaml:"fcm_service_account"`
+	APNsCert          string `yaml:"apns_cert"`
+	APNsKeyID         string `yaml:"apns_key_id"`
+	APNsTeamID        string `yaml:"apns_team_id"`
+	APNsBundleID      string `yaml:"apns_bundle_id"`
+	APNsProduction    bool   `yaml:"apns_production"`
+}
+
 type PprofConfig struct {
 	Addr string `yaml:"addr"`
 }
 
-// PushConfig holds file paths for push notification credentials.
-type PushConfig struct {
-	APNSCert          string `yaml:"apns_cert"`
-	FCMServiceAccount string `yaml:"fcm_service_account"`
+type LogConfig struct {
+	Level string `yaml:"level"`
 }
 
-// Config is the top-level configuration struct.
 type Config struct {
-	SIP   SIPConfig   `yaml:"sip"`
-	Pprof PprofConfig `yaml:"pprof"`
-	Push  PushConfig  `yaml:"push"`
+	SIP      SIPConfig      `yaml:"sip"`
+	API      APIConfig      `yaml:"api"`
+	Database DatabaseConfig `yaml:"database"`
+	Secrets  SecretsConfig  `yaml:"secrets"`
+	Push     PushConfig     `yaml:"push"`
+	Pprof    PprofConfig    `yaml:"pprof"`
+	Log      LogConfig      `yaml:"log"`
 }
 
-// Defaults returns a Config pre-populated with safe production defaults.
-func Defaults() *Config {
-	return &Config{
-		SIP: SIPConfig{
-			UDPAddr: "0.0.0.0:5060",
-			TCPAddr: "0.0.0.0:5060",
-			DNS:     "8.8.8.8",
-			TLSCert: "certs/cert.pem",
-			TLSKey:  "certs/key.pem",
-		},
-		Pprof: PprofConfig{
-			Addr: "127.0.0.1:6658",
-		},
-		Push: PushConfig{
-			APNSCert:          "./voip-callkeep.p12",
-			FCMServiceAccount: "service-account.json",
-		},
-	}
-}
-
-// Load reads a YAML config file from path, merging over Defaults().
-// Missing keys retain their default values.
 func Load(path string) (*Config, error) {
-	cfg := Defaults()
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read config: %w", err)
 	}
-	defer f.Close()
-	dec := yaml.NewDecoder(f)
-	dec.KnownFields(true)
-	if err := dec.Decode(cfg); err != nil {
-		return nil, err
+
+	cfg := &Config{
+		SIP: SIPConfig{
+			UDPAddr:   "0.0.0.0:5060",
+			TCPAddr:   "0.0.0.0:5060",
+			UserAgent: "Difuse-B2BUA/1.0",
+		},
+		API: APIConfig{
+			Addr: "0.0.0.0:8080",
+		},
+		Database: DatabaseConfig{
+			Driver: "sqlite",
+			DSN:    "difuse.db",
+		},
+		Log: LogConfig{
+			Level: "info",
+		},
 	}
+
+	if err := yaml.Unmarshal(data, cfg); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+
 	return cfg, nil
 }
