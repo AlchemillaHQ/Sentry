@@ -518,6 +518,9 @@ func (b *B2BUA) handleRegister(request sip.Request, tx sip.ServerTransaction) {
 		upstreamPass := upstreamHeaderVal(request, "X-Upstream-Password")
 		upstreamTransport := upstreamHeaderVal(request, "X-Upstream-Transport")
 
+		logger.Infof("REGISTER from %s: upstream headers: host=%q user=%q transport=%q hasPass=%v",
+			localUser, upstreamHost, upstreamUser, upstreamTransport, upstreamPass != "")
+
 		if upstreamHost != "" && upstreamUser != "" && upstreamPass != "" {
 			// Upstream credentials present — register with the PBX first.
 			// Only accept the device's REGISTER if the upstream succeeds.
