@@ -299,7 +299,11 @@ func NewB2BUA(cfg *config.Config) *B2BUA {
 	}
 
 	ua.RegisterStateHandler = func(state account.RegisterState) {
-		logger.Infof("RegisterStateHandler: state => %v", state)
+		if state.StatusCode == 200 {
+			logger.Infof("Upstream registration OK: %s (expires %ds)", state.Account.URI, state.Expiration)
+		} else {
+			logger.Errorf("Upstream registration failed: %s — %d %s", state.Account.URI, state.StatusCode, state.Reason)
+		}
 	}
 
 	stack.OnRequest(sip.REGISTER, b.handleRegister)
@@ -524,7 +528,9 @@ func (b *B2BUA) handleRegister(request sip.Request, tx sip.ServerTransaction) {
 		upstreamPass := upstreamHeaderVal(request, "X-Upstream-Password")
 
 		if upstreamHost != "" && upstreamUser != "" && upstreamPass != "" {
-			// Re-register upstream if the account changed (e.g. new credentials).
+			// Re-register upstream if the account is new or credentials changed.
+			// Done in a goroutine so the device's 200 OK is not delayed by the
+			// upstream network round-trip.
 			b.mu.Lock()
 			existing, alreadyRegistered := b.upstreamAccounts[localUser]
 			b.mu.Unlock()
@@ -533,13 +539,18 @@ func (b *B2BUA) handleRegister(request sip.Request, tx sip.ServerTransaction) {
 				existing.UpstreamUser != upstreamUser ||
 				existing.Password != upstreamPass {
 
+				var oldReg *ua.Register
 				if alreadyRegistered && existing.register != nil {
-					// Unregister old upstream before registering with new one.
-					existing.register.SendRegister(0) //nolint:errcheck
+					oldReg = existing.register
 				}
-				if err := b.AddUpstreamAccount(localUser, upstreamHost, upstreamUser, upstreamPass); err != nil {
-					logger.Errorf("Dynamic upstream registration failed for %s: %v", localUser, err)
-				}
+				go func() {
+					if oldReg != nil {
+						oldReg.SendRegister(0) //nolint:errcheck
+					}
+					if err := b.AddUpstreamAccount(localUser, upstreamHost, upstreamUser, upstreamPass); err != nil {
+						logger.Errorf("Upstream registration failed for %s: %v", localUser, err)
+					}
+				}()
 			}
 		}
 	} else {
