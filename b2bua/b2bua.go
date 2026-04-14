@@ -46,6 +46,8 @@ type UpstreamAccount struct {
 	UpstreamUser string
 	// Password is the SIP digest password for the upstream PBX account.
 	Password string
+	// Transport is the SIP transport to use towards the PBX (udp, tcp, tls). Defaults to udp.
+	Transport string
 	// register is the live registration handle; kept so it can be unregistered on shutdown.
 	register *ua.Register
 }
@@ -225,7 +227,7 @@ func NewB2BUA(cfg *config.Config) *B2BUA {
 				)
 
 				// Route to the upstream PBX; let the PBX resolve the final destination.
-				recipient, err2 := parser.ParseSipUri("sip:" + called.User().String() + "@" + upstream.UpstreamHost + ";transport=udp")
+				recipient, err2 := parser.ParseSipUri("sip:" + called.User().String() + "@" + upstream.UpstreamHost + ";transport=" + upstream.Transport)
 				if err2 != nil {
 					logger.Errorf("Failed to build upstream recipient: %v", err2)
 					sess.Reject(500, "Internal error")
@@ -392,26 +394,18 @@ func mustParseSipUri(raw string) sip.SipUri {
 
 func (b *B2BUA) requiresChallenge(req sip.Request) bool {
 	switch req.Method() {
-	//case sip.UPDATE:
 	case sip.REGISTER:
-		return true
-	case sip.INVITE:
-		return true
-	//case sip.RREFER:
-	//	return false
-	case sip.CANCEL:
-		return false
-	case sip.OPTIONS:
-		return false
-	case sip.INFO:
-		return false
-	case sip.BYE:
-		{
-			// Allow locally initiated dialogs
-			// Return false if call-id in sessions.
-			return false
-		}
+		// Only challenge if we have local accounts configured.
+		// When using dynamic upstream registration, disable_auth should be
+		// set in config and the upstream PBX is the real authenticator.
+		b.mu.RLock()
+		hasAccounts := len(b.accounts) > 0
+		b.mu.RUnlock()
+		return hasAccounts
 	}
+	// INVITEs and everything else: don't challenge locally.
+	// Devices proved identity at REGISTER time; upstream PBX authenticates
+	// outbound legs independently.
 	return false
 }
 
@@ -432,7 +426,10 @@ func (b *B2BUA) GetAccounts() map[string]string {
 //
 //	b2bua.AddUpstreamAccount("1000", "example.com", "1000", "pass1000")
 //	b2bua.AddUpstreamAccount("1001", "example2.com", "1001", "pass1001")
-func (b *B2BUA) AddUpstreamAccount(localUser, upstreamHost, upstreamUser, password string) error {
+func (b *B2BUA) AddUpstreamAccount(localUser, upstreamHost, upstreamUser, password, transport string) error {
+	if transport == "" {
+		transport = "udp"
+	}
 	profile := account.NewProfile(
 		mustParseUri("sip:"+upstreamUser+"@"+upstreamHost),
 		"",
@@ -445,7 +442,7 @@ func (b *B2BUA) AddUpstreamAccount(localUser, upstreamHost, upstreamUser, passwo
 		b.stack,
 	)
 
-	recipient := mustParseSipUri("sip:" + upstreamUser + "@" + upstreamHost + ";transport=udp")
+	recipient := mustParseSipUri("sip:" + upstreamUser + "@" + upstreamHost + ";transport=" + transport)
 
 	reg, err := b.ua.SendRegister(profile, recipient, profile.Expires, nil)
 	if err != nil {
@@ -458,6 +455,7 @@ func (b *B2BUA) AddUpstreamAccount(localUser, upstreamHost, upstreamUser, passwo
 		UpstreamHost: upstreamHost,
 		UpstreamUser: upstreamUser,
 		Password:     password,
+		Transport:    transport,
 		register:     reg,
 	}
 	b.mu.Unlock()
@@ -484,8 +482,10 @@ func (b *B2BUA) GetRFC8599() *registry.RFC8599 {
 }
 
 func (b *B2BUA) requestCredential(username string) (string, string, error) {
-	if password, found := b.accounts[username]; found {
-		logger.Infof("Found user %s", username)
+	b.mu.RLock()
+	password, found := b.accounts[username]
+	b.mu.RUnlock()
+	if found {
 		return password, "", nil
 	}
 	return "", "", fmt.Errorf("username [%s] not found", username)
@@ -516,6 +516,7 @@ func (b *B2BUA) handleRegister(request sip.Request, tx sip.ServerTransaction) {
 		upstreamHost := upstreamHeaderVal(request, "X-Upstream-Host")
 		upstreamUser := upstreamHeaderVal(request, "X-Upstream-User")
 		upstreamPass := upstreamHeaderVal(request, "X-Upstream-Password")
+		upstreamTransport := upstreamHeaderVal(request, "X-Upstream-Transport")
 
 		if upstreamHost != "" && upstreamUser != "" && upstreamPass != "" {
 			// Upstream credentials present — register with the PBX first.
@@ -527,13 +528,14 @@ func (b *B2BUA) handleRegister(request sip.Request, tx sip.ServerTransaction) {
 			needsRegister := !alreadyRegistered ||
 				existing.UpstreamHost != upstreamHost ||
 				existing.UpstreamUser != upstreamUser ||
-				existing.Password != upstreamPass
+				existing.Password != upstreamPass ||
+				existing.Transport != upstreamTransport
 
 			if needsRegister {
 				if alreadyRegistered && existing.register != nil {
 					existing.register.SendRegister(0) //nolint:errcheck
 				}
-				if err := b.AddUpstreamAccount(localUser, upstreamHost, upstreamUser, upstreamPass); err != nil {
+				if err := b.AddUpstreamAccount(localUser, upstreamHost, upstreamUser, upstreamPass, upstreamTransport); err != nil {
 					logger.Errorf("Upstream registration failed for %s: %v", localUser, err)
 					code, reason := uint(502), "Upstream Registration Failed"
 					var reqErr *sip.RequestError
