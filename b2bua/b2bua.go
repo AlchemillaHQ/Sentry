@@ -302,9 +302,16 @@ func NewB2BUA(cfg *config.Config) *B2BUA {
 	}
 
 	ua.RegisterStateHandler = func(state account.RegisterState) {
+		// Forward the result to a per-registration channel when provided.
+		if ch, ok := state.UserData.(chan account.RegisterState); ok {
+			select {
+			case ch <- state:
+			default:
+			}
+		}
 		if state.StatusCode == 200 {
 			logger.Infof("Upstream registration OK: %s (expires %ds)", state.Account.URI, state.Expiration)
-		} else {
+		} else if state.StatusCode != 0 {
 			logger.Errorf("Upstream registration failed: %s — %d %s", state.Account.URI, state.StatusCode, state.Reason)
 		}
 	}
@@ -444,9 +451,25 @@ func (b *B2BUA) AddUpstreamAccount(localUser, upstreamHost, upstreamUser, passwo
 
 	recipient := mustParseSipUri("sip:" + upstreamUser + "@" + upstreamHost + ";transport=" + transport)
 
-	reg, err := b.ua.SendRegister(profile, recipient, profile.Expires, nil)
+	// Use a buffered channel as userdata so RegisterStateHandler can deliver
+	// the first registration result back to us synchronously.
+	resultCh := make(chan account.RegisterState, 1)
+	reg, err := b.ua.SendRegister(profile, recipient, profile.Expires, resultCh)
 	if err != nil {
+		// Library-level error (e.g. could not build request).
 		return fmt.Errorf("upstream register for %s@%s failed: %w", upstreamUser, upstreamHost, err)
+	}
+
+	// Block until the first SIP response (or network-level failure) arrives.
+	state := <-resultCh
+	if state.StatusCode != 200 {
+		if reg != nil {
+			reg.Stop()
+		}
+		return &sip.RequestError{
+			Code:   uint(state.StatusCode),
+			Reason: state.Reason,
+		}
 	}
 
 	b.mu.Lock()
