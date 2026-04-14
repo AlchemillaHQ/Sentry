@@ -1,6 +1,7 @@
 package b2bua
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -512,47 +513,45 @@ func (b *B2BUA) handleRegister(request sip.Request, tx sip.ServerTransaction) {
 
 	reason := ""
 	if len(headers) > 0 && expires != sip.Expires(0) {
-		instance := registry.NewContactInstanceForRequest(request)
-		logger.Infof("Registered [%v] expires [%d] source %s", to, expires, request.Source())
-		reason = "Registered"
-		b.registry.AddAor(aor, instance)
-		b.rfc8599.HandleContactInstance(aor, instance)
-
-		// Dynamic upstream registration: if the REGISTER carries upstream PBX
-		// details via custom headers, register with the upstream PBX now.
-		// The device only needs to send these headers once (on first REGISTER or
-		// whenever credentials change); the B2BUA keeps the upstream registration
-		// alive via auto-renewal until the device unregisters.
 		upstreamHost := upstreamHeaderVal(request, "X-Upstream-Host")
 		upstreamUser := upstreamHeaderVal(request, "X-Upstream-User")
 		upstreamPass := upstreamHeaderVal(request, "X-Upstream-Password")
 
 		if upstreamHost != "" && upstreamUser != "" && upstreamPass != "" {
-			// Re-register upstream if the account is new or credentials changed.
-			// Done in a goroutine so the device's 200 OK is not delayed by the
-			// upstream network round-trip.
+			// Upstream credentials present — register with the PBX first.
+			// Only accept the device's REGISTER if the upstream succeeds.
 			b.mu.Lock()
 			existing, alreadyRegistered := b.upstreamAccounts[localUser]
 			b.mu.Unlock()
-			if !alreadyRegistered ||
+
+			needsRegister := !alreadyRegistered ||
 				existing.UpstreamHost != upstreamHost ||
 				existing.UpstreamUser != upstreamUser ||
-				existing.Password != upstreamPass {
+				existing.Password != upstreamPass
 
-				var oldReg *ua.Register
+			if needsRegister {
 				if alreadyRegistered && existing.register != nil {
-					oldReg = existing.register
+					existing.register.SendRegister(0) //nolint:errcheck
 				}
-				go func() {
-					if oldReg != nil {
-						oldReg.SendRegister(0) //nolint:errcheck
+				if err := b.AddUpstreamAccount(localUser, upstreamHost, upstreamUser, upstreamPass); err != nil {
+					logger.Errorf("Upstream registration failed for %s: %v", localUser, err)
+					code, reason := uint(502), "Upstream Registration Failed"
+					var reqErr *sip.RequestError
+					if errors.As(err, &reqErr) {
+						code, reason = reqErr.Code, reqErr.Reason
 					}
-					if err := b.AddUpstreamAccount(localUser, upstreamHost, upstreamUser, upstreamPass); err != nil {
-						logger.Errorf("Upstream registration failed for %s: %v", localUser, err)
-					}
-				}()
+					resp := sip.NewResponseFromRequest(request.MessageID(), request, sip.StatusCode(code), reason, "")
+					tx.Respond(resp)
+					return
+				}
 			}
 		}
+
+		instance := registry.NewContactInstanceForRequest(request)
+		logger.Infof("Registered [%v] expires [%d] source %s", to, expires, request.Source())
+		reason = "Registered"
+		b.registry.AddAor(aor, instance)
+		b.rfc8599.HandleContactInstance(aor, instance)
 	} else {
 		logger.Infof("Logged out [%v] expires [%d] ", to, expires)
 		reason = "UnRegistered"
