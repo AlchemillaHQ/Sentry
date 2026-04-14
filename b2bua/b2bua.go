@@ -2,10 +2,12 @@ package b2bua
 
 import (
 	"fmt"
+	"sync"
 
-	"github.com/cloudwebrtc/go-sip-ua/examples/b2bua/fcm"
-	"github.com/cloudwebrtc/go-sip-ua/examples/b2bua/pushkit"
-	"github.com/cloudwebrtc/go-sip-ua/examples/b2bua/registry"
+	"github.com/AlchemillaHQ/Difuse-B2BUA/config"
+	"github.com/AlchemillaHQ/Difuse-B2BUA/fcm"
+	"github.com/AlchemillaHQ/Difuse-B2BUA/pushkit"
+	"github.com/AlchemillaHQ/Difuse-B2BUA/registry"
 
 	"github.com/cloudwebrtc/go-sip-ua/pkg/account"
 	"github.com/cloudwebrtc/go-sip-ua/pkg/auth"
@@ -29,19 +31,6 @@ func (b *B2BCall) ToString() string {
 	return b.src.Contact() + " => " + b.dest.Contact()
 }
 
-func pushCallback(pn *registry.PNParams, payload map[string]string) error {
-	fmt.Printf("Handle Push Request:\nprovider=%v\nparam=%v\nprid=%v\npayload=%v", pn.Provider, pn.Param, pn.PRID, payload)
-	switch pn.Provider {
-	case "apns":
-		go pushkit.DoPushKit("./voip-callkeep.p12", pn.PRID, payload)
-		return nil
-	case "fcm":
-		go fcm.FCMPush("service-account.json", pn.PRID, payload)
-		return nil
-	}
-	return fmt.Errorf("%v provider not found", pn.Provider)
-}
-
 // UpstreamAccount maps a locally-registered user to an upstream PBX.
 // The B2BUA registers on behalf of the user with the upstream PBX so that:
 //   - Inbound calls from the PBX are forwarded to the locally-registered device.
@@ -61,6 +50,7 @@ type UpstreamAccount struct {
 
 // B2BUA .
 type B2BUA struct {
+	mu               sync.RWMutex
 	stack            *stack.SipStack
 	ua               *ua.UserAgent
 	accounts         map[string]string
@@ -79,8 +69,21 @@ func init() {
 	logger = utils.NewLogrusLogger(log.InfoLevel, "B2BUA", nil)
 }
 
-// NewB2BUA .
-func NewB2BUA(disableAuth bool, enableTLS bool) *B2BUA {
+// NewB2BUA creates a new B2BUA from the provided configuration.
+func NewB2BUA(cfg *config.Config) *B2BUA {
+	pushCallback := func(pn *registry.PNParams, payload map[string]string) error {
+		fmt.Printf("Handle Push Request:\nprovider=%v\nparam=%v\nprid=%v\npayload=%v", pn.Provider, pn.Param, pn.PRID, payload)
+		switch pn.Provider {
+		case "apns":
+			go pushkit.DoPushKit(cfg.Push.APNSCert, pn.PRID, payload)
+			return nil
+		case "fcm":
+			go fcm.FCMPush(cfg.Push.FCMServiceAccount, pn.PRID, payload)
+			return nil
+		}
+		return fmt.Errorf("%v provider not found", pn.Provider)
+	}
+
 	b := &B2BUA{
 		registry:         registry.Registry(registry.NewMemoryRegistry()),
 		accounts:         make(map[string]string),
@@ -90,14 +93,14 @@ func NewB2BUA(disableAuth bool, enableTLS bool) *B2BUA {
 
 	var authenticator *auth.ServerAuthorizer = nil
 
-	if !disableAuth {
+	if !cfg.SIP.DisableAuth {
 		authenticator = auth.NewServerAuthorizer(b.requestCredential, "b2bua", false)
 	}
 
 	stack := stack.NewSipStack(&stack.SipStackConfig{
 		UserAgent:  "Go B2BUA/1.0.0",
 		Extensions: []string{"replaces", "outbound"},
-		Dns:        "8.8.8.8",
+		Dns:        cfg.SIP.DNS,
 		ServerAuthManager: stack.ServerAuthManager{
 			Authenticator:     authenticator,
 			RequiresChallenge: b.requiresChallenge,
@@ -106,22 +109,26 @@ func NewB2BUA(disableAuth bool, enableTLS bool) *B2BUA {
 
 	stack.OnConnectionError(b.handleConnectionError)
 
-	if err := stack.Listen("udp", "0.0.0.0:5060"); err != nil {
+	if err := stack.Listen("udp", cfg.SIP.UDPAddr); err != nil {
 		logger.Panic(err)
 	}
 
-	if err := stack.Listen("tcp", "0.0.0.0:5060"); err != nil {
+	if err := stack.Listen("tcp", cfg.SIP.TCPAddr); err != nil {
 		logger.Panic(err)
 	}
 
-	if enableTLS {
-		tlsOptions := &transport.TLSConfig{Cert: "certs/cert.pem", Key: "certs/key.pem"}
+	if cfg.SIP.TLSAddr != "" {
+		tlsOptions := &transport.TLSConfig{Cert: cfg.SIP.TLSCert, Key: cfg.SIP.TLSKey}
 
-		if err := stack.ListenTLS("tls", "0.0.0.0:5061", tlsOptions); err != nil {
+		if err := stack.ListenTLS("tls", cfg.SIP.TLSAddr, tlsOptions); err != nil {
 			logger.Panic(err)
 		}
+	}
 
-		if err := stack.ListenTLS("wss", "0.0.0.0:5081", tlsOptions); err != nil {
+	if cfg.SIP.WSSAddr != "" {
+		tlsOptions := &transport.TLSConfig{Cert: cfg.SIP.TLSCert, Key: cfg.SIP.TLSKey}
+
+		if err := stack.ListenTLS("wss", cfg.SIP.WSSAddr, tlsOptions); err != nil {
 			logger.Panic(err)
 		}
 	}
@@ -163,7 +170,9 @@ func NewB2BUA(disableAuth bool, enableTLS bool) *B2BUA {
 					logger.Errorf("B-Leg session error: %v", err)
 					return
 				}
+				b.mu.Lock()
 				b.calls = append(b.calls, &B2BCall{src: sess, dest: dest})
+				b.mu.Unlock()
 			}
 
 			// Try to find online contact records.
@@ -183,7 +192,7 @@ func NewB2BUA(disableAuth bool, enableTLS bool) *B2BUA {
 				instance, err := pusher.WaitContactOnline()
 				if err != nil {
 					logger.Errorf("Push failed, error: %v", err)
-					sess.Reject(500, fmt.Sprint("Push failed"))
+					sess.Reject(500, "Push failed")
 					return
 				}
 				doInvite(instance)
@@ -228,7 +237,9 @@ func NewB2BUA(disableAuth bool, enableTLS bool) *B2BUA {
 					sess.Reject(502, "Bad Gateway")
 					return
 				}
+				b.mu.Lock()
 				b.calls = append(b.calls, &B2BCall{src: sess, dest: dest})
+				b.mu.Unlock()
 				return
 			}
 
@@ -297,10 +308,18 @@ func NewB2BUA(disableAuth bool, enableTLS bool) *B2BUA {
 }
 
 func (b *B2BUA) Calls() []*B2BCall {
-	return b.calls
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	copy := make([]*B2BCall, len(b.calls))
+	for i, c := range b.calls {
+		copy[i] = c
+	}
+	return copy
 }
 
 func (b *B2BUA) findCall(sess *session.Session) *B2BCall {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	for _, call := range b.calls {
 		if call.src == sess || call.dest == sess {
 			return call
@@ -310,6 +329,8 @@ func (b *B2BUA) findCall(sess *session.Session) *B2BCall {
 }
 
 func (b *B2BUA) removeCall(sess *session.Session) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	for idx, call := range b.calls {
 		if call.src == sess || call.dest == sess {
 			b.calls = append(b.calls[:idx], b.calls[idx+1:]...)
@@ -321,7 +342,14 @@ func (b *B2BUA) removeCall(sess *session.Session) {
 // Shutdown .
 func (b *B2BUA) Shutdown() {
 	// Unregister all upstream accounts gracefully.
+	b.mu.Lock()
+	upstream := make([]*UpstreamAccount, 0, len(b.upstreamAccounts))
 	for _, acc := range b.upstreamAccounts {
+		upstream = append(upstream, acc)
+	}
+	b.mu.Unlock()
+
+	for _, acc := range upstream {
 		if acc.register != nil {
 			if err := acc.register.SendRegister(0); err != nil {
 				logger.Warnf("Failed to unregister upstream %s@%s: %v", acc.UpstreamUser, acc.UpstreamHost, err)
@@ -409,6 +437,7 @@ func (b *B2BUA) AddUpstreamAccount(localUser, upstreamHost, upstreamUser, passwo
 		return fmt.Errorf("upstream register for %s@%s failed: %w", upstreamUser, upstreamHost, err)
 	}
 
+	b.mu.Lock()
 	b.upstreamAccounts[localUser] = &UpstreamAccount{
 		LocalUser:    localUser,
 		UpstreamHost: upstreamHost,
@@ -416,12 +445,15 @@ func (b *B2BUA) AddUpstreamAccount(localUser, upstreamHost, upstreamUser, passwo
 		Password:     password,
 		register:     reg,
 	}
+	b.mu.Unlock()
 	logger.Infof("Upstream account registered: %s -> %s@%s", localUser, upstreamUser, upstreamHost)
 	return nil
 }
 
 // upstreamForUser returns the upstream account for a locally-registered user, if any.
 func (b *B2BUA) upstreamForUser(localUser string) (*UpstreamAccount, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	acc, ok := b.upstreamAccounts[localUser]
 	return acc, ok
 }
@@ -483,7 +515,9 @@ func (b *B2BUA) handleRegister(request sip.Request, tx sip.ServerTransaction) {
 
 		if upstreamHost != "" && upstreamUser != "" && upstreamPass != "" {
 			// Re-register upstream if the account changed (e.g. new credentials).
+			b.mu.Lock()
 			existing, alreadyRegistered := b.upstreamAccounts[localUser]
+			b.mu.Unlock()
 			if !alreadyRegistered ||
 				existing.UpstreamHost != upstreamHost ||
 				existing.UpstreamUser != upstreamUser ||
@@ -506,13 +540,18 @@ func (b *B2BUA) handleRegister(request sip.Request, tx sip.ServerTransaction) {
 		b.rfc8599.HandleContactInstance(aor, instance)
 
 		// Device unregistered — tear down the upstream registration too.
-		if acc, ok := b.upstreamAccounts[localUser]; ok {
+		b.mu.Lock()
+		acc, ok := b.upstreamAccounts[localUser]
+		if ok {
+			delete(b.upstreamAccounts, localUser)
+		}
+		b.mu.Unlock()
+		if ok {
 			if acc.register != nil {
 				if err := acc.register.SendRegister(0); err != nil {
 					logger.Warnf("Failed to unregister upstream %s@%s: %v", acc.UpstreamUser, acc.UpstreamHost, err)
 				}
 			}
-			delete(b.upstreamAccounts, localUser)
 		}
 	}
 

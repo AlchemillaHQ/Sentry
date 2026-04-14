@@ -14,6 +14,9 @@ import (
 func FCMPush(fcmCert string, token string, payload map[string]string) (string, error) {
 	opt := option.WithCredentialsFile(fcmCert)
 	app, err := firebase.NewApp(context.Background(), nil, opt)
+	if err != nil {
+		return "", fmt.Errorf("firebase.NewApp: %w", err)
+	}
 
 	// Obtain a messaging.Client from the App.
 	ctx := context.Background()

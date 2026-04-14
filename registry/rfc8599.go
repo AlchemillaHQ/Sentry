@@ -3,6 +3,7 @@ package registry
 import (
 	"fmt"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/ghettovoice/gosip/sip"
@@ -28,7 +29,7 @@ func (p *PNParams) Equals(other *PNParams) bool {
 	return p.Provider == other.Provider && p.Param == other.Param && p.PRID == other.PRID
 }
 
-//Disabled https://tools.ietf.org/html/rfc8599#section-4.1.2
+// Disabled https://tools.ietf.org/html/rfc8599#section-4.1.2
 func (p *PNParams) Disabled() bool {
 	return len(p.PRID) == 0
 }
@@ -36,6 +37,7 @@ func (p *PNParams) Disabled() bool {
 type PushCallback func(pn *PNParams, payload map[string]string) error
 
 type RFC8599 struct {
+	mu           sync.RWMutex
 	PushCallback PushCallback
 	records      map[PNParams]sip.Uri
 	pushers      map[PNParams]*Pusher
@@ -51,7 +53,13 @@ func NewRFC8599(callback PushCallback) *RFC8599 {
 }
 
 func (r *RFC8599) PNRecords() map[PNParams]sip.Uri {
-	return r.records
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	copy := make(map[PNParams]sip.Uri, len(r.records))
+	for k, v := range r.records {
+		copy[k] = v
+	}
+	return copy
 }
 
 func (r *RFC8599) HandleContactInstance(aor sip.Uri, instance *ContactInstance) {
@@ -59,24 +67,20 @@ func (r *RFC8599) HandleContactInstance(aor sip.Uri, instance *ContactInstance) 
 	if pn != nil {
 		disable := pn.Disabled()
 		if disable {
-			//Remove pn record.
+			r.mu.Lock()
 			for params, uri := range r.records {
 				if uri.User() == aor.User() {
 					delete(r.records, params)
 				}
 			}
-
+			r.mu.Unlock()
 			return
 		}
 
-		// Add pn record.
+		r.mu.Lock()
 		if _, ok := r.records[*pn]; !ok {
 			r.records[*pn] = aor
 		}
-
-		//for params, aor := range r.records {
-		//	fmt.Printf("\n\n\naor %v => params %v\n\n\n", aor, params.String())
-		//}
 
 		for params, pusher := range r.pushers {
 			if params.Equals(pn) {
@@ -85,12 +89,14 @@ func (r *RFC8599) HandleContactInstance(aor sip.Uri, instance *ContactInstance) 
 				break
 			}
 		}
+		r.mu.Unlock()
 	}
 }
 
 func (r *RFC8599) TryPush(aor sip.Uri, from *sip.FromHeader) (*Pusher, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for params, uri := range r.records {
-
 		if uri.User() == aor.User() {
 			displayName := ""
 			if from.DisplayName != nil {
@@ -104,7 +110,6 @@ func (r *RFC8599) TryPush(aor sip.Uri, from *sip.FromHeader) (*Pusher, bool) {
 			}
 
 			if err := r.PushCallback(&params, payload); err != nil {
-				//push failed,.
 				log.Printf("Push failed: %v", err)
 				return nil, false
 			}
@@ -143,7 +148,7 @@ func (pn *Pusher) WaitContactOnline() (*ContactInstance, error) {
 	}
 }
 
-//Abort caller cancelled the call
+// Abort caller cancelled the call
 func (pn *Pusher) Abort() {
 	pn.abort <- 1
 }

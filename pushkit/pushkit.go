@@ -9,8 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
+	"os"
 	"strings"
 	"time"
 
@@ -65,18 +65,18 @@ func (p *PushKit) Push(token string, data []byte) error {
 
 	conn, err := net.Dial("tcp", p.hostUrl)
 	if err != nil {
-		return errors.New(fmt.Sprintf("error Dial: %s", err.Error()))
+		return fmt.Errorf("error Dial: %s", err.Error())
 	}
 	tlsconn := tls.Client(conn, conf)
 
 	err = tlsconn.Handshake()
 	if err != nil {
-		return errors.New(fmt.Sprintf("error Handshake: %s", err.Error()))
+		return fmt.Errorf("error Handshake: %s", err.Error())
 	}
 
 	btoken, err := hex.DecodeString(token)
 	if err != nil {
-		return errors.New(fmt.Sprintf("tls error DecodeString: %s", err.Error()))
+		return fmt.Errorf("tls error DecodeString: %s", err.Error())
 	}
 	buffer := bytes.NewBuffer([]byte{})
 	binary.Write(buffer, binary.BigEndian, uint8(1))
@@ -89,7 +89,7 @@ func (p *PushKit) Push(token string, data []byte) error {
 	pdu := buffer.Bytes()
 	_, err = tlsconn.Write(pdu)
 	if err != nil {
-		return errors.New(fmt.Sprintf("tls error Write: %s", err.Error()))
+		return fmt.Errorf("tls error Write: %s", err.Error())
 	}
 	tlsconn.Close()
 	return nil
@@ -97,7 +97,7 @@ func (p *PushKit) Push(token string, data []byte) error {
 
 // Load a .p12 certificate from disk.
 func Load(filename, password string) (tls.Certificate, error) {
-	p12, err := ioutil.ReadFile(filename)
+	p12, err := os.ReadFile(filename)
 	if err != nil {
 		return tls.Certificate{}, fmt.Errorf("Unable to load %s: %v", filename, err)
 	}

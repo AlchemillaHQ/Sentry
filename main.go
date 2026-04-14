@@ -9,8 +9,9 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/AlchemillaHQ/Difuse-B2BUA/b2bua"
+	"github.com/AlchemillaHQ/Difuse-B2BUA/config"
 	"github.com/c-bata/go-prompt"
-	"github.com/cloudwebrtc/go-sip-ua/examples/b2bua/b2bua"
 	"github.com/cloudwebrtc/go-sip-ua/pkg/utils"
 	"github.com/ghettovoice/gosip/log"
 )
@@ -124,13 +125,11 @@ func consoleLoop(b2bua *b2bua.B2BUA) {
 
 func main() {
 	noconsole := false
-	disableAuth := false
-	enableTLS := false
 	h := false
+	configPath := "config.yaml"
 	flag.BoolVar(&h, "h", false, "this help")
 	flag.BoolVar(&noconsole, "nc", false, "no console mode")
-	flag.BoolVar(&disableAuth, "da", false, "disable auth mode")
-	flag.BoolVar(&enableTLS, "tls", false, "enable TLS")
+	flag.StringVar(&configPath, "config", configPath, "path to config file")
 	flag.Usage = usage
 
 	flag.Parse()
@@ -140,48 +139,29 @@ func main() {
 		return
 	}
 
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load config %q: %v\n", configPath, err)
+		os.Exit(1)
+	}
+
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGTERM, syscall.SIGINT)
 
 	go func() {
-		fmt.Print("Start pprof on :6658\n")
-		http.ListenAndServe(":6658", nil)
+		fmt.Printf("Start pprof on %s\n", cfg.Pprof.Addr)
+		if err := http.ListenAndServe(cfg.Pprof.Addr, nil); err != nil {
+			fmt.Fprintf(os.Stderr, "pprof server error: %v\n", err)
+		}
 	}()
 
-	b2bua := b2bua.NewB2BUA(disableAuth, enableTLS)
-
-	// Add sample accounts.
-	b2bua.AddAccount("100", "100")
-	b2bua.AddAccount("200", "200")
-	b2bua.AddAccount("300", "300")
-	b2bua.AddAccount("400", "400")
-
-	// ------------------------------------------------------------------
-	// Upstream (PBX) accounts — one per user.
-	//
-	// Each entry tells the B2BUA:
-	//   • which locally-registered username this applies to ("1000")
-	//   • which remote PBX to register with and authenticate against
-	//
-	// After calling AddUpstreamAccount the B2BUA immediately SIP-REGISTERs
-	// with the remote PBX so inbound calls from that PBX are delivered here.
-	// Outbound calls from the local device are forwarded through that PBX.
-	//
-	// Uncomment and customise these lines for your deployment:
-	//
-	// if err := b2bua.AddUpstreamAccount("1000", "example.com", "1000", "pass1000"); err != nil {
-	// 	logger.Error(err)
-	// }
-	// if err := b2bua.AddUpstreamAccount("1001", "example2.com", "1001", "pass1001"); err != nil {
-	// 	logger.Error(err)
-	// }
-	// ------------------------------------------------------------------
+	b := b2bua.NewB2BUA(cfg)
 
 	if !noconsole {
-		consoleLoop(b2bua)
+		consoleLoop(b)
 		return
 	}
 
 	<-stop
-	b2bua.Shutdown()
+	b.Shutdown()
 }
