@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"os"
 	"sync"
 
 	"github.com/AlchemillaHQ/Difuse-B2BUA/config"
@@ -13,10 +14,11 @@ import (
 )
 
 type Stack struct {
-	cfg    config.SIPConfig
-	ua     *sipgo.UserAgent
-	server *sipgo.Server
-	client *sipgo.Client
+	cfg       config.SIPConfig
+	ua        *sipgo.UserAgent
+	server    *sipgo.Server
+	client    *sipgo.Client
+	listenTLS *tls.Config
 
 	mu         sync.RWMutex
 	onRegister func(req *sip.Request, tx sip.ServerTransaction)
@@ -27,9 +29,30 @@ type Stack struct {
 }
 
 func New(cfg config.SIPConfig) (*Stack, error) {
-	ua, err := sipgo.NewUA(
+	// Enable sipgo debug logging to see SIP traffic
+	sipLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	sip.SetDefaultLogger(sipLogger)
+
+	uaOpts := []sipgo.UserAgentOption{
 		sipgo.WithUserAgent(cfg.UserAgent),
-	)
+	}
+
+	// TLS config for outbound SIP (client) connections
+	outboundTLS := &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: true, // PBXes often use self-signed certs
+	}
+	// If we have local certs, use them for inbound TLS too
+	if cfg.TLSCert != "" && cfg.TLSKey != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
+		if err != nil {
+			return nil, fmt.Errorf("load TLS cert: %w", err)
+		}
+		outboundTLS.Certificates = []tls.Certificate{cert}
+	}
+	uaOpts = append(uaOpts, sipgo.WithUserAgenTLSConfig(outboundTLS))
+
+	ua, err := sipgo.NewUA(uaOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("create UA: %w", err)
 	}
@@ -47,10 +70,11 @@ func New(cfg config.SIPConfig) (*Stack, error) {
 	}
 
 	s := &Stack{
-		cfg:    cfg,
-		ua:     ua,
-		server: server,
-		client: client,
+		cfg:       cfg,
+		ua:        ua,
+		server:    server,
+		client:    client,
+		listenTLS: outboundTLS,
 	}
 
 	server.OnRegister(s.handleRegister)
@@ -174,13 +198,8 @@ func (s *Stack) ListenAndServe(ctx context.Context) error {
 
 	if s.cfg.TLSAddr != "" && s.cfg.TLSCert != "" && s.cfg.TLSKey != "" {
 		go func() {
-			tlsCfg, err := loadTLS(s.cfg.TLSCert, s.cfg.TLSKey)
-			if err != nil {
-				errCh <- fmt.Errorf("tls config: %w", err)
-				return
-			}
 			slog.Info("SIP listening", "transport", "tls", "addr", s.cfg.TLSAddr)
-			if err := s.server.ListenAndServeTLS(ctx, "tcp", s.cfg.TLSAddr, tlsCfg); err != nil {
+			if err := s.server.ListenAndServeTLS(ctx, "tcp", s.cfg.TLSAddr, s.listenTLS); err != nil {
 				errCh <- fmt.Errorf("tls: %w", err)
 			}
 		}()
@@ -196,15 +215,4 @@ func (s *Stack) ListenAndServe(ctx context.Context) error {
 
 func (s *Stack) Close() {
 	s.ua.Close()
-}
-
-func loadTLS(certFile, keyFile string) (*tls.Config, error) {
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, fmt.Errorf("load TLS cert: %w", err)
-	}
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
-	}, nil
 }

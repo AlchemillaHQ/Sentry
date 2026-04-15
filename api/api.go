@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -126,7 +127,9 @@ func (h *Handler) RegisterDevice(c *gin.Context) {
 		Realm:     req.UpstreamRealm,
 	}
 
-	if err := h.registrar.Register(c.Request.Context(), reg); err != nil {
+	regCtx, regCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer regCancel()
+	if err := h.registrar.Register(regCtx, reg); err != nil {
 		slog.Error("upstream registration failed", "device", req.DeviceID, "error", err)
 		c.JSON(http.StatusBadGateway, gin.H{"status": "error", "message": "upstream registration failed"})
 		return

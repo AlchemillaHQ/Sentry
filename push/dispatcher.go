@@ -19,15 +19,20 @@ type Dispatcher struct {
 
 func NewDispatcher(cfg config.PushConfig) (*Dispatcher, error) {
 	d := &Dispatcher{}
-	var err error
-	d.fcm, err = NewFCMSender(cfg.FCMServiceAccount)
+
+	fcm, err := NewFCMSender(cfg.FCMServiceAccount)
 	if err != nil {
 		return nil, fmt.Errorf("init fcm: %w", err)
 	}
-	d.apns, err = NewAPNsSender(cfg.APNsCert, cfg.APNsBundleID, cfg.APNsProduction)
+	d.fcm = fcm
+
+	apns, err := NewAPNsSender(cfg.APNsCert, cfg.APNsBundleID, cfg.APNsProduction)
 	if err != nil {
-		return nil, fmt.Errorf("init apns: %w", err)
+		slog.Warn("APNs push disabled", "error", err)
+	} else {
+		d.apns = apns
 	}
+
 	return d, nil
 }
 
