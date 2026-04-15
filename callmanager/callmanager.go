@@ -111,12 +111,19 @@ func (cm *CallManager) handleRegister(req *sip.Request, tx sip.ServerTransaction
 func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) {
 	toHdr := req.To()
 	if toHdr == nil {
+		slog.Warn("INVITE missing To header")
 		res := sip.NewResponseFromRequest(req, 400, "Bad Request", nil)
 		tx.Respond(res)
 		return
 	}
 
 	sipUser := toHdr.Address.User
+	slog.Info("INVITE received",
+		"to_user", sipUser,
+		"from", req.From().String(),
+		"call_id", req.CallID().Value(),
+		"sdp_len", len(req.Body()))
+
 	var device db.Device
 	if err := cm.database.Where("upstream_user = ?", sipUser).First(&device).Error; err != nil {
 		if err := cm.database.Where("b2bua_sip_user = ?", sipUser).First(&device).Error; err != nil {
@@ -127,6 +134,12 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 		}
 	}
 
+	slog.Info("INVITE matched device",
+		"device_id", device.DeviceID,
+		"platform", device.Platform,
+		"b2bua_user", device.B2BUASIPUser,
+		"has_push_token", len(device.PushToken) > 0)
+
 	dlg, err := cm.dialogSrv.ReadInvite(req, tx)
 	if err != nil {
 		slog.Error("failed to read invite into dialog", "error", err)
@@ -135,6 +148,7 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 		return
 	}
 
+	slog.Info("sending 100 Trying", "call_id", req.CallID().Value())
 	dlg.Respond(sip.StatusTrying, "Trying", nil)
 
 	fromHdr := req.From()
@@ -178,8 +192,10 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 		ExpiresAt:  time.Now().Add(callTimeout),
 	})
 
+	slog.Info("sending 180 Ringing", "call_id", callID)
 	dlg.Respond(sip.StatusRinging, "Ringing", nil)
 
+	slog.Info("starting push+wait goroutine", "call_id", callID, "device", device.DeviceID)
 	go cm.sendPushAndWait(callCtx, pc, &device)
 }
 
@@ -194,6 +210,11 @@ func (cm *CallManager) sendPushAndWait(ctx context.Context, pc *pendingCall, dev
 		pc.serverDlg.Close()
 		return
 	}
+
+	slog.Info("sending push notification",
+		"call_id", pc.callID,
+		"device", device.DeviceID,
+		"platform", device.Platform)
 
 	pushCtx := context.Background()
 	if err := cm.pushSender.Send(pushCtx, device.Platform, string(pushTokenBytes), pc.callID, pc.callerURI, pc.callerName); err != nil {
@@ -220,6 +241,11 @@ func (cm *CallManager) sendPushAndWait(ctx context.Context, pc *pendingCall, dev
 }
 
 func (cm *CallManager) relayCall(ctx context.Context, pc *pendingCall, device *db.Device) {
+	slog.Info("relaying call to device",
+		"call_id", pc.callID,
+		"device", device.DeviceID,
+		"b2bua_user", device.B2BUASIPUser)
+
 	recipient := sip.Uri{
 		User: device.B2BUASIPUser,
 		Host: cm.stack.ExternalIP(),
@@ -256,6 +282,9 @@ func (cm *CallManager) relayCall(ctx context.Context, pc *pendingCall, device *d
 	}
 
 	deviceSDP := dlgClient.InviteResponse.Body()
+	slog.Info("device answered, sending 200 OK to PBX",
+		"call_id", pc.callID,
+		"device_sdp_len", len(deviceSDP))
 	pc.serverDlg.Respond(sip.StatusOK, "OK", deviceSDP)
 
 	cm.database.Model(&db.PendingCall{}).Where("call_id = ?", pc.callID).Update("state", "BRIDGED")
@@ -263,8 +292,10 @@ func (cm *CallManager) relayCall(ctx context.Context, pc *pendingCall, device *d
 
 	<-dlgClient.Context().Done()
 
+	slog.Info("call ended, sending BYE to PBX", "call_id", pc.callID)
 	pc.serverDlg.Bye(ctx)
 	cm.database.Model(&db.PendingCall{}).Where("call_id = ?", pc.callID).Update("state", "TERMINATED")
+	slog.Info("call terminated", "call_id", pc.callID)
 }
 
 func (cm *CallManager) handleAck(req *sip.Request, tx sip.ServerTransaction) {
@@ -296,8 +327,10 @@ func (cm *CallManager) handleCancel(req *sip.Request, tx sip.ServerTransaction) 
 	cm.mu.RUnlock()
 
 	if found != nil {
-		slog.Info("call cancelled by PBX", "call_id", found.callID)
+		slog.Info("call cancelled by PBX", "call_id", found.callID, "sip_call_id", callIDVal)
 		found.cancelFunc()
+	} else {
+		slog.Warn("CANCEL for unknown call", "sip_call_id", callIDVal)
 	}
 
 	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
