@@ -34,10 +34,10 @@ func (f *FCMSender) SendCallPush(ctx context.Context, token, callID, callerURI, 
 	msg := &messaging.Message{
 		Token: token,
 		Data: map[string]string{
-			"call_id":      callID,
-			"caller_uri":   callerURI,
-			"caller_name":  callerName,
-			"content_type": "application/call-info",
+			"call-id":      callID,
+			"caller-uri":   callerURI,
+			"caller-name":  callerName,
+			"content-type": "application/call-info",
 		},
 		Android: &messaging.AndroidConfig{
 			Priority: "high",

@@ -38,9 +38,9 @@ func (a *APNsSender) SendCallPush(ctx context.Context, token, callID, callerURI,
 		AlertBody(callerName).
 		Sound("default").
 		ContentAvailable().
-		Custom("call_id", callID).
-		Custom("caller_uri", callerURI).
-		Custom("caller_name", callerName)
+		Custom("call-id", callID).
+		Custom("caller-uri", callerURI).
+		Custom("caller-name", callerName)
 
 	notification := &apns2.Notification{
 		DeviceToken: token,
