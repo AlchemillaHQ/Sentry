@@ -4,7 +4,9 @@ sip:
   # tls_addr: "0.0.0.0:5061"
   # tls_cert: "certs/cert.pem"
   # tls_key:  "certs/key.pem"
-  external_ip: ""  # Public IP/hostname for SIP Contact headers. Auto-detected if empty.
+  external_ip: ""           # REQUIRED: Public IP/hostname for SIP Contact headers (e.g. "178.63.44.165" or "sip.example.com")
+  external_sip_port: 5060   # Port clients use to reach B2BUA for readiness REGISTER
+  external_sip_transport: "udp"  # Transport clients use: udp, tcp, or tls
   user_agent: "Difuse-B2BUA/1.0"
 
 api:

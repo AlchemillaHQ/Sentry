@@ -116,10 +116,12 @@ func (s *Stack) SetOnCancel(fn func(req *sip.Request, tx sip.ServerTransaction))
 	s.onCancel = fn
 }
 
-func (s *Stack) Client() *sipgo.Client { return s.client }
-func (s *Stack) Server() *sipgo.Server { return s.server }
-func (s *Stack) UA() *sipgo.UserAgent  { return s.ua }
-func (s *Stack) ExternalIP() string    { return s.cfg.ExternalIP }
+func (s *Stack) Client() *sipgo.Client        { return s.client }
+func (s *Stack) Server() *sipgo.Server        { return s.server }
+func (s *Stack) UA() *sipgo.UserAgent         { return s.ua }
+func (s *Stack) ExternalIP() string           { return s.cfg.ExternalIP }
+func (s *Stack) ExternalSIPPort() int         { return s.cfg.ExternalSIPPort }
+func (s *Stack) ExternalSIPTransport() string { return s.cfg.ExternalSIPTransport }
 
 func (s *Stack) handleRegister(req *sip.Request, tx sip.ServerTransaction) {
 	s.mu.RLock()

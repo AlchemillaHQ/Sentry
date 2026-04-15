@@ -8,13 +8,15 @@ import (
 )
 
 type SIPConfig struct {
-	UDPAddr    string `yaml:"udp_addr"`
-	TCPAddr    string `yaml:"tcp_addr"`
-	TLSAddr    string `yaml:"tls_addr"`
-	TLSCert    string `yaml:"tls_cert"`
-	TLSKey     string `yaml:"tls_key"`
-	ExternalIP string `yaml:"external_ip"`
-	UserAgent  string `yaml:"user_agent"`
+	UDPAddr              string `yaml:"udp_addr"`
+	TCPAddr              string `yaml:"tcp_addr"`
+	TLSAddr              string `yaml:"tls_addr"`
+	TLSCert              string `yaml:"tls_cert"`
+	TLSKey               string `yaml:"tls_key"`
+	ExternalIP           string `yaml:"external_ip"`
+	ExternalSIPPort      int    `yaml:"external_sip_port"`
+	ExternalSIPTransport string `yaml:"external_sip_transport"`
+	UserAgent            string `yaml:"user_agent"`
 }
 
 type APIConfig struct {
@@ -85,6 +87,16 @@ func Load(path string) (*Config, error) {
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
+	}
+
+	if cfg.SIP.ExternalIP == "" {
+		return nil, fmt.Errorf("sip.external_ip is required (public IP or hostname reachable by SIP clients)")
+	}
+	if cfg.SIP.ExternalSIPPort == 0 {
+		cfg.SIP.ExternalSIPPort = 5060
+	}
+	if cfg.SIP.ExternalSIPTransport == "" {
+		cfg.SIP.ExternalSIPTransport = "udp"
 	}
 
 	return cfg, nil

@@ -130,15 +130,12 @@ func (ur *UpstreamRegistrar) buildRegisterRequest(reg *UpstreamReg, expires int)
 	})
 
 	contactHost := ur.stack.ExternalIP()
-	if contactHost == "" {
-		contactHost = "127.0.0.1"
-	}
 
 	req.AppendHeader(&sip.ContactHeader{
 		Address: sip.Uri{
 			User: reg.User,
 			Host: contactHost,
-			Port: 5060,
+			Port: ur.stack.ExternalSIPPort(),
 		},
 	})
 

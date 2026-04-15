@@ -141,13 +141,14 @@ func (h *Handler) RegisterDevice(c *gin.Context) {
 	}
 
 	externalIP := h.stack.ExternalIP()
-	if externalIP == "" {
-		externalIP = "localhost"
-	}
+	sipPort := h.stack.ExternalSIPPort()
+	sipTransport := h.stack.ExternalSIPTransport()
+
+	b2buaURI := fmt.Sprintf("sip:%s@%s:%d;transport=%s", b2buaSIPUser, externalIP, sipPort, sipTransport)
 
 	c.JSON(http.StatusOK, gin.H{
 		"status":        "registered",
-		"b2bua_sip_uri": fmt.Sprintf("sip:%s@%s", b2buaSIPUser, externalIP),
+		"b2bua_sip_uri": b2buaURI,
 		"expires":       3600,
 	})
 }

@@ -52,9 +52,6 @@ func New(database *gorm.DB, stack *sipstack.Stack, registrar *sipstack.UpstreamR
 			Port: 5060,
 		},
 	}
-	if contactHdr.Address.Host == "" {
-		contactHdr.Address.Host = "127.0.0.1"
-	}
 
 	cm := &CallManager{
 		database:   database,
@@ -250,9 +247,6 @@ func (cm *CallManager) relayCall(ctx context.Context, pc *pendingCall, device *d
 		User: device.B2BUASIPUser,
 		Host: cm.stack.ExternalIP(),
 		Port: 5060,
-	}
-	if recipient.Host == "" {
-		recipient.Host = "127.0.0.1"
 	}
 
 	fromHdr := &sip.FromHeader{
