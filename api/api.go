@@ -34,7 +34,7 @@ func NewHandler(database *gorm.DB, registrar *sipstack.UpstreamRegistrar, box *s
 type RegisterRequest struct {
 	DeviceID          string `json:"device_id" binding:"required"`
 	Platform          string `json:"platform" binding:"required,oneof=android ios"`
-	PushToken         string `json:"push_token" binding:"required"`
+	PushToken         string `json:"push_token"`
 	UpstreamHost      string `json:"upstream_host" binding:"required"`
 	UpstreamPort      int    `json:"upstream_port"`
 	UpstreamTransport string `json:"upstream_transport"`
@@ -47,6 +47,7 @@ type RegisterRequest struct {
 func (h *Handler) RegisterDevice(c *gin.Context) {
 	var req RegisterRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		slog.Warn("register validation failed", "error", err)
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": err.Error()})
 		return
 	}
@@ -58,11 +59,15 @@ func (h *Handler) RegisterDevice(c *gin.Context) {
 		req.UpstreamTransport = "udp"
 	}
 
-	encToken, err := h.box.Encrypt([]byte(req.PushToken))
-	if err != nil {
-		slog.Error("encrypt push token failed", "error", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "encryption failed"})
-		return
+	var encToken []byte
+	if req.PushToken != "" {
+		var err error
+		encToken, err = h.box.Encrypt([]byte(req.PushToken))
+		if err != nil {
+			slog.Error("encrypt push token failed", "error", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "encryption failed"})
+			return
+		}
 	}
 	encPassword, err := h.box.Encrypt([]byte(req.UpstreamPassword))
 	if err != nil {
@@ -199,6 +204,78 @@ func (h *Handler) UnregisterDevice(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "unregistered"})
 }
 
+func (h *Handler) DeviceStatus(c *gin.Context) {
+	deviceID := c.Param("device_id")
+	if _, err := uuid.Parse(deviceID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "invalid device_id"})
+		return
+	}
+
+	var device db.Device
+	if err := h.database.Where("device_id = ?", deviceID).First(&device).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "message": "device not found"})
+		return
+	}
+
+	registered := h.registrar.IsRegistered(deviceID)
+	expired := device.ExpiresAt.Before(time.Now())
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":              "ok",
+		"device_id":           deviceID,
+		"upstream_registered": registered,
+		"db_expired":          expired,
+		"expires_at":          device.ExpiresAt,
+		"last_seen":           device.LastSeen,
+	})
+}
+
+func (h *Handler) ForceReregister(c *gin.Context) {
+	deviceID := c.Param("device_id")
+	if _, err := uuid.Parse(deviceID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "invalid device_id"})
+		return
+	}
+
+	var device db.Device
+	if err := h.database.Where("device_id = ?", deviceID).First(&device).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "message": "device not found"})
+		return
+	}
+
+	password, err := h.box.Decrypt(device.UpstreamPassword)
+	if err != nil {
+		slog.Error("decrypt password failed", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "decryption failed"})
+		return
+	}
+
+	reg := &sipstack.UpstreamReg{
+		DeviceID:  device.DeviceID,
+		User:      device.UpstreamUser,
+		Host:      device.UpstreamHost,
+		Port:      device.UpstreamPort,
+		Transport: device.UpstreamTransport,
+		Password:  string(password),
+		Realm:     device.UpstreamRealm,
+	}
+
+	regCtx, regCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer regCancel()
+	if err := h.registrar.Register(regCtx, reg); err != nil {
+		slog.Error("force re-register failed", "device", deviceID, "error", err)
+		c.JSON(http.StatusBadGateway, gin.H{"status": "error", "message": "upstream registration failed"})
+		return
+	}
+
+	h.database.Model(&db.Device{}).Where("device_id = ?", deviceID).Updates(map[string]interface{}{
+		"expires_at": time.Now().Add(1 * time.Hour),
+		"last_seen":  time.Now(),
+	})
+
+	c.JSON(http.StatusOK, gin.H{"status": "registered", "device_id": deviceID})
+}
+
 func SetupRouter(handler *Handler) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
@@ -214,6 +291,8 @@ func SetupRouter(handler *Handler) *gin.Engine {
 		v1.POST("/devices/register", handler.RegisterDevice)
 		v1.PUT("/devices/:device_id/refresh", handler.RefreshDevice)
 		v1.DELETE("/devices/:device_id", handler.UnregisterDevice)
+		v1.GET("/devices/:device_id/status", handler.DeviceStatus)
+		v1.POST("/devices/:device_id/reregister", handler.ForceReregister)
 	}
 
 	return r
