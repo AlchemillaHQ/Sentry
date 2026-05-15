@@ -94,7 +94,13 @@ func (h *Handler) RegisterDevice(c *gin.Context) {
 		LastSeen:          time.Now(),
 	}
 
-	result := h.database.Where("device_id = ?", req.DeviceID).First(&db.Device{})
+	var existing db.Device
+	result := h.database.Where("device_id = ?", req.DeviceID).First(&existing)
+	if result.Error != nil && result.Error != gorm.ErrRecordNotFound {
+		slog.Error("query device failed", "error", result.Error)
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "database error"})
+		return
+	}
 	if result.Error == gorm.ErrRecordNotFound {
 		if err := h.database.Create(&device).Error; err != nil {
 			slog.Error("create device failed", "error", err)
@@ -219,7 +225,7 @@ func (h *Handler) DeviceStatus(c *gin.Context) {
 	}
 
 	registered := h.registrar.IsRegistered(deviceID)
-	expired := device.ExpiresAt.Before(time.Now())
+	expired := time.Now().After(device.ExpiresAt)
 
 	c.JSON(http.StatusOK, gin.H{
 		"status":              "ok",

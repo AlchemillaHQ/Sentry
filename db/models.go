@@ -45,6 +45,10 @@ type Device struct {
 	UpstreamRealm     string    `gorm:"type:varchar(255)" json:"upstream_realm"`
 	DisplayName       string    `gorm:"type:varchar(255)" json:"display_name"`
 	B2BUASIPUser      string    `gorm:"column:b2bua_sip_user;type:varchar(255);uniqueIndex;not null" json:"b2bua_sip_user"`
+	DeviceContact     string    `gorm:"type:varchar(255)" json:"-"`
+	PushProvider      string    `gorm:"type:varchar(10)" json:"-"`
+	PushParam         string    `gorm:"type:varchar(255)" json:"-"`
+	PushPrid          string    `gorm:"type:varchar(512)" json:"-"`
 	RegisteredAt      time.Time `gorm:"autoCreateTime" json:"registered_at"`
 	ExpiresAt         time.Time `gorm:"not null" json:"expires_at"`
 	LastSeen          time.Time `json:"last_seen"`

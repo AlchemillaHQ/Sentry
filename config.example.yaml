@@ -4,10 +4,11 @@ sip:
   # tls_addr: "0.0.0.0:5061"
   # tls_cert: "certs/cert.pem"
   # tls_key:  "certs/key.pem"
-  external_ip: ""           # REQUIRED: Public IP/hostname for SIP Contact headers (e.g. "178.63.44.165" or "sip.example.com")
-  external_sip_port: 5060   # Port clients use to reach B2BUA for readiness REGISTER
-  external_sip_transport: "udp"  # Transport clients use: udp, tcp, or tls
+  external_ip: ""
+  external_sip_port: 5060
+  external_sip_transport: "udp"
   user_agent: "Difuse-B2BUA/1.0"
+  log_sip: false
 
 api:
   addr: "0.0.0.0:8080"
@@ -15,22 +16,19 @@ api:
   # tls_key:  "certs/api-key.pem"
 
 database:
-  driver: "sqlite"          # "sqlite" or "postgres"
-  dsn: "difuse.db"          # For postgres: "host=localhost user=difuse password=secret dbname=difuse port=5432 sslmode=disable"
-
-secrets:
-  encryption_key: "change-me-32-byte-key-here!!!!!"  # Exactly 32 bytes for AES-256-GCM
+  driver: "sqlite"
+  dsn: "difuse.db"
 
 push:
-  fcm_service_account: ""   # Path to Firebase service account JSON
-  apns_cert: ""             # Path to APNs .p12 certificate
+  fcm_service_account: ""
+  apns_cert: ""
   apns_key_id: ""
   apns_team_id: ""
   apns_bundle_id: ""
   apns_production: false
 
 pprof:
-  addr: ""                  # e.g. "127.0.0.1:6060". Empty = disabled.
+  addr: ""
 
 log:
-  level: "info"             # debug, info, warn, error
+  level: "info"

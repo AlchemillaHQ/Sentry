@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/AlchemillaHQ/Difuse-B2BUA/api"
 	"github.com/AlchemillaHQ/Difuse-B2BUA/callmanager"
@@ -30,7 +31,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Setup logging
 	var logLevel slog.Level
 	switch cfg.Log.Level {
 	case "debug":
@@ -44,7 +44,6 @@ func main() {
 	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})))
 
-	// Pprof
 	if cfg.Pprof.Addr != "" {
 		go func() {
 			slog.Info("pprof listening", "addr", cfg.Pprof.Addr)
@@ -54,14 +53,12 @@ func main() {
 		}()
 	}
 
-	// Database
 	database, err := db.Open(cfg.Database)
 	if err != nil {
 		slog.Error("database failed", "error", err)
 		os.Exit(1)
 	}
 
-	// Encryption key (auto-generated, stored in DB)
 	encKey, err := db.GetOrCreateEncryptionKey(database)
 	if err != nil {
 		slog.Error("encryption key failed", "error", err)
@@ -73,14 +70,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Push notifications
 	pushSender, err := push.NewDispatcher(cfg.Push)
 	if err != nil {
 		slog.Error("push init failed", "error", err)
 		os.Exit(1)
 	}
 
-	// SIP stack
 	stack, err := sipstack.New(cfg.SIP)
 	if err != nil {
 		slog.Error("SIP stack failed", "error", err)
@@ -88,18 +83,15 @@ func main() {
 	}
 	defer stack.Close()
 
-	// Upstream registrar
 	registrar := sipstack.NewUpstreamRegistrar(stack)
 	defer registrar.StopAll()
 
-	// Call manager (wires SIP handlers)
-	_ = callmanager.New(database, stack, registrar, pushSender, box)
+	callmanager.New(database, stack, registrar, pushSender, box)
 
-	// Context for graceful shutdown
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// Start SIP listeners
+	slog.Info("starting SIP listeners...")
 	go func() {
 		if err := stack.ListenAndServe(ctx); err != nil && ctx.Err() == nil {
 			slog.Error("SIP stack error", "error", err)
@@ -107,7 +99,6 @@ func main() {
 		}
 	}()
 
-	// REST API
 	handler := api.NewHandler(database, registrar, box, stack)
 	router := api.SetupRouter(handler)
 
@@ -130,8 +121,8 @@ func main() {
 		}
 	}()
 
-	// Re-register existing devices from DB on startup
 	go func() {
+		time.Sleep(2 * time.Second)
 		var devices []db.Device
 		database.Find(&devices)
 		for _, d := range devices {
@@ -149,9 +140,11 @@ func main() {
 				Password:  string(pwBytes),
 				Realm:     d.UpstreamRealm,
 			}
-			if err := registrar.Register(ctx, reg); err != nil {
+			regCtx, regCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			if err := registrar.Register(regCtx, reg); err != nil {
 				slog.Error("re-register on startup failed", "device", d.DeviceID, "error", err)
 			}
+			regCancel()
 		}
 		slog.Info("startup re-registration complete")
 	}()
@@ -160,7 +153,7 @@ func main() {
 	<-ctx.Done()
 	slog.Info("shutting down...")
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*1e9)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	srv.Shutdown(shutdownCtx)
 }

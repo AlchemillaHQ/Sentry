@@ -29,20 +29,22 @@ type Stack struct {
 }
 
 func New(cfg config.SIPConfig) (*Stack, error) {
-	// Enable sipgo debug logging to see SIP traffic
-	sipLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
-	sip.SetDefaultLogger(sipLogger)
+	if cfg.LogSIP {
+		sipLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		sip.SetDefaultLogger(sipLogger)
+	} else {
+		sipLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))
+		sip.SetDefaultLogger(sipLogger)
+	}
 
 	uaOpts := []sipgo.UserAgentOption{
 		sipgo.WithUserAgent(cfg.UserAgent),
 	}
 
-	// TLS config for outbound SIP (client) connections
 	outboundTLS := &tls.Config{
 		MinVersion:         tls.VersionTLS12,
-		InsecureSkipVerify: true, // PBXes often use self-signed certs
+		InsecureSkipVerify: true,
 	}
-	// If we have local certs, use them for inbound TLS too
 	if cfg.TLSCert != "" && cfg.TLSKey != "" {
 		cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)
 		if err != nil {

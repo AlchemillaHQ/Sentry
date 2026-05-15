@@ -17,6 +17,7 @@ type SIPConfig struct {
 	ExternalSIPPort      int    `yaml:"external_sip_port"`
 	ExternalSIPTransport string `yaml:"external_sip_transport"`
 	UserAgent            string `yaml:"user_agent"`
+	LogSIP               bool   `yaml:"log_sip"`
 }
 
 type APIConfig struct {
@@ -28,10 +29,6 @@ type APIConfig struct {
 type DatabaseConfig struct {
 	Driver string `yaml:"driver"`
 	DSN    string `yaml:"dsn"`
-}
-
-type SecretsConfig struct {
-	EncryptionKey string `yaml:"encryption_key"`
 }
 
 type PushConfig struct {
@@ -55,7 +52,6 @@ type Config struct {
 	SIP      SIPConfig      `yaml:"sip"`
 	API      APIConfig      `yaml:"api"`
 	Database DatabaseConfig `yaml:"database"`
-	Secrets  SecretsConfig  `yaml:"secrets"`
 	Push     PushConfig     `yaml:"push"`
 	Pprof    PprofConfig    `yaml:"pprof"`
 	Log      LogConfig      `yaml:"log"`
@@ -72,6 +68,7 @@ func Load(path string) (*Config, error) {
 			UDPAddr:   "0.0.0.0:5060",
 			TCPAddr:   "0.0.0.0:5060",
 			UserAgent: "Difuse-B2BUA/1.0",
+			LogSIP:    false,
 		},
 		API: APIConfig{
 			Addr: "0.0.0.0:8080",
