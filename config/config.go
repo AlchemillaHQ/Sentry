@@ -8,22 +8,24 @@ import (
 )
 
 type SIPConfig struct {
-	UDPAddr              string `yaml:"udp_addr"`
-	TCPAddr              string `yaml:"tcp_addr"`
-	TLSAddr              string `yaml:"tls_addr"`
-	TLSCert              string `yaml:"tls_cert"`
-	TLSKey               string `yaml:"tls_key"`
-	ExternalIP           string `yaml:"external_ip"`
-	ExternalSIPPort      int    `yaml:"external_sip_port"`
-	ExternalSIPTransport string `yaml:"external_sip_transport"`
-	UserAgent            string `yaml:"user_agent"`
-	LogSIP               bool   `yaml:"log_sip"`
+	UDPAddr                string `yaml:"udp_addr"`
+	TCPAddr                string `yaml:"tcp_addr"`
+	TLSAddr                string `yaml:"tls_addr"`
+	TLSCert                string `yaml:"tls_cert"`
+	TLSKey                 string `yaml:"tls_key"`
+	ExternalIP             string `yaml:"external_ip"`
+	ExternalSIPPort        int    `yaml:"external_sip_port"`
+	ExternalSIPTransport   string `yaml:"external_sip_transport"`
+	UserAgent              string `yaml:"user_agent"`
+	LogSIP                 bool   `yaml:"log_sip"`
+	TLSInsecureSkipVerify  bool   `yaml:"tls_insecure_skip_verify"`
 }
 
 type APIConfig struct {
 	Addr    string `yaml:"addr"`
 	TLSCert string `yaml:"tls_cert"`
 	TLSKey  string `yaml:"tls_key"`
+	AuthKey string `yaml:"auth_key"`
 }
 
 type DatabaseConfig struct {

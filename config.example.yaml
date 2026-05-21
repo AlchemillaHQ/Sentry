@@ -9,11 +9,13 @@ sip:
   external_sip_transport: "udp"
   user_agent: "Difuse-B2BUA/1.0"
   log_sip: false
+  tls_insecure_skip_verify: false
 
 api:
   addr: "0.0.0.0:8080"
   # tls_cert: "certs/api-cert.pem"
   # tls_key:  "certs/api-key.pem"
+  auth_key: ""
 
 database:
   driver: "sqlite"

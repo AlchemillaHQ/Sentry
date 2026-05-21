@@ -109,6 +109,28 @@ func (ur *UpstreamRegistrar) StopAll() {
 	ur.regs = make(map[string]*UpstreamReg)
 }
 
+func (ur *UpstreamRegistrar) UnregisterAll(ctx context.Context) {
+	ur.mu.Lock()
+	regs := make([]*UpstreamReg, 0, len(ur.regs))
+	for _, reg := range ur.regs {
+		regs = append(regs, reg)
+		if reg.cancel != nil {
+			reg.cancel()
+		}
+	}
+	ur.regs = make(map[string]*UpstreamReg)
+	ur.mu.Unlock()
+
+	for _, reg := range regs {
+		unregCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		if err := ur.sendRegister(unregCtx, reg, 0); err != nil {
+			slog.Error("unregister on shutdown failed", "device", reg.DeviceID, "error", err)
+		}
+		cancel()
+	}
+	slog.Info("all upstream registrations cancelled", "count", len(regs))
+}
+
 func (ur *UpstreamRegistrar) buildRegisterRequest(reg *UpstreamReg, expires int) *sip.Request {
 	target := sip.Uri{
 		Host: reg.Host,
@@ -130,10 +152,11 @@ func (ur *UpstreamRegistrar) buildRegisterRequest(reg *UpstreamReg, expires int)
 	})
 
 	contactHost := ur.stack.ExternalIP()
+	b2buaSIPUser := fmt.Sprintf("%s_%s", reg.User, reg.DeviceID[:8])
 
 	req.AppendHeader(&sip.ContactHeader{
 		Address: sip.Uri{
-			User: reg.User,
+			User: b2buaSIPUser,
 			Host: contactHost,
 			Port: ur.stack.ExternalSIPPort(),
 		},

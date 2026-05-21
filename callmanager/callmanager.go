@@ -21,21 +21,21 @@ import (
 const callTimeout = 30 * time.Second
 
 type pendingCall struct {
-	id         string
-	deviceID   string
+	id          string
+	deviceID    string
 	sipUser     string
-	callID     string
-	callerURI  string
-	callerName string
-	callerUser string
-	callerHost string
-	sdpOffer   []byte
-	serverDlg  *sipgo.DialogServerSession
-	clientDlg  *sipgo.DialogClientSession
+	callID      string
+	callerURI   string
+	callerName  string
+	callerUser  string
+	callerHost  string
+	sdpOffer    []byte
+	serverDlg   *sipgo.DialogServerSession
+	clientDlg   *sipgo.DialogClientSession
 	clientDlgMu sync.Mutex
-	readyCh    chan struct{}
-	ctx        context.Context
-	cancel     context.CancelFunc
+	readyCh     chan struct{}
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
 type CallManager struct {
@@ -90,7 +90,46 @@ func (cm *CallManager) handleRegister(req *sip.Request, tx sip.ServerTransaction
 	}
 
 	sipUser := toHdr.Address.User
-	slog.Info("REGISTER received", "sip_user", sipUser)
+
+	var device db.Device
+	if err := cm.database.Where("b2bua_sip_user = ?", sipUser).First(&device).Error; err != nil {
+		// Fallback: multiple devices might share the same upstream_user (extension)
+		var devices []db.Device
+		cm.database.Where("upstream_user = ?", sipUser).Find(&devices)
+		if len(devices) == 0 {
+			slog.Warn("REGISTER rejected: unknown user", "sip_user", sipUser)
+			tx.Respond(sip.NewResponseFromRequest(req, 403, "Forbidden", nil))
+			return
+		}
+
+		// Pick device with pending call
+		cm.mu.RLock()
+		var found *db.Device
+		for _, pc := range cm.pending {
+			for i := range devices {
+				if devices[i].DeviceID == pc.deviceID {
+					found = &devices[i]
+					break
+				}
+			}
+			if found != nil {
+				break
+			}
+		}
+		cm.mu.RUnlock()
+
+		if found != nil {
+			device = *found
+			slog.Info("REGISTER matched via pending call", "sip_user", sipUser, "device_id", device.DeviceID)
+		} else {
+			device = devices[0] // Fallback to first
+			slog.Info("REGISTER matched via first device fallback", "sip_user", sipUser, "device_id", device.DeviceID)
+		}
+	}
+
+	deviceKey := device.B2BUASIPUser
+
+	slog.Info("REGISTER received", "sip_user", sipUser, "device_key", deviceKey)
 
 	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
 	expiresHdr := sip.ExpiresHeader(120)
@@ -112,9 +151,9 @@ func (cm *CallManager) handleRegister(req *sip.Request, tx sip.ServerTransaction
 				uri.UriParams.Add("transport", transport)
 			}
 			cm.mu.Lock()
-			cm.deviceSource[sipUser] = uri
+			cm.deviceSource[deviceKey] = uri
 			cm.mu.Unlock()
-			slog.Info("stored device source", "sip_user", sipUser, "source", source, "transport", transport)
+			slog.Info("stored device source", "device_key", deviceKey, "source", source, "transport", transport)
 		}
 	}
 
@@ -126,8 +165,8 @@ func (cm *CallManager) handleRegister(req *sip.Request, tx sip.ServerTransaction
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 
-	for _, pc := range cm.pending {
-		if pc.sipUser == sipUser {
+		for _, pc := range cm.pending {
+		if pc.sipUser == deviceKey {
 			select {
 			case <-pc.readyCh:
 			default:
@@ -178,8 +217,10 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 	slog.Info("INVITE received", "to_user", sipUser, "call_id", req.CallID().Value())
 
 	var device db.Device
-	if err := cm.database.Where("upstream_user = ?", sipUser).First(&device).Error; err != nil {
-		if err := cm.database.Where("b2bua_sip_user = ?", sipUser).First(&device).Error; err != nil {
+	// Try looking up by b2bua_sip_user first (unique per device)
+	if err := cm.database.Where("b2bua_sip_user = ?", sipUser).First(&device).Error; err != nil {
+		// Fallback to upstream_user (may be ambiguous if multiple devices use same extension)
+		if err := cm.database.Where("upstream_user = ?", sipUser).First(&device).Error; err != nil {
 			slog.Warn("INVITE for unknown user", "user", sipUser)
 			tx.Respond(sip.NewResponseFromRequest(req, 404, "Not Found", nil))
 			return
@@ -275,13 +316,19 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 	case <-pc.readyCh:
 		slog.Info("device ready, relaying call", "call_id", callID)
 		cm.database.Model(&db.PendingCall{}).Where("call_id = ?", callID).Update("state", "DEVICE_READY")
+		cm.relayCall(callCtx, pc, &device)
+		return
 	case <-timeoutCtx.Done():
 		slog.Warn("call timed out waiting for device", "call_id", callID, "device", device.DeviceID)
+		if callCtx.Err() != nil { // cancelled by handleBye/handleCancel, not timeout
+			return
+		}
 		dlg.Respond(sip.StatusTemporarilyUnavailable, "Temporarily Unavailable", nil)
 		return
+	case <-callCtx.Done():
+		slog.Info("call cancelled before device wake", "call_id", callID)
+		return
 	}
-
-	cm.relayCall(callCtx, pc, &device)
 }
 
 func (cm *CallManager) relayCall(ctx context.Context, pc *pendingCall, device *db.Device) {
@@ -305,10 +352,7 @@ func (cm *CallManager) relayCall(ctx context.Context, pc *pendingCall, device *d
 		recipient.UriParams = srcUri.UriParams
 	}
 
-	slog.Info("relaying call to device",
-		"call_id", pc.id,
-		"device", device.DeviceID,
-		"recipient", recipient.String())
+	slog.Info("relaying call to device", "call_id", pc.id, "device", device.DeviceID, "recipient", recipient.String())
 
 	fromAddr := sip.Uri{User: pc.callerUser, Host: pc.callerHost}
 	if fromAddr.User == "" || fromAddr.Host == "" {
@@ -330,12 +374,11 @@ func (cm *CallManager) relayCall(ctx context.Context, pc *pendingCall, device *d
 		pc.serverDlg.Close()
 		return
 	}
+	defer dlgClient.Close()
 
 	pc.clientDlgMu.Lock()
 	pc.clientDlg = dlgClient
 	pc.clientDlgMu.Unlock()
-
-	defer dlgClient.Close()
 
 	if err := dlgClient.WaitAnswer(ctx, sipgo.AnswerOptions{}); err != nil {
 		slog.Error("device did not answer relay INVITE", "call_id", pc.id, "error", err)
@@ -450,4 +493,35 @@ func (cm *CallManager) cleanup(callID string) {
 	cm.mu.Lock()
 	delete(cm.pending, callID)
 	cm.mu.Unlock()
+}
+
+func (cm *CallManager) RemoveDeviceSource(sipUser string) {
+	cm.mu.Lock()
+	delete(cm.deviceSource, sipUser)
+	cm.mu.Unlock()
+}
+
+func (cm *CallManager) SendByeToAllBridgedCalls(ctx context.Context) {
+	cm.mu.RLock()
+	pendingCalls := make([]*pendingCall, 0, len(cm.pending))
+	for _, pc := range cm.pending {
+		pendingCalls = append(pendingCalls, pc)
+	}
+	cm.mu.RUnlock()
+
+	for _, pc := range pendingCalls {
+		pc.cancel()
+		byeCtx, byeCancel := context.WithTimeout(ctx, 5*time.Second)
+		pc.serverDlg.Bye(byeCtx)
+		byeCancel()
+
+		pc.clientDlgMu.Lock()
+		if pc.clientDlg != nil {
+			clientByeCtx, clientByeCancel := context.WithTimeout(ctx, 5*time.Second)
+			pc.clientDlg.Bye(clientByeCtx)
+			clientByeCancel()
+		}
+		pc.clientDlgMu.Unlock()
+	}
+	slog.Info("sent BYE to all bridged calls", "count", len(pendingCalls))
 }

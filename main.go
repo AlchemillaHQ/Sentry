@@ -19,6 +19,7 @@ import (
 	"github.com/AlchemillaHQ/Difuse-B2BUA/push"
 	"github.com/AlchemillaHQ/Difuse-B2BUA/secrets"
 	"github.com/AlchemillaHQ/Difuse-B2BUA/sipstack"
+	"gorm.io/gorm"
 )
 
 func main() {
@@ -59,6 +60,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	sqlDB, err := database.DB()
+	if err == nil {
+		sqlDB.SetMaxOpenConns(25)
+		sqlDB.SetMaxIdleConns(10)
+		sqlDB.SetConnMaxLifetime(5 * time.Minute)
+	}
+
 	encKey, err := db.GetOrCreateEncryptionKey(database)
 	if err != nil {
 		slog.Error("encryption key failed", "error", err)
@@ -84,22 +92,28 @@ func main() {
 	defer stack.Close()
 
 	registrar := sipstack.NewUpstreamRegistrar(stack)
-	defer registrar.StopAll()
 
-	callmanager.New(database, stack, registrar, pushSender, box)
+	cm := callmanager.New(database, stack, registrar, pushSender, box)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	sipReady := make(chan struct{})
 	slog.Info("starting SIP listeners...")
 	go func() {
+		close(sipReady)
 		if err := stack.ListenAndServe(ctx); err != nil && ctx.Err() == nil {
 			slog.Error("SIP stack error", "error", err)
 			cancel()
 		}
 	}()
 
-	handler := api.NewHandler(database, registrar, box, stack)
+	<-sipReady
+
+	db.CleanupStaleState(database)
+
+	handler := api.NewHandler(database, registrar, box, stack, cfg.API.AuthKey)
+	handler.SetCallManager(cm)
 	router := api.SetupRouter(handler)
 
 	srv := &http.Server{
@@ -121,39 +135,52 @@ func main() {
 		}
 	}()
 
-	go func() {
-		time.Sleep(2 * time.Second)
-		var devices []db.Device
-		database.Find(&devices)
-		for _, d := range devices {
-			pwBytes, err := box.Decrypt(d.UpstreamPassword)
-			if err != nil {
-				slog.Error("decrypt password failed on startup", "device", d.DeviceID, "error", err)
-				continue
-			}
-			reg := &sipstack.UpstreamReg{
-				DeviceID:  d.DeviceID,
-				User:      d.UpstreamUser,
-				Host:      d.UpstreamHost,
-				Port:      d.UpstreamPort,
-				Transport: d.UpstreamTransport,
-				Password:  string(pwBytes),
-				Realm:     d.UpstreamRealm,
-			}
-			regCtx, regCancel := context.WithTimeout(context.Background(), 15*time.Second)
-			if err := registrar.Register(regCtx, reg); err != nil {
-				slog.Error("re-register on startup failed", "device", d.DeviceID, "error", err)
-			}
-			regCancel()
-		}
-		slog.Info("startup re-registration complete")
-	}()
+	go reregisterDevices(ctx, database, registrar, box)
 
 	slog.Info("Difuse B2BUA started")
 	<-ctx.Done()
 	slog.Info("shutting down...")
 
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
+
+	slog.Info("sending unregister to upstream PBXes...")
+	registrar.UnregisterAll(shutdownCtx)
+
+	cm.SendByeToAllBridgedCalls(shutdownCtx)
+
 	srv.Shutdown(shutdownCtx)
+	slog.Info("shutdown complete")
+}
+
+func reregisterDevices(ctx context.Context, database *gorm.DB, registrar *sipstack.UpstreamRegistrar, box *secrets.Box) {
+	var devices []db.Device
+	database.Find(&devices)
+	for _, d := range devices {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		pwBytes, err := box.Decrypt(d.UpstreamPassword)
+		if err != nil {
+			slog.Error("decrypt password failed on startup", "device", d.DeviceID, "error", err)
+			continue
+		}
+		reg := &sipstack.UpstreamReg{
+			DeviceID:  d.DeviceID,
+			User:      d.UpstreamUser,
+			Host:      d.UpstreamHost,
+			Port:      d.UpstreamPort,
+			Transport: d.UpstreamTransport,
+			Password:  string(pwBytes),
+			Realm:     d.UpstreamRealm,
+		}
+		regCtx, regCancel := context.WithTimeout(ctx, 15*time.Second)
+		if err := registrar.Register(regCtx, reg); err != nil {
+			slog.Error("re-register on startup failed", "device", d.DeviceID, "error", err)
+		}
+		regCancel()
+	}
+	slog.Info("startup re-registration complete")
 }

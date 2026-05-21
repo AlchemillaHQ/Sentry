@@ -43,7 +43,7 @@ func New(cfg config.SIPConfig) (*Stack, error) {
 
 	outboundTLS := &tls.Config{
 		MinVersion:         tls.VersionTLS12,
-		InsecureSkipVerify: true,
+		InsecureSkipVerify: cfg.TLSInsecureSkipVerify,
 	}
 	if cfg.TLSCert != "" && cfg.TLSKey != "" {
 		cert, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey)

@@ -16,19 +16,26 @@ import (
 )
 
 type Handler struct {
-	database  *gorm.DB
-	registrar *sipstack.UpstreamRegistrar
-	box       *secrets.Box
-	stack     *sipstack.Stack
+	database   *gorm.DB
+	registrar  *sipstack.UpstreamRegistrar
+	box        *secrets.Box
+	stack      *sipstack.Stack
+	authKey    string
+	callMgr    interface{ RemoveDeviceSource(string) }
 }
 
-func NewHandler(database *gorm.DB, registrar *sipstack.UpstreamRegistrar, box *secrets.Box, stack *sipstack.Stack) *Handler {
+func NewHandler(database *gorm.DB, registrar *sipstack.UpstreamRegistrar, box *secrets.Box, stack *sipstack.Stack, authKey string) *Handler {
 	return &Handler{
 		database:  database,
 		registrar: registrar,
 		box:       box,
 		stack:     stack,
+		authKey:   authKey,
 	}
+}
+
+func (h *Handler) SetCallManager(cm interface{ RemoveDeviceSource(string) }) {
+	h.callMgr = cm
 }
 
 type RegisterRequest struct {
@@ -206,6 +213,13 @@ func (h *Handler) UnregisterDevice(c *gin.Context) {
 		slog.Error("upstream unregistration failed", "device", deviceID, "error", err)
 	}
 
+	var device db.Device
+	if err := h.database.Where("device_id = ?", deviceID).First(&device).Error; err == nil {
+		if h.callMgr != nil {
+			h.callMgr.RemoveDeviceSource(device.B2BUASIPUser)
+		}
+	}
+
 	h.database.Where("device_id = ?", deviceID).Delete(&db.Device{})
 	h.database.Where("device_id = ?", deviceID).Delete(&db.PendingCall{})
 	c.JSON(http.StatusOK, gin.H{"status": "unregistered"})
@@ -290,10 +304,27 @@ func SetupRouter(handler *Handler) *gin.Engine {
 	r.Use(gin.LoggerWithConfig(gin.LoggerConfig{SkipPaths: []string{"/health"}}))
 
 	r.GET("/health", func(c *gin.Context) {
+		sqlDB, err := handler.database.DB()
+		if err != nil || sqlDB.Ping() != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "degraded", "db": "unreachable"})
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
 
 	v1 := r.Group("/v1")
+	if handler.authKey != "" {
+		v1.Use(func(c *gin.Context) {
+			key := c.GetHeader("Authorization")
+			expected := "Bearer " + handler.authKey
+			if key != expected {
+				c.JSON(http.StatusUnauthorized, gin.H{"status": "error", "message": "unauthorized"})
+				c.Abort()
+				return
+			}
+			c.Next()
+		})
+	}
 	{
 		v1.POST("/devices/register", handler.RegisterDevice)
 		v1.PUT("/devices/:device_id/refresh", handler.RefreshDevice)
