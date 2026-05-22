@@ -60,6 +60,10 @@ func New(database *gorm.DB, stack *sipstack.Stack, registrar *sipstack.UpstreamR
 			Port: stack.ExternalSIPPort(),
 		},
 	}
+	if stack.ExternalSIPTransport() != "" && stack.ExternalSIPTransport() != "udp" {
+		contactHdr.Address.UriParams = sip.NewParams()
+		contactHdr.Address.UriParams.Add("transport", stack.ExternalSIPTransport())
+	}
 
 	cm := &CallManager{
 		database:      database,
@@ -214,18 +218,7 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 	}
 
 	sipUser := toHdr.Address.User
-	slog.Info("INVITE received", "to_user", sipUser, "call_id", req.CallID().Value())
-
-	var device db.Device
-	// Try looking up by b2bua_sip_user first (unique per device)
-	if err := cm.database.Where("b2bua_sip_user = ?", sipUser).First(&device).Error; err != nil {
-		// Fallback to upstream_user (may be ambiguous if multiple devices use same extension)
-		if err := cm.database.Where("upstream_user = ?", sipUser).First(&device).Error; err != nil {
-			slog.Warn("INVITE for unknown user", "user", sipUser)
-			tx.Respond(sip.NewResponseFromRequest(req, 404, "Not Found", nil))
-			return
-		}
-	}
+	slog.Info("INVITE received", "to", toHdr.String(), "call_id", req.CallID().Value())
 
 	dlg, err := cm.dialogSrv.ReadInvite(req, tx)
 	if err != nil {
@@ -234,7 +227,50 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 		return
 	}
 
+	if toHdr.Params.Has("tag") {
+		slog.Info("in-dialog INVITE (re-INVITE) received", "call_id", req.CallID().Value())
+		dlg.Respond(sip.StatusOK, "OK", nil)
+		return
+	}
+
 	dlg.Respond(sip.StatusTrying, "Trying", nil)
+
+	var device db.Device
+	// Try looking up by b2bua_sip_user first (unique per device)
+	if err := cm.database.Where("b2bua_sip_user = ?", sipUser).First(&device).Error; err != nil {
+		// Fallback: multiple devices might share the same upstream_user (extension)
+		var devices []db.Device
+		cm.database.Where("upstream_user = ?", sipUser).Find(&devices)
+		if len(devices) == 0 {
+			slog.Warn("INVITE for unknown user", "user", sipUser)
+			tx.Respond(sip.NewResponseFromRequest(req, 404, "Not Found", nil))
+			return
+		}
+
+		// Pick device with pending call
+		cm.mu.RLock()
+		var found *db.Device
+		for _, pc := range cm.pending {
+			for i := range devices {
+				if devices[i].DeviceID == pc.deviceID {
+					found = &devices[i]
+					break
+				}
+			}
+			if found != nil {
+				break
+			}
+		}
+		cm.mu.RUnlock()
+
+		if found != nil {
+			device = *found
+			slog.Info("INVITE matched via pending call", "sip_user", sipUser, "device_id", device.DeviceID)
+		} else {
+			device = devices[0] // Fallback to first
+			slog.Info("INVITE matched via first device fallback", "sip_user", sipUser, "device_id", device.DeviceID)
+		}
+	}
 
 	fromHdr := req.From()
 	callerURI := ""
@@ -405,7 +441,24 @@ func (cm *CallManager) relayCall(ctx context.Context, pc *pendingCall, device *d
 
 	deviceSDP := inviteResponse.Body()
 	slog.Info("sending 200 OK to PBX", "call_id", pc.id, "sdp_len", len(deviceSDP))
-	if err := pc.serverDlg.Respond(sip.StatusOK, "OK", deviceSDP); err != nil {
+
+	// SIPIS/Asterisk-style headers for robust bridging
+	contactHdr := &sip.ContactHeader{
+		Address: sip.Uri{
+			User: device.B2BUASIPUser,
+			Host: cm.stack.ExternalIP(),
+			Port: cm.stack.ExternalSIPPort(),
+		},
+	}
+	if cm.stack.ExternalSIPTransport() != "" && cm.stack.ExternalSIPTransport() != "udp" {
+		contactHdr.Address.UriParams = sip.NewParams()
+		contactHdr.Address.UriParams.Add("transport", cm.stack.ExternalSIPTransport())
+	}
+
+	contentTypeHdr := sip.NewHeader("Content-Type", "application/sdp")
+	allowHdr := sip.NewHeader("Allow", "INVITE, ACK, CANCEL, OPTIONS, BYE, REFER, NOTIFY, MESSAGE, SUBSCRIBE, INFO, UPDATE")
+
+	if err := pc.serverDlg.Respond(sip.StatusOK, "OK", deviceSDP, contactHdr, contentTypeHdr, allowHdr); err != nil {
 		slog.Error("failed to send 200 OK to PBX", "call_id", pc.id, "error", err)
 		pc.serverDlg.Close()
 		return
@@ -432,11 +485,18 @@ func (cm *CallManager) relayCall(ctx context.Context, pc *pendingCall, device *d
 }
 
 func (cm *CallManager) handleAck(req *sip.Request, tx sip.ServerTransaction) {
-	cm.dialogSrv.ReadAck(req, tx)
+	err := cm.dialogSrv.ReadAck(req, tx)
+	if err != nil {
+		slog.Error("failed to read ACK into dialog", "error", err, "call_id", req.CallID().Value())
+	} else {
+		slog.Info("ACK received and processed", "call_id", req.CallID().Value())
+	}
 }
 
 func (cm *CallManager) handleBye(req *sip.Request, tx sip.ServerTransaction) {
-	if err := cm.dialogSrv.ReadBye(req, tx); err == nil {
+	err := cm.dialogSrv.ReadBye(req, tx)
+	if err == nil {
+		slog.Info("BYE received from PBX", "call_id", req.CallID().Value())
 		callIDVal := req.CallID().Value()
 		cm.mu.RLock()
 		for _, pc := range cm.pending {
@@ -448,9 +508,13 @@ func (cm *CallManager) handleBye(req *sip.Request, tx sip.ServerTransaction) {
 		cm.mu.RUnlock()
 		return
 	}
+
 	if err := cm.dialogCli.ReadBye(req, tx); err == nil {
+		slog.Info("BYE received from device", "call_id", req.CallID().Value())
 		return
 	}
+
+	slog.Warn("BYE received for unknown dialog", "call_id", req.CallID().Value())
 	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
 	tx.Respond(res)
 }
