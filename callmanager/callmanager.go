@@ -399,6 +399,14 @@ func (cm *CallManager) relayCall(ctx context.Context, pc *pendingCall, device *d
 		return
 	}
 
+	if ctx.Err() != nil {
+		slog.Info("call cancelled while waiting for device answer, terminating relay leg", "call_id", pc.id)
+		byeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		dlgClient.Bye(byeCtx)
+		cancel()
+		return
+	}
+
 	inviteResponse := dlgClient.InviteResponse
 	if inviteResponse == nil {
 		slog.Error("no invite response from device", "call_id", pc.id)
