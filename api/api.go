@@ -97,7 +97,7 @@ func (h *Handler) RegisterDevice(c *gin.Context) {
 		UpstreamRealm:     req.UpstreamRealm,
 		DisplayName:       req.DisplayName,
 		B2BUASIPUser:      b2buaSIPUser,
-		ExpiresAt:         time.Now().Add(1 * time.Hour),
+		ExpiresAt:         time.Now().Add(24 * time.Hour),
 		LastSeen:          time.Now(),
 	}
 
@@ -184,7 +184,7 @@ func (h *Handler) RefreshDevice(c *gin.Context) {
 	}
 
 	updates := map[string]interface{}{
-		"expires_at": time.Now().Add(1 * time.Hour),
+		"expires_at": time.Now().Add(24 * time.Hour),
 		"last_seen":  time.Now(),
 	}
 
@@ -290,7 +290,7 @@ func (h *Handler) ForceReregister(c *gin.Context) {
 	}
 
 	h.database.Model(&db.Device{}).Where("device_id = ?", deviceID).Updates(map[string]interface{}{
-		"expires_at": time.Now().Add(1 * time.Hour),
+		"expires_at": time.Now().Add(24 * time.Hour),
 		"last_seen":  time.Now(),
 	})
 
