@@ -29,12 +29,24 @@ type UpstreamReg struct {
 	cancel context.CancelFunc
 }
 
+type Registrar interface {
+	Register(ctx context.Context, reg *UpstreamReg) error
+	Unregister(ctx context.Context, deviceID string) error
+	IsRegistered(deviceID string) bool
+	GetReg(deviceID string) *UpstreamReg
+	StopAll()
+	UnregisterAll(ctx context.Context)
+}
+
 type UpstreamRegistrar struct {
 	stack *Stack
 
 	mu   sync.RWMutex
 	regs map[string]*UpstreamReg
 }
+
+var _ Registrar = (*UpstreamRegistrar)(nil)
+
 
 func NewUpstreamRegistrar(stack *Stack) *UpstreamRegistrar {
 	return &UpstreamRegistrar{

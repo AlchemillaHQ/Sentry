@@ -4,10 +4,10 @@ sip:
   # tls_addr: "0.0.0.0:5061"
   # tls_cert: "certs/cert.pem"
   # tls_key:  "certs/key.pem"
-  external_ip: ""
+  external_ip: "" # YOUR_PUBLIC_IP
   external_sip_port: 5060
   external_sip_transport: "udp"
-  user_agent: "Difuse-B2BUA/1.0"
+  user_agent: "Sentry/1.0"
   log_sip: false
   tls_insecure_skip_verify: false
 
@@ -15,15 +15,15 @@ api:
   addr: "0.0.0.0:8080"
   # tls_cert: "certs/api-cert.pem"
   # tls_key:  "certs/api-key.pem"
-  auth_key: ""
+  auth_key: "CHANGE_ME"
 
 database:
-  driver: "sqlite"
-  dsn: "difuse.db"
+  driver: "postgres"
+  dsn: "postgres://user:password@localhost:5432/difuse?sslmode=disable"
 
 push:
-  fcm_service_account: ""
-  apns_cert: ""
+  fcm_service_account: "" # Path to Firebase JSON key
+  apns_cert: "" # Path to APNs .p12 or .pem
   apns_key_id: ""
   apns_team_id: ""
   apns_bundle_id: ""

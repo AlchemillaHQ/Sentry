@@ -12,14 +12,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/AlchemillaHQ/Difuse-B2BUA/api"
-	"github.com/AlchemillaHQ/Difuse-B2BUA/callmanager"
-	"github.com/AlchemillaHQ/Difuse-B2BUA/config"
-	"github.com/AlchemillaHQ/Difuse-B2BUA/db"
-	"github.com/AlchemillaHQ/Difuse-B2BUA/push"
-	"github.com/AlchemillaHQ/Difuse-B2BUA/secrets"
-	"github.com/AlchemillaHQ/Difuse-B2BUA/sipstack"
-	"gorm.io/gorm"
+	"github.com/AlchemillaHQ/Sentry/api"
+	"github.com/AlchemillaHQ/Sentry/callmanager"
+	"github.com/AlchemillaHQ/Sentry/config"
+	"github.com/AlchemillaHQ/Sentry/db"
+	"github.com/AlchemillaHQ/Sentry/push"
+	"github.com/AlchemillaHQ/Sentry/secrets"
+	"github.com/AlchemillaHQ/Sentry/sipstack"
 )
 
 func main() {
@@ -54,20 +53,16 @@ func main() {
 		}()
 	}
 
-	database, err := db.Open(cfg.Database)
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	database, err := db.Open(ctx, cfg.Database)
 	if err != nil {
 		slog.Error("database failed", "error", err)
 		os.Exit(1)
 	}
 
-	sqlDB, err := database.DB()
-	if err == nil {
-		sqlDB.SetMaxOpenConns(25)
-		sqlDB.SetMaxIdleConns(10)
-		sqlDB.SetConnMaxLifetime(5 * time.Minute)
-	}
-
-	encKey, err := db.GetOrCreateEncryptionKey(database)
+	encKey, err := database.GetOrCreateEncryptionKey(ctx)
 	if err != nil {
 		slog.Error("encryption key failed", "error", err)
 		os.Exit(1)
@@ -84,6 +79,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	pushSender.Start(ctx)
+
 	stack, err := sipstack.New(cfg.SIP)
 	if err != nil {
 		slog.Error("SIP stack failed", "error", err)
@@ -94,9 +91,6 @@ func main() {
 	registrar := sipstack.NewUpstreamRegistrar(stack)
 
 	cm := callmanager.New(database, stack, registrar, pushSender, box)
-
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
 
 	sipReady := make(chan struct{})
 	slog.Info("starting SIP listeners...")
@@ -110,7 +104,8 @@ func main() {
 
 	<-sipReady
 
-	db.CleanupStaleState(database)
+	database.CleanupStaleState(ctx)
+	database.StartCleanupWorker(ctx)
 
 	handler := api.NewHandler(database, registrar, box, stack, cfg.API.AuthKey)
 	handler.SetCallManager(cm)
@@ -137,7 +132,7 @@ func main() {
 
 	go reregisterDevices(ctx, database, registrar, box)
 
-	slog.Info("Difuse B2BUA started")
+	slog.Info("Sentry started")
 	<-ctx.Done()
 	slog.Info("shutting down...")
 
@@ -153,32 +148,44 @@ func main() {
 	slog.Info("shutdown complete")
 }
 
-func reregisterDevices(ctx context.Context, database *gorm.DB, registrar *sipstack.UpstreamRegistrar, box *secrets.Box) {
-	var devices []db.Device
-	database.Find(&devices)
-	for _, d := range devices {
+func reregisterDevices(ctx context.Context, database *db.Database, registrar *sipstack.UpstreamRegistrar, box *secrets.Box) {
+	rows, err := database.Pool.Query(ctx, "SELECT device_id, upstream_host, upstream_port, upstream_transport, upstream_user, upstream_password, upstream_realm FROM devices")
+	if err != nil {
+		slog.Error("failed to query devices for re-registration", "error", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var dID, host, transport, user, password, realm string
+		var port int
+		if err := rows.Scan(&dID, &host, &port, &transport, &user, &password, &realm); err != nil {
+			slog.Error("failed to scan device", "error", err)
+			continue
+		}
+
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-		pwBytes, err := box.Decrypt(d.UpstreamPassword)
+		pwBytes, err := box.Decrypt([]byte(password))
 		if err != nil {
-			slog.Error("decrypt password failed on startup", "device", d.DeviceID, "error", err)
+			slog.Error("decrypt password failed on startup", "device", dID, "error", err)
 			continue
 		}
 		reg := &sipstack.UpstreamReg{
-			DeviceID:  d.DeviceID,
-			User:      d.UpstreamUser,
-			Host:      d.UpstreamHost,
-			Port:      d.UpstreamPort,
-			Transport: d.UpstreamTransport,
+			DeviceID:  dID,
+			User:      user,
+			Host:      host,
+			Port:      port,
+			Transport: transport,
 			Password:  string(pwBytes),
-			Realm:     d.UpstreamRealm,
+			Realm:     realm,
 		}
 		regCtx, regCancel := context.WithTimeout(ctx, 15*time.Second)
 		if err := registrar.Register(regCtx, reg); err != nil {
-			slog.Error("re-register on startup failed", "device", d.DeviceID, "error", err)
+			slog.Error("re-register on startup failed", "device", dID, "error", err)
 		}
 		regCancel()
 	}

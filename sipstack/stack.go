@@ -5,12 +5,15 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"sync"
+	"syscall"
 
-	"github.com/AlchemillaHQ/Difuse-B2BUA/config"
+	"github.com/AlchemillaHQ/Sentry/config"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
+	"golang.org/x/sys/unix"
 )
 
 type Stack struct {
@@ -185,8 +188,28 @@ func (s *Stack) ListenAndServe(ctx context.Context) error {
 	if s.cfg.UDPAddr != "" {
 		go func() {
 			slog.Info("SIP listening", "transport", "udp", "addr", s.cfg.UDPAddr)
-			if err := s.server.ListenAndServe(ctx, "udp", s.cfg.UDPAddr); err != nil {
-				errCh <- fmt.Errorf("udp: %w", err)
+
+			// Optimized UDP listener with SO_REUSEPORT
+			lc := net.ListenConfig{
+				Control: func(network, address string, c syscall.RawConn) error {
+					var opErr error
+					if err := c.Control(func(fd uintptr) {
+						opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+					}); err != nil {
+						return err
+					}
+					return opErr
+				},
+			}
+
+			conn, err := lc.ListenPacket(ctx, "udp", s.cfg.UDPAddr)
+			if err != nil {
+				errCh <- fmt.Errorf("udp listen: %w", err)
+				return
+			}
+
+			if err := s.server.ServeUDP(conn.(*net.UDPConn)); err != nil {
+				errCh <- fmt.Errorf("udp serve: %w", err)
 			}
 		}()
 	}

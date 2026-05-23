@@ -8,14 +8,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AlchemillaHQ/Difuse-B2BUA/db"
-	"github.com/AlchemillaHQ/Difuse-B2BUA/push"
-	"github.com/AlchemillaHQ/Difuse-B2BUA/secrets"
-	"github.com/AlchemillaHQ/Difuse-B2BUA/sipstack"
+	"github.com/AlchemillaHQ/Sentry/db"
+	"github.com/AlchemillaHQ/Sentry/push"
+	"github.com/AlchemillaHQ/Sentry/secrets"
+	"github.com/AlchemillaHQ/Sentry/sipstack"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 	"github.com/google/uuid"
-	"gorm.io/gorm"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 const callTimeout = 30 * time.Second
@@ -39,11 +40,11 @@ type pendingCall struct {
 }
 
 type CallManager struct {
-	database   *gorm.DB
-	stack      *sipstack.Stack
-	registrar  *sipstack.UpstreamRegistrar
-	pushSender *push.Dispatcher
-	box        *secrets.Box
+	dbQueries    db.Querier
+	stack        *sipstack.Stack
+	registrar    sipstack.Registrar
+	pushSender   push.Sender
+	box          *secrets.Box
 
 	mu           sync.RWMutex
 	pending      map[string]*pendingCall
@@ -53,7 +54,7 @@ type CallManager struct {
 	dialogCli *sipgo.DialogClientCache
 }
 
-func New(database *gorm.DB, stack *sipstack.Stack, registrar *sipstack.UpstreamRegistrar, pushSender *push.Dispatcher, box *secrets.Box) *CallManager {
+func New(database *db.Database, stack *sipstack.Stack, registrar sipstack.Registrar, pushSender push.Sender, box *secrets.Box) *CallManager {
 	contactHdr := sip.ContactHeader{
 		Address: sip.Uri{
 			Host: stack.ExternalIP(),
@@ -66,7 +67,7 @@ func New(database *gorm.DB, stack *sipstack.Stack, registrar *sipstack.UpstreamR
 	}
 
 	cm := &CallManager{
-		database:     database,
+		dbQueries:    database.Queries,
 		stack:        stack,
 		registrar:    registrar,
 		pushSender:   pushSender,
@@ -86,16 +87,15 @@ func New(database *gorm.DB, stack *sipstack.Stack, registrar *sipstack.UpstreamR
 	return cm
 }
 
-func (cm *CallManager) matchDevice(sipUser string) (*db.Device, error) {
-	var device db.Device
-	if err := cm.database.Where("b2bua_sip_user = ?", sipUser).First(&device).Error; err == nil {
+func (cm *CallManager) matchDevice(ctx context.Context, sipUser string) (*db.Device, error) {
+	device, err := cm.dbQueries.GetDeviceByB2BUASIPUser(ctx, sipUser)
+	if err == nil {
 		return &device, nil
 	}
 
-	var devices []db.Device
-	cm.database.Where("upstream_user = ?", sipUser).Find(&devices)
-	if len(devices) == 0 {
-		return nil, gorm.ErrRecordNotFound
+	devices, err := cm.dbQueries.GetDevicesByUpstreamUser(ctx, sipUser)
+	if err != nil || len(devices) == 0 {
+		return nil, pgx.ErrNoRows
 	}
 
 	cm.mu.RLock()
@@ -132,14 +132,15 @@ func (cm *CallManager) handleRegister(req *sip.Request, tx sip.ServerTransaction
 	}
 
 	sipUser := toHdr.Address.User
-	device, err := cm.matchDevice(sipUser)
+	ctx := context.Background()
+	device, err := cm.matchDevice(ctx, sipUser)
 	if err != nil {
 		slog.Warn("REGISTER rejected: unknown user", "sip_user", sipUser)
 		tx.Respond(sip.NewResponseFromRequest(req, 403, "Forbidden", nil))
 		return
 	}
 
-	deviceKey := device.B2BUASIPUser
+	deviceKey := device.B2buaSipUser
 	slog.Info("REGISTER received", "sip_user", sipUser, "device_id", device.DeviceID)
 
 	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
@@ -169,7 +170,7 @@ func (cm *CallManager) handleRegister(req *sip.Request, tx sip.ServerTransaction
 
 	contact := req.Contact()
 	if contact != nil {
-		cm.updateDeviceFromContact(device.B2BUASIPUser, contact)
+		cm.updateDeviceFromContact(ctx, device.B2buaSipUser, contact)
 	}
 
 	cm.mu.RLock()
@@ -186,34 +187,58 @@ func (cm *CallManager) handleRegister(req *sip.Request, tx sip.ServerTransaction
 	}
 }
 
-func (cm *CallManager) updateDeviceFromContact(sipUser string, contact *sip.ContactHeader) {
-	var device db.Device
-	if err := cm.database.Where("b2bua_sip_user = ?", sipUser).First(&device).Error; err != nil {
+func (cm *CallManager) updateDeviceFromContact(ctx context.Context, sipUser string, contact *sip.ContactHeader) {
+	device, err := cm.dbQueries.GetDeviceByB2BUASIPUser(ctx, sipUser)
+	if err != nil {
 		return
 	}
 
-	updates := map[string]interface{}{
-		"device_contact": contact.Address.String(),
-		"last_seen":      time.Now(),
-	}
+	deviceContact := contact.Address.String()
+	lastSeen := time.Now()
+
+	pushProvider := device.PushProvider.String
+	pushParam := device.PushParam.String
+	pushPrid := device.PushPrid.String
+	pushToken := device.PushToken
 
 	if params := contact.Address.UriParams; params != nil {
 		if provider, ok := params.Get("pn-provider"); ok && provider != "" {
-			updates["push_provider"] = provider
+			pushProvider = provider
 		}
 		if param, ok := params.Get("pn-param"); ok && param != "" {
-			updates["push_param"] = param
+			pushParam = param
 		}
 		if prid, ok := params.Get("pn-prid"); ok && prid != "" {
 			encToken, err := cm.box.Encrypt([]byte(prid))
 			if err == nil {
-				updates["push_token"] = encToken
-				updates["push_prid"] = prid
+				pushToken = encToken
+				pushPrid = prid
 			}
 		}
 	}
 
-	cm.database.Model(&db.Device{}).Where("b2bua_sip_user = ?", sipUser).Updates(updates)
+	err = cm.dbQueries.UpsertDevice(ctx, db.UpsertDeviceParams{
+		DeviceID:          device.DeviceID,
+		Platform:          device.Platform,
+		PushToken:         pushToken,
+		UpstreamHost:      device.UpstreamHost,
+		UpstreamPort:      device.UpstreamPort,
+		UpstreamTransport: device.UpstreamTransport,
+		UpstreamUser:      device.UpstreamUser,
+		UpstreamPassword:  device.UpstreamPassword,
+		UpstreamRealm:     device.UpstreamRealm,
+		DisplayName:       device.DisplayName,
+		B2buaSipUser:      device.B2buaSipUser,
+		DeviceContact:     pgtype.Text{String: deviceContact, Valid: true},
+		PushProvider:      pgtype.Text{String: pushProvider, Valid: pushProvider != ""},
+		PushParam:         pgtype.Text{String: pushParam, Valid: pushParam != ""},
+		PushPrid:          pgtype.Text{String: pushPrid, Valid: pushPrid != ""},
+		ExpiresAt:         device.ExpiresAt,
+		LastSeen:          pgtype.Timestamptz{Time: lastSeen, Valid: true},
+	})
+	if err != nil {
+		slog.Error("failed to update device from contact", "error", err)
+	}
 }
 
 func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) {
@@ -241,7 +266,8 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 
 	dlg.Respond(sip.StatusTrying, "Trying", nil)
 
-	device, err := cm.matchDevice(sipUser)
+	ctx := context.Background()
+	device, err := cm.matchDevice(ctx, sipUser)
 	if err != nil {
 		slog.Warn("INVITE rejected: unknown user", "user", sipUser)
 		tx.Respond(sip.NewResponseFromRequest(req, 404, "Not Found", nil))
@@ -270,7 +296,7 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 	pc := &pendingCall{
 		id:         callID,
 		deviceID:   device.DeviceID,
-		sipUser:    device.B2BUASIPUser,
+		sipUser:    device.B2buaSipUser,
 		callID:     req.CallID().Value(),
 		callerURI:  callerURI,
 		callerName: callerName,
@@ -289,18 +315,21 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 
 	defer cm.cleanup(callID)
 
-	cm.database.Create(&db.PendingCall{
+	err = cm.dbQueries.CreatePendingCall(ctx, db.CreatePendingCallParams{
 		CallID:     callID,
 		DeviceID:   device.DeviceID,
-		SIPCallID:  req.CallID().Value(),
-		SIPFrom:    callerURI,
-		SIPTo:      toHdr.Address.String(),
-		CallerURI:  callerURI,
-		CallerName: callerName,
-		SDPOffer:   string(req.Body()),
+		SipCallID:  req.CallID().Value(),
+		SipFrom:    callerURI,
+		SipTo:      toHdr.Address.String(),
+		SdpOffer:   pgtype.Text{String: string(req.Body()), Valid: len(req.Body()) > 0},
+		CallerUri:  callerURI,
+		CallerName: pgtype.Text{String: callerName, Valid: callerName != ""},
 		State:      "PENDING_PUSH",
-		ExpiresAt:  time.Now().Add(callTimeout),
+		ExpiresAt:  pgtype.Timestamptz{Time: time.Now().Add(callTimeout), Valid: true},
 	})
+	if err != nil {
+		slog.Error("failed to create pending call in DB", "error", err)
+	}
 
 	dlg.Respond(110, "Push sent", nil)
 
@@ -318,7 +347,10 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 		return
 	}
 
-	cm.database.Model(&db.PendingCall{}).Where("call_id = ?", callID).Update("state", "PUSH_SENT")
+	cm.dbQueries.UpdatePendingCallState(ctx, db.UpdatePendingCallStateParams{
+		CallID: callID,
+		State:  "PUSH_SENT",
+	})
 
 	dlg.Respond(sip.StatusRinging, "Ringing", nil)
 
@@ -327,7 +359,10 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 	select {
 	case <-pc.readyCh:
 		slog.Info("device ready, relaying call", "call_id", callID)
-		cm.database.Model(&db.PendingCall{}).Where("call_id = ?", callID).Update("state", "DEVICE_READY")
+		cm.dbQueries.UpdatePendingCallState(ctx, db.UpdatePendingCallStateParams{
+			CallID: callID,
+			State:  "DEVICE_READY",
+		})
 		cm.relayCall(callCtx, pc, device)
 		return
 	case <-timeoutCtx.Done():
@@ -348,6 +383,14 @@ func (cm *CallManager) relayCall(ctx context.Context, pc *pendingCall, device *d
 	srcUri, ok := cm.deviceSource[pc.sipUser]
 	cm.mu.RUnlock()
 
+	defer func() {
+		cm.dbQueries.UpdatePendingCallState(context.Background(), db.UpdatePendingCallStateParams{
+			CallID: pc.id,
+			State:  "TERMINATED",
+		})
+		slog.Info("call terminated (fail-safe)", "call_id", pc.id)
+	}()
+
 	if !ok {
 		slog.Error("no device source stored", "call_id", pc.id, "sip_user", pc.sipUser)
 		pc.serverDlg.Respond(sip.StatusTemporarilyUnavailable, "Temporarily Unavailable", nil)
@@ -356,7 +399,7 @@ func (cm *CallManager) relayCall(ctx context.Context, pc *pendingCall, device *d
 	}
 
 	recipient := sip.Uri{
-		User: device.B2BUASIPUser,
+		User: device.B2buaSipUser,
 		Host: srcUri.Host,
 		Port: srcUri.Port,
 	}
@@ -428,7 +471,7 @@ func (cm *CallManager) relayCall(ctx context.Context, pc *pendingCall, device *d
 
 	contactHdr := &sip.ContactHeader{
 		Address: sip.Uri{
-			User: device.B2BUASIPUser,
+			User: device.B2buaSipUser,
 			Host: cm.stack.ExternalIP(),
 			Port: cm.stack.ExternalSIPPort(),
 		},
@@ -447,7 +490,10 @@ func (cm *CallManager) relayCall(ctx context.Context, pc *pendingCall, device *d
 		return
 	}
 
-	cm.database.Model(&db.PendingCall{}).Where("call_id = ?", pc.id).Update("state", "BRIDGED")
+	cm.dbQueries.UpdatePendingCallState(context.Background(), db.UpdatePendingCallStateParams{
+		CallID: pc.id,
+		State:  "BRIDGED",
+	})
 	slog.Info("call bridged", "call_id", pc.id)
 
 	select {
@@ -463,8 +509,7 @@ func (cm *CallManager) relayCall(ctx context.Context, pc *pendingCall, device *d
 		byeCancel()
 	}
 
-	cm.database.Model(&db.PendingCall{}).Where("call_id = ?", pc.id).Update("state", "TERMINATED")
-	slog.Info("call terminated", "call_id", pc.id)
+	slog.Info("call finished", "call_id", pc.id)
 }
 
 func (cm *CallManager) handleAck(req *sip.Request, tx sip.ServerTransaction) {

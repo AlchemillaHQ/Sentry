@@ -5,20 +5,36 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/AlchemillaHQ/Difuse-B2BUA/config"
+	"github.com/AlchemillaHQ/Sentry/config"
 )
 
 type Sender interface {
-	SendCallPush(ctx context.Context, token, callID, callerURI, callerName string) error
+	Send(ctx context.Context, platform, token, callID, callerURI, callerName string) error
+	Start(ctx context.Context)
+}
+
+type pushRequest struct {
+	platform   string
+	token      string
+	callID     string
+	callerURI  string
+	callerName string
 }
 
 type Dispatcher struct {
-	fcm  *FCMSender
-	apns *APNsSender
+	fcm     *FCMSender
+	apns    *APNsSender
+	queue   chan pushRequest
+	workers int
 }
 
+var _ Sender = (*Dispatcher)(nil)
+
 func NewDispatcher(cfg config.PushConfig) (*Dispatcher, error) {
-	d := &Dispatcher{}
+	d := &Dispatcher{
+		queue:   make(chan pushRequest, 1000),
+		workers: 50,
+	}
 
 	fcm, err := NewFCMSender(cfg.FCMServiceAccount)
 	if err != nil {
@@ -36,7 +52,45 @@ func NewDispatcher(cfg config.PushConfig) (*Dispatcher, error) {
 	return d, nil
 }
 
+func (d *Dispatcher) Start(ctx context.Context) {
+	for i := 0; i < d.workers; i++ {
+		go d.worker(ctx)
+	}
+	slog.Info("push dispatcher started", "workers", d.workers)
+}
+
+func (d *Dispatcher) worker(ctx context.Context) {
+	for {
+		select {
+		case req := <-d.queue:
+			// We use Background here as the SIP transaction ctx might be dead
+			err := d.sendImmediate(context.Background(), req.platform, req.token, req.callID, req.callerURI, req.callerName)
+			if err != nil {
+				slog.Error("async push failed", "call_id", req.callID, "error", err)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 func (d *Dispatcher) Send(ctx context.Context, platform, token, callID, callerURI, callerName string) error {
+	select {
+	case d.queue <- pushRequest{
+		platform:   platform,
+		token:      token,
+		callID:     callID,
+		callerURI:  callerURI,
+		callerName: callerName,
+	}:
+		return nil
+	default:
+		slog.Warn("push queue full, dropping notification", "call_id", callID)
+		return fmt.Errorf("push queue full")
+	}
+}
+
+func (d *Dispatcher) sendImmediate(ctx context.Context, platform, token, callID, callerURI, callerName string) error {
 	switch platform {
 	case "android":
 		if d.fcm == nil {

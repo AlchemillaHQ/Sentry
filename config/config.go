@@ -69,7 +69,7 @@ func Load(path string) (*Config, error) {
 		SIP: SIPConfig{
 			UDPAddr:   "0.0.0.0:5060",
 			TCPAddr:   "0.0.0.0:5060",
-			UserAgent: "Difuse-B2BUA/1.0",
+			UserAgent: "Sentry/1.0",
 			LogSIP:    false,
 		},
 		API: APIConfig{
