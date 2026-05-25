@@ -25,7 +25,6 @@ type Handler struct {
 	registrar  sipstack.Registrar
 	box        *secrets.Box
 	stack      *sipstack.Stack
-	authKey    string
 	jwtSecret  string
 	callMgr    interface {
 		RemoveDeviceSource(string)
@@ -40,7 +39,6 @@ func NewHandler(database *db.Database, registrar sipstack.Registrar, box *secret
 		registrar: registrar,
 		box:       box,
 		stack:     stack,
-		authKey:   apiCfg.AuthKey,
 		jwtSecret: apiCfg.JWTSecret,
 	}
 }
@@ -512,26 +510,14 @@ func SetupRouter(handler *Handler) *gin.Engine {
 		admin.DELETE("/users/:username", handler.DeleteUser)
 	}
 
-	// Mobile API routes (protected by static API key)
-	if handler.authKey != "" {
-		mobile := v1.Group("/devices")
-		mobile.Use(func(c *gin.Context) {
-			key := c.GetHeader("Authorization")
-			expected := "Bearer " + handler.authKey
-			if key != expected {
-				c.JSON(http.StatusUnauthorized, gin.H{"status": "error", "message": "unauthorized"})
-				c.Abort()
-				return
-			}
-			c.Next()
-		})
-		{
-			mobile.POST("/register", handler.RegisterDevice)
-			mobile.PUT("/:device_id/refresh", handler.RefreshDevice)
-			mobile.DELETE("/:device_id", handler.UnregisterDevice)
-			mobile.GET("/:device_id/status", handler.DeviceStatus)
-			mobile.POST("/:device_id/reregister", handler.ForceReregister)
-		}
+	// Mobile API routes
+	mobile := v1.Group("/devices")
+	{
+		mobile.POST("/register", handler.RegisterDevice)
+		mobile.PUT("/:device_id/refresh", handler.RefreshDevice)
+		mobile.DELETE("/:device_id", handler.UnregisterDevice)
+		mobile.GET("/:device_id/status", handler.DeviceStatus)
+		mobile.POST("/:device_id/reregister", handler.ForceReregister)
 	}
 
 	return r

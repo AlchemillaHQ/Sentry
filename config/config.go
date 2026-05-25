@@ -25,7 +25,6 @@ type APIConfig struct {
 	Addr      string `yaml:"addr"`
 	TLSCert   string `yaml:"tls_cert"`
 	TLSKey    string `yaml:"tls_key"`
-	AuthKey   string `yaml:"auth_key"`
 	JWTSecret string `yaml:"jwt_secret"`
 }
 

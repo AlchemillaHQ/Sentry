@@ -1,6 +1,6 @@
 import { browser } from '$app/environment';
 
-const BASE_URL = 'http://localhost:8080/v1';
+const BASE_URL = '/v1';
 
 export async function apiFetch(path: string, options: RequestInit = {}) {
     const token = browser ? localStorage.getItem('sentry_token') : null;

@@ -15,7 +15,6 @@ api:
   addr: "0.0.0.0:8080"
   # tls_cert: "certs/api-cert.pem"
   # tls_key:  "certs/api-key.pem"
-  auth_key: "CHANGE_ME_FOR_MOBILE_API"
   jwt_secret: "CHANGE_ME_FOR_DASHBOARD"
 
 admin:
