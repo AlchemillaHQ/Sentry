@@ -13,6 +13,7 @@ import (
 	"github.com/AlchemillaHQ/Sentry/config"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
+	"github.com/rs/zerolog/log"
 	"golang.org/x/sys/unix"
 )
 
@@ -33,11 +34,9 @@ type Stack struct {
 
 func New(cfg config.SIPConfig) (*Stack, error) {
 	if cfg.LogSIP {
-		sipLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
-		sip.SetDefaultLogger(sipLogger)
+		sip.SetDefaultLogger(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	} else {
-		sipLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn}))
-		sip.SetDefaultLogger(sipLogger)
+		sip.SetDefaultLogger(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn})))
 	}
 
 	uaOpts := []sipgo.UserAgentOption{
@@ -187,7 +186,7 @@ func (s *Stack) ListenAndServe(ctx context.Context) error {
 
 	if s.cfg.UDPAddr != "" {
 		go func() {
-			slog.Info("SIP listening", "transport", "udp", "addr", s.cfg.UDPAddr)
+			log.Info().Str("transport", "udp").Str("addr", s.cfg.UDPAddr).Msg("SIP listening")
 
 			// Optimized UDP listener with SO_REUSEPORT
 			lc := net.ListenConfig{
@@ -216,7 +215,7 @@ func (s *Stack) ListenAndServe(ctx context.Context) error {
 
 	if s.cfg.TCPAddr != "" {
 		go func() {
-			slog.Info("SIP listening", "transport", "tcp", "addr", s.cfg.TCPAddr)
+			log.Info().Str("transport", "tcp").Str("addr", s.cfg.TCPAddr).Msg("SIP listening")
 			if err := s.server.ListenAndServe(ctx, "tcp", s.cfg.TCPAddr); err != nil {
 				errCh <- fmt.Errorf("tcp: %w", err)
 			}
@@ -225,7 +224,7 @@ func (s *Stack) ListenAndServe(ctx context.Context) error {
 
 	if s.cfg.TLSAddr != "" && s.cfg.TLSCert != "" && s.cfg.TLSKey != "" {
 		go func() {
-			slog.Info("SIP listening", "transport", "tls", "addr", s.cfg.TLSAddr)
+			log.Info().Str("transport", "tls").Str("addr", s.cfg.TLSAddr).Msg("SIP listening")
 			if err := s.server.ListenAndServeTLS(ctx, "tcp", s.cfg.TLSAddr, s.listenTLS); err != nil {
 				errCh <- fmt.Errorf("tls: %w", err)
 			}

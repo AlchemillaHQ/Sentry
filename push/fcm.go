@@ -3,10 +3,10 @@ package push
 import (
 	"context"
 	"fmt"
-	"log/slog"
 
 	firebase "firebase.google.com/go/v4"
 	"firebase.google.com/go/v4/messaging"
+	"github.com/rs/zerolog/log"
 	"google.golang.org/api/option"
 )
 
@@ -47,6 +47,6 @@ func (f *FCMSender) SendCallPush(ctx context.Context, token, callID, callerURI, 
 	if err != nil {
 		return fmt.Errorf("fcm send: %w", err)
 	}
-	slog.Debug("fcm push sent", "response", resp, "call_id", callID)
+	log.Debug().Str("response", resp).Str("call_id", callID).Msg("fcm push sent")
 	return nil
 }

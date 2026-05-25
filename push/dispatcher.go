@@ -3,9 +3,9 @@ package push
 import (
 	"context"
 	"fmt"
-	"log/slog"
 
 	"github.com/AlchemillaHQ/Sentry/config"
+	"github.com/rs/zerolog/log"
 )
 
 type Sender interface {
@@ -44,7 +44,7 @@ func NewDispatcher(cfg config.PushConfig) (*Dispatcher, error) {
 
 	apns, err := NewAPNsSender(cfg.APNsCert, cfg.APNsBundleID, cfg.APNsProduction)
 	if err != nil {
-		slog.Warn("APNs push disabled", "error", err)
+		log.Warn().Err(err).Msg("APNs push disabled")
 	} else {
 		d.apns = apns
 	}
@@ -56,7 +56,7 @@ func (d *Dispatcher) Start(ctx context.Context) {
 	for i := 0; i < d.workers; i++ {
 		go d.worker(ctx)
 	}
-	slog.Info("push dispatcher started", "workers", d.workers)
+	log.Info().Int("workers", d.workers).Msg("push dispatcher started")
 }
 
 func (d *Dispatcher) worker(ctx context.Context) {
@@ -66,7 +66,7 @@ func (d *Dispatcher) worker(ctx context.Context) {
 			// We use Background here as the SIP transaction ctx might be dead
 			err := d.sendImmediate(context.Background(), req.platform, req.token, req.callID, req.callerURI, req.callerName)
 			if err != nil {
-				slog.Error("async push failed", "call_id", req.callID, "error", err)
+				log.Error().Err(err).Str("call_id", req.callID).Msg("async push failed")
 			}
 		case <-ctx.Done():
 			return
@@ -85,7 +85,7 @@ func (d *Dispatcher) Send(ctx context.Context, platform, token, callID, callerUR
 	}:
 		return nil
 	default:
-		slog.Warn("push queue full, dropping notification", "call_id", callID)
+		log.Warn().Str("call_id", callID).Msg("push queue full, dropping notification")
 		return fmt.Errorf("push queue full")
 	}
 }
@@ -103,7 +103,7 @@ func (d *Dispatcher) sendImmediate(ctx context.Context, platform, token, callID,
 		}
 		return d.apns.SendCallPush(ctx, token, callID, callerURI, callerName)
 	default:
-		slog.Warn("unknown push platform", "platform", platform)
+		log.Warn().Str("platform", platform).Msg("unknown push platform")
 		return fmt.Errorf("unknown platform: %s", platform)
 	}
 }

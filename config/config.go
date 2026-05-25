@@ -22,10 +22,20 @@ type SIPConfig struct {
 }
 
 type APIConfig struct {
-	Addr    string `yaml:"addr"`
-	TLSCert string `yaml:"tls_cert"`
-	TLSKey  string `yaml:"tls_key"`
-	AuthKey string `yaml:"auth_key"`
+	Addr      string `yaml:"addr"`
+	TLSCert   string `yaml:"tls_cert"`
+	TLSKey    string `yaml:"tls_key"`
+	AuthKey   string `yaml:"auth_key"`
+	JWTSecret string `yaml:"jwt_secret"`
+}
+
+type BootstrapUser struct {
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
+}
+
+type AdminConfig struct {
+	BootstrapUsers []BootstrapUser `yaml:"bootstrap_users"`
 }
 
 type DatabaseConfig struct {
@@ -53,6 +63,7 @@ type LogConfig struct {
 type Config struct {
 	SIP      SIPConfig      `yaml:"sip"`
 	API      APIConfig      `yaml:"api"`
+	Admin    AdminConfig    `yaml:"admin"`
 	Database DatabaseConfig `yaml:"database"`
 	Push     PushConfig     `yaml:"push"`
 	Pprof    PprofConfig    `yaml:"pprof"`

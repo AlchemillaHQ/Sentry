@@ -4,18 +4,19 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
-	"log/slog"
 	"time"
 
+	"github.com/AlchemillaHQ/Sentry/auth"
 	"github.com/AlchemillaHQ/Sentry/config"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/rs/zerolog/log"
 )
 
 type Database struct {
 	Pool    *pgxpool.Pool
-	Queries *Queries
+	Queries Querier
 }
 
 func Open(ctx context.Context, cfg config.DatabaseConfig) (*Database, error) {
@@ -68,16 +69,29 @@ func (db *Database) GetOrCreateEncryptionKey(ctx context.Context) ([]byte, error
 	return key, nil
 }
 
+func (db *Database) Reset(ctx context.Context) error {
+	// Truncate all tables. References handle cascade if configured,
+	// but here we list them explicitly for clarity.
+	tables := []string{"pending_calls", "devices", "settings"}
+	for _, t := range tables {
+		_, err := db.Pool.Exec(ctx, fmt.Sprintf("TRUNCATE TABLE %s CASCADE", t))
+		if err != nil {
+			return fmt.Errorf("truncate %s: %w", t, err)
+		}
+	}
+	return nil
+}
+
 func (db *Database) CleanupStaleState(ctx context.Context) {
 	now := pgtype.Timestamptz{Time: time.Now(), Valid: true}
 	err := db.Queries.PruneDevices(ctx, now)
 	if err != nil {
-		slog.Error("failed to prune devices", "error", err)
+		log.Error().Err(err).Msg("failed to prune devices")
 	}
 
 	err = db.Queries.PrunePendingCalls(ctx, now)
 	if err != nil {
-		slog.Error("failed to prune pending calls", "error", err)
+		log.Error().Err(err).Msg("failed to prune pending calls")
 	}
 }
 
@@ -94,5 +108,25 @@ func (db *Database) StartCleanupWorker(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+func (db *Database) BootstrapUsers(ctx context.Context, bootstrapUsers []config.BootstrapUser) error {
+	for _, u := range bootstrapUsers {
+		hash, err := auth.HashPassword(u.Password)
+		if err != nil {
+			return fmt.Errorf("hash password for %s: %w", u.Username, err)
+		}
+
+		err = db.Queries.CreateUser(ctx, CreateUserParams{
+			Username:     u.Username,
+			PasswordHash: hash,
+			Role:         "admin",
+		})
+		if err != nil {
+			return fmt.Errorf("bootstrap user %s: %w", u.Username, err)
+		}
+		log.Info().Str("username", u.Username).Msg("bootstrapped admin user")
+	}
+	return nil
 }
 

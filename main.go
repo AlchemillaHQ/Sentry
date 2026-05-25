@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log/slog"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -16,14 +15,30 @@ import (
 	"github.com/AlchemillaHQ/Sentry/callmanager"
 	"github.com/AlchemillaHQ/Sentry/config"
 	"github.com/AlchemillaHQ/Sentry/db"
+	"github.com/AlchemillaHQ/Sentry/logger"
 	"github.com/AlchemillaHQ/Sentry/push"
 	"github.com/AlchemillaHQ/Sentry/secrets"
 	"github.com/AlchemillaHQ/Sentry/sipstack"
+	"github.com/rs/zerolog/log"
+)
+
+var (
+	Version   = "v0.0.1"
+	GitCommit = "unknown"
+	BuildTime = "unknown"
 )
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "Path to config file")
+	dataDir := flag.String("data-dir", "./data", "Directory for logs and persistent data")
+	resetDB := flag.Bool("reset-db", false, "Reset the database and exit")
+	showVersion := flag.Bool("version", false, "Show version information")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("Sentry %s\nCommit: %s\nBuildTime: %s\n", Version, GitCommit, BuildTime)
+		return
+	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -31,51 +46,42 @@ func main() {
 		os.Exit(1)
 	}
 
-	var logLevel slog.Level
-	switch cfg.Log.Level {
-	case "debug":
-		logLevel = slog.LevelDebug
-	case "warn":
-		logLevel = slog.LevelWarn
-	case "error":
-		logLevel = slog.LevelError
-	default:
-		logLevel = slog.LevelInfo
-	}
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel})))
-
-	if cfg.Pprof.Addr != "" {
-		go func() {
-			slog.Info("pprof listening", "addr", cfg.Pprof.Addr)
-			if err := http.ListenAndServe(cfg.Pprof.Addr, nil); err != nil {
-				slog.Error("pprof failed", "error", err)
-			}
-		}()
-	}
+	// Initialize new zerolog/lumberjack logger
+	logger.Init(cfg.Log.Level, *dataDir, true)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
 	database, err := db.Open(ctx, cfg.Database)
 	if err != nil {
-		slog.Error("database failed", "error", err)
+		log.Error().Err(err).Msg("database failed")
 		os.Exit(1)
+	}
+
+	if *resetDB {
+		log.Info().Msg("resetting database...")
+		if err := database.Reset(ctx); err != nil {
+			log.Error().Err(err).Msg("database reset failed")
+			os.Exit(1)
+		}
+		log.Info().Msg("database reset successful")
+		return
 	}
 
 	encKey, err := database.GetOrCreateEncryptionKey(ctx)
 	if err != nil {
-		slog.Error("encryption key failed", "error", err)
+		log.Error().Err(err).Msg("encryption key failed")
 		os.Exit(1)
 	}
 	box, err := secrets.NewBox(encKey)
 	if err != nil {
-		slog.Error("secrets failed", "error", err)
+		log.Error().Err(err).Msg("secrets failed")
 		os.Exit(1)
 	}
 
 	pushSender, err := push.NewDispatcher(cfg.Push)
 	if err != nil {
-		slog.Error("push init failed", "error", err)
+		log.Error().Err(err).Msg("push init failed")
 		os.Exit(1)
 	}
 
@@ -83,7 +89,7 @@ func main() {
 
 	stack, err := sipstack.New(cfg.SIP)
 	if err != nil {
-		slog.Error("SIP stack failed", "error", err)
+		log.Error().Err(err).Msg("SIP stack failed")
 		os.Exit(1)
 	}
 	defer stack.Close()
@@ -93,11 +99,11 @@ func main() {
 	cm := callmanager.New(database, stack, registrar, pushSender, box)
 
 	sipReady := make(chan struct{})
-	slog.Info("starting SIP listeners...")
+	log.Info().Msg("starting SIP listeners...")
 	go func() {
 		close(sipReady)
 		if err := stack.ListenAndServe(ctx); err != nil && ctx.Err() == nil {
-			slog.Error("SIP stack error", "error", err)
+			log.Error().Err(err).Msg("SIP stack error")
 			cancel()
 		}
 	}()
@@ -107,9 +113,14 @@ func main() {
 	database.CleanupStaleState(ctx)
 	database.StartCleanupWorker(ctx)
 
-	handler := api.NewHandler(database, registrar, box, stack, cfg.API.AuthKey)
+	if err := database.BootstrapUsers(ctx, cfg.Admin.BootstrapUsers); err != nil {
+		log.Error().Err(err).Msg("bootstrap users failed")
+	}
+
+	handler := api.NewHandler(database, registrar, box, stack, cfg.API)
 	handler.SetCallManager(cm)
 	router := api.SetupRouter(handler)
+	ServeSPA(router)
 
 	srv := &http.Server{
 		Addr:    cfg.API.Addr,
@@ -117,7 +128,7 @@ func main() {
 	}
 
 	go func() {
-		slog.Info("REST API listening", "addr", cfg.API.Addr)
+		log.Info().Str("addr", cfg.API.Addr).Msg("REST API listening")
 		var err error
 		if cfg.API.TLSCert != "" && cfg.API.TLSKey != "" {
 			err = srv.ListenAndServeTLS(cfg.API.TLSCert, cfg.API.TLSKey)
@@ -125,42 +136,44 @@ func main() {
 			err = srv.ListenAndServe()
 		}
 		if err != nil && err != http.ErrServerClosed {
-			slog.Error("API server error", "error", err)
+			log.Error().Err(err).Msg("API server error")
 			cancel()
 		}
 	}()
 
 	go reregisterDevices(ctx, database, registrar, box)
 
-	slog.Info("Sentry started")
+	log.Info().Str("version", Version).Msg("Sentry started")
 	<-ctx.Done()
-	slog.Info("shutting down...")
+	log.Info().Msg("shutting down...")
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
-	slog.Info("sending unregister to upstream PBXes...")
+	log.Info().Msg("sending unregister to upstream PBXes...")
 	registrar.UnregisterAll(shutdownCtx)
 
 	cm.SendByeToAllBridgedCalls(shutdownCtx)
 
 	srv.Shutdown(shutdownCtx)
-	slog.Info("shutdown complete")
+	log.Info().Msg("shutdown complete")
 }
 
 func reregisterDevices(ctx context.Context, database *db.Database, registrar *sipstack.UpstreamRegistrar, box *secrets.Box) {
 	rows, err := database.Pool.Query(ctx, "SELECT device_id, upstream_host, upstream_port, upstream_transport, upstream_user, upstream_password, upstream_realm FROM devices")
 	if err != nil {
-		slog.Error("failed to query devices for re-registration", "error", err)
+		log.Error().Err(err).Msg("failed to query devices for re-registration")
 		return
 	}
 	defer rows.Close()
 
 	for rows.Next() {
-		var dID, host, transport, user, password, realm string
-		var port int
+		var dID, host, transport, user string
+		var password []byte
+		var realm []byte
+		var port int32
 		if err := rows.Scan(&dID, &host, &port, &transport, &user, &password, &realm); err != nil {
-			slog.Error("failed to scan device", "error", err)
+			log.Error().Err(err).Msg("failed to scan device")
 			continue
 		}
 
@@ -169,25 +182,25 @@ func reregisterDevices(ctx context.Context, database *db.Database, registrar *si
 			return
 		default:
 		}
-		pwBytes, err := box.Decrypt([]byte(password))
+		pwBytes, err := box.Decrypt(password)
 		if err != nil {
-			slog.Error("decrypt password failed on startup", "device", dID, "error", err)
+			log.Error().Err(err).Str("device", dID).Msg("decrypt password failed on startup")
 			continue
 		}
 		reg := &sipstack.UpstreamReg{
 			DeviceID:  dID,
 			User:      user,
 			Host:      host,
-			Port:      port,
+			Port:      int(port),
 			Transport: transport,
 			Password:  string(pwBytes),
-			Realm:     realm,
+			Realm:     string(realm),
 		}
 		regCtx, regCancel := context.WithTimeout(ctx, 15*time.Second)
 		if err := registrar.Register(regCtx, reg); err != nil {
-			slog.Error("re-register on startup failed", "device", dID, "error", err)
+			log.Error().Err(err).Str("device", dID).Msg("re-register on startup failed")
 		}
 		regCancel()
 	}
-	slog.Info("startup re-registration complete")
+	log.Info().Msg("startup re-registration complete")
 }

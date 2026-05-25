@@ -87,6 +87,23 @@ func (m *MockQuerier) UpdatePendingCallState(ctx context.Context, arg db.UpdateP
 func (m *MockQuerier) UpsertDevice(ctx context.Context, arg db.UpsertDeviceParams) error {
 	return m.Called(ctx, arg).Error(0)
 }
+func (m *MockQuerier) CreateUser(ctx context.Context, arg db.CreateUserParams) error {
+	return m.Called(ctx, arg).Error(0)
+}
+func (m *MockQuerier) DeleteUser(ctx context.Context, username string) error {
+	return m.Called(ctx, username).Error(0)
+}
+func (m *MockQuerier) GetUser(ctx context.Context, username string) (db.User, error) {
+	args := m.Called(ctx, username)
+	return args.Get(0).(db.User), args.Error(1)
+}
+func (m *MockQuerier) ListUsers(ctx context.Context) ([]db.ListUsersRow, error) {
+	args := m.Called(ctx)
+	return args.Get(0).([]db.ListUsersRow), args.Error(1)
+}
+func (m *MockQuerier) UpdateUserPassword(ctx context.Context, arg db.UpdateUserPasswordParams) error {
+	return m.Called(ctx, arg).Error(0)
+}
 func (m *MockQuerier) UpsertSetting(ctx context.Context, arg db.UpsertSettingParams) error {
 	return m.Called(ctx, arg).Error(0)
 }

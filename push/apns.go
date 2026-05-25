@@ -3,8 +3,8 @@ package push
 import (
 	"context"
 	"fmt"
-	"log/slog"
 
+	"github.com/rs/zerolog/log"
 	"github.com/sideshow/apns2"
 	"github.com/sideshow/apns2/certificate"
 	"github.com/sideshow/apns2/payload"
@@ -56,6 +56,6 @@ func (a *APNsSender) SendCallPush(ctx context.Context, token, callID, callerURI,
 	if !resp.Sent() {
 		return fmt.Errorf("apns rejected: %d %s", resp.StatusCode, resp.Reason)
 	}
-	slog.Debug("apns push sent", "apns_id", resp.ApnsID, "call_id", callID)
+	log.Debug().Str("apns_id", resp.ApnsID).Str("call_id", callID).Msg("apns push sent")
 	return nil
 }

@@ -12,17 +12,22 @@ import (
 
 type Querier interface {
 	CreatePendingCall(ctx context.Context, arg CreatePendingCallParams) error
+	CreateUser(ctx context.Context, arg CreateUserParams) error
 	DeletePendingCall(ctx context.Context, callID string) error
+	DeleteUser(ctx context.Context, username string) error
 	GetDeviceByB2BUASIPUser(ctx context.Context, b2buaSipUser string) (Device, error)
 	GetDeviceByID(ctx context.Context, deviceID string) (Device, error)
 	GetDevicesByUpstreamUser(ctx context.Context, upstreamUser string) ([]Device, error)
 	GetPendingCall(ctx context.Context, callID string) (PendingCall, error)
 	GetSetting(ctx context.Context, key string) ([]byte, error)
+	GetUser(ctx context.Context, username string) (User, error)
+	ListUsers(ctx context.Context) ([]ListUsersRow, error)
 	PruneDevices(ctx context.Context, expiresAt pgtype.Timestamptz) error
 	PrunePendingCalls(ctx context.Context, expiresAt pgtype.Timestamptz) error
 	UpdateDeviceContact(ctx context.Context, arg UpdateDeviceContactParams) error
 	UpdateDeviceLastSeen(ctx context.Context, b2buaSipUser string) error
 	UpdatePendingCallState(ctx context.Context, arg UpdatePendingCallStateParams) error
+	UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) error
 	UpsertDevice(ctx context.Context, arg UpsertDeviceParams) error
 	UpsertSetting(ctx context.Context, arg UpsertSettingParams) error
 }

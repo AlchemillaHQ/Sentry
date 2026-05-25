@@ -49,12 +49,38 @@ func (q *Queries) CreatePendingCall(ctx context.Context, arg CreatePendingCallPa
 	return err
 }
 
+const createUser = `-- name: CreateUser :exec
+INSERT INTO users (username, password_hash, role)
+VALUES ($1, $2, $3)
+ON CONFLICT (username) DO NOTHING
+`
+
+type CreateUserParams struct {
+	Username     string `json:"username"`
+	PasswordHash string `json:"password_hash"`
+	Role         string `json:"role"`
+}
+
+func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) error {
+	_, err := q.db.Exec(ctx, createUser, arg.Username, arg.PasswordHash, arg.Role)
+	return err
+}
+
 const deletePendingCall = `-- name: DeletePendingCall :exec
 DELETE FROM pending_calls WHERE call_id = $1
 `
 
 func (q *Queries) DeletePendingCall(ctx context.Context, callID string) error {
 	_, err := q.db.Exec(ctx, deletePendingCall, callID)
+	return err
+}
+
+const deleteUser = `-- name: DeleteUser :exec
+DELETE FROM users WHERE username = $1
+`
+
+func (q *Queries) DeleteUser(ctx context.Context, username string) error {
+	_, err := q.db.Exec(ctx, deleteUser, username)
 	return err
 }
 
@@ -195,6 +221,52 @@ func (q *Queries) GetSetting(ctx context.Context, key string) ([]byte, error) {
 	return value, err
 }
 
+const getUser = `-- name: GetUser :one
+SELECT username, password_hash, role, created_at FROM users WHERE username = $1 LIMIT 1
+`
+
+func (q *Queries) GetUser(ctx context.Context, username string) (User, error) {
+	row := q.db.QueryRow(ctx, getUser, username)
+	var i User
+	err := row.Scan(
+		&i.Username,
+		&i.PasswordHash,
+		&i.Role,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const listUsers = `-- name: ListUsers :many
+SELECT username, role, created_at FROM users ORDER BY created_at DESC
+`
+
+type ListUsersRow struct {
+	Username  string             `json:"username"`
+	Role      string             `json:"role"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+func (q *Queries) ListUsers(ctx context.Context) ([]ListUsersRow, error) {
+	rows, err := q.db.Query(ctx, listUsers)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListUsersRow
+	for rows.Next() {
+		var i ListUsersRow
+		if err := rows.Scan(&i.Username, &i.Role, &i.CreatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const pruneDevices = `-- name: PruneDevices :exec
 DELETE FROM devices WHERE expires_at < $1
 `
@@ -247,6 +319,20 @@ type UpdatePendingCallStateParams struct {
 
 func (q *Queries) UpdatePendingCallState(ctx context.Context, arg UpdatePendingCallStateParams) error {
 	_, err := q.db.Exec(ctx, updatePendingCallState, arg.CallID, arg.State)
+	return err
+}
+
+const updateUserPassword = `-- name: UpdateUserPassword :exec
+UPDATE users SET password_hash = $2 WHERE username = $1
+`
+
+type UpdateUserPasswordParams struct {
+	Username     string `json:"username"`
+	PasswordHash string `json:"password_hash"`
+}
+
+func (q *Queries) UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) error {
+	_, err := q.db.Exec(ctx, updateUserPassword, arg.Username, arg.PasswordHash)
 	return err
 }
 

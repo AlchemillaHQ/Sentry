@@ -3,17 +3,20 @@ package api
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"time"
 
+	"github.com/AlchemillaHQ/Sentry/auth"
+	"github.com/AlchemillaHQ/Sentry/config"
 	"github.com/AlchemillaHQ/Sentry/db"
 	"github.com/AlchemillaHQ/Sentry/secrets"
 	"github.com/AlchemillaHQ/Sentry/sipstack"
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/rs/zerolog/log"
 )
 
 type Handler struct {
@@ -23,22 +26,201 @@ type Handler struct {
 	box        *secrets.Box
 	stack      *sipstack.Stack
 	authKey    string
-	callMgr    interface{ RemoveDeviceSource(string) }
+	jwtSecret  string
+	callMgr    interface {
+		RemoveDeviceSource(string)
+		GetPendingCallsCount() int
+	}
 }
 
-func NewHandler(database *db.Database, registrar *sipstack.UpstreamRegistrar, box *secrets.Box, stack *sipstack.Stack, authKey string) *Handler {
+func NewHandler(database *db.Database, registrar sipstack.Registrar, box *secrets.Box, stack *sipstack.Stack, apiCfg config.APIConfig) *Handler {
 	return &Handler{
 		dbQueries: database.Queries,
 		dbPool:    database.Pool,
 		registrar: registrar,
 		box:       box,
 		stack:     stack,
-		authKey:   authKey,
+		authKey:   apiCfg.AuthKey,
+		jwtSecret: apiCfg.JWTSecret,
 	}
 }
 
-func (h *Handler) SetCallManager(cm interface{ RemoveDeviceSource(string) }) {
+func (h *Handler) SetCallManager(cm interface {
+	RemoveDeviceSource(string)
+	GetPendingCallsCount() int
+}) {
 	h.callMgr = cm
+}
+
+func (h *Handler) AuthMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		token := c.GetHeader("Authorization")
+		if len(token) > 7 && token[:7] == "Bearer " {
+			token = token[7:]
+		}
+
+		if h.jwtSecret == "" {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "JWT secret not configured"})
+			c.Abort()
+			return
+		}
+
+		claims, err := auth.ValidateToken(token, h.jwtSecret)
+		if err != nil {
+			c.JSON(http.StatusUnauthorized, gin.H{"status": "error", "message": "unauthorized"})
+			c.Abort()
+			return
+		}
+
+		c.Set("username", claims.Username)
+		c.Set("role", claims.Role)
+		c.Next()
+	}
+}
+
+type LoginRequest struct {
+	Username string `json:"username" binding:"required"`
+	Password string `json:"password" binding:"required"`
+}
+
+func (h *Handler) Login(c *gin.Context) {
+	var req LoginRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": err.Error()})
+		return
+	}
+
+	user, err := h.dbQueries.GetUser(c.Request.Context(), req.Username)
+	if err != nil {
+		log.Warn().Str("username", req.Username).Msg("login failed: user not found")
+		c.JSON(http.StatusUnauthorized, gin.H{"status": "error", "message": "invalid credentials"})
+		return
+	}
+
+	if !auth.CheckPasswordHash(req.Password, user.PasswordHash) {
+		log.Warn().Str("username", req.Username).Msg("login failed: invalid password")
+		c.JSON(http.StatusUnauthorized, gin.H{"status": "error", "message": "invalid credentials"})
+		return
+	}
+
+	token, err := auth.GenerateToken(user.Username, user.Role, h.jwtSecret)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to generate token")
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "internal server error"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": "ok",
+		"token":  token,
+		"user": gin.H{
+			"username": user.Username,
+			"role":     user.Role,
+		},
+	})
+}
+
+func (h *Handler) DashboardStats(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	var deviceCount int64
+	h.dbPool.QueryRow(ctx, "SELECT COUNT(*) FROM devices").Scan(&deviceCount)
+
+	activeCalls := 0
+	if h.callMgr != nil {
+		activeCalls = h.callMgr.GetPendingCallsCount()
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"registered_devices": deviceCount,
+		"active_calls":       activeCalls,
+		"db_status":          "healthy",
+	})
+}
+
+func (h *Handler) ListDevices(c *gin.Context) {
+	// We could use SQLC for this, but for simple lists a raw query is fine too.
+	// For consistency with SQLC models, let's use a query that matches.
+	rows, err := h.dbPool.Query(c.Request.Context(), "SELECT device_id, platform, upstream_host, upstream_user, display_name, last_seen FROM devices ORDER BY last_seen DESC")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "failed to list devices"})
+		return
+	}
+	defer rows.Close()
+
+	var devices []map[string]interface{}
+	for rows.Next() {
+		var dID, platform, host, user string
+		var displayName pgtype.Text
+		var lastSeen pgtype.Timestamptz
+		rows.Scan(&dID, &platform, &host, &user, &displayName, &lastSeen)
+		devices = append(devices, map[string]interface{}{
+			"device_id":     dID,
+			"platform":      platform,
+			"upstream_host": host,
+			"upstream_user": user,
+			"display_name":  displayName.String,
+			"last_seen":     lastSeen.Time,
+		})
+	}
+	c.JSON(http.StatusOK, devices)
+}
+
+func (h *Handler) ListUsers(c *gin.Context) {
+	users, err := h.dbQueries.ListUsers(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "failed to list users"})
+		return
+	}
+	c.JSON(http.StatusOK, users)
+}
+
+type CreateUserRequest struct {
+	Username string `json:"username" binding:"required"`
+	Password string `json:"password" binding:"required"`
+	Role     string `json:"role" binding:"required,oneof=admin viewer"`
+}
+
+func (h *Handler) CreateUser(c *gin.Context) {
+	var req CreateUserRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": err.Error()})
+		return
+	}
+
+	hash, err := auth.HashPassword(req.Password)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "failed to hash password"})
+		return
+	}
+
+	err = h.dbQueries.CreateUser(c.Request.Context(), db.CreateUserParams{
+		Username:     req.Username,
+		PasswordHash: hash,
+		Role:         req.Role,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "failed to create user"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{"status": "ok"})
+}
+
+func (h *Handler) DeleteUser(c *gin.Context) {
+	username := c.Param("username")
+	if username == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "username required"})
+		return
+	}
+
+	err := h.dbQueries.DeleteUser(c.Request.Context(), username)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "failed to delete user"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
 type RegisterRequest struct {
@@ -57,7 +239,7 @@ type RegisterRequest struct {
 func (h *Handler) RegisterDevice(c *gin.Context) {
 	var req RegisterRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		slog.Warn("register validation failed", "error", err)
+		log.Warn().Err(err).Msg("register validation failed")
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": err.Error()})
 		return
 	}
@@ -74,14 +256,14 @@ func (h *Handler) RegisterDevice(c *gin.Context) {
 		var err error
 		encToken, err = h.box.Encrypt([]byte(req.PushToken))
 		if err != nil {
-			slog.Error("encrypt push token failed", "error", err)
+			log.Error().Err(err).Msg("encrypt push token failed")
 			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "encryption failed"})
 			return
 		}
 	}
 	encPassword, err := h.box.Encrypt([]byte(req.UpstreamPassword))
 	if err != nil {
-		slog.Error("encrypt password failed", "error", err)
+		log.Error().Err(err).Msg("encrypt password failed")
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "encryption failed"})
 		return
 	}
@@ -106,7 +288,7 @@ func (h *Handler) RegisterDevice(c *gin.Context) {
 		LastSeen:          pgtype.Timestamptz{Time: lastSeen, Valid: true},
 	})
 	if err != nil {
-		slog.Error("upsert device failed", "error", err)
+		log.Error().Err(err).Msg("upsert device failed")
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "database error"})
 		return
 	}
@@ -124,7 +306,7 @@ func (h *Handler) RegisterDevice(c *gin.Context) {
 	regCtx, regCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer regCancel()
 	if err := h.registrar.Register(regCtx, reg); err != nil {
-		slog.Error("upstream registration failed", "device", req.DeviceID, "error", err)
+		log.Error().Err(err).Str("device", req.DeviceID).Msg("upstream registration failed")
 		c.JSON(http.StatusBadGateway, gin.H{"status": "error", "message": "upstream registration failed"})
 		return
 	}
@@ -190,7 +372,7 @@ func (h *Handler) RefreshDevice(c *gin.Context) {
 		LastSeen:          pgtype.Timestamptz{Time: time.Now(), Valid: true},
 	})
 	if err != nil {
-		slog.Error("refresh device failed", "error", err)
+		log.Error().Err(err).Msg("refresh device failed")
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "database error"})
 		return
 	}
@@ -205,7 +387,7 @@ func (h *Handler) UnregisterDevice(c *gin.Context) {
 	}
 
 	if err := h.registrar.Unregister(c.Request.Context(), deviceID); err != nil {
-		slog.Error("upstream unregistration failed", "device", deviceID, "error", err)
+		log.Error().Err(err).Str("device", deviceID).Msg("upstream unregistration failed")
 	}
 
 	device, err := h.dbQueries.GetDeviceByID(c.Request.Context(), deviceID)
@@ -264,7 +446,7 @@ func (h *Handler) ForceReregister(c *gin.Context) {
 
 	password, err := h.box.Decrypt(device.UpstreamPassword)
 	if err != nil {
-		slog.Error("decrypt password failed", "error", err)
+		log.Error().Err(err).Msg("decrypt password failed")
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "decryption failed"})
 		return
 	}
@@ -282,7 +464,7 @@ func (h *Handler) ForceReregister(c *gin.Context) {
 	regCtx, regCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer regCancel()
 	if err := h.registrar.Register(regCtx, reg); err != nil {
-		slog.Error("force re-register failed", "device", deviceID, "error", err)
+		log.Error().Err(err).Str("device", deviceID).Msg("force re-register failed")
 		c.JSON(http.StatusBadGateway, gin.H{"status": "error", "message": "upstream registration failed"})
 		return
 	}
@@ -296,6 +478,14 @@ func SetupRouter(handler *Handler) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
+	r.Use(cors.New(cors.Config{
+		AllowOrigins:     []string{"http://localhost:5173", "http://127.0.0.1:5173"},
+		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
+		ExposeHeaders:    []string{"Content-Length"},
+		AllowCredentials: true,
+		MaxAge:           12 * time.Hour,
+	}))
 	r.Use(gin.LoggerWithConfig(gin.LoggerConfig{SkipPaths: []string{"/health"}}))
 
 	r.GET("/health", func(c *gin.Context) {
@@ -307,8 +497,25 @@ func SetupRouter(handler *Handler) *gin.Engine {
 	})
 
 	v1 := r.Group("/v1")
+
+	// Public routes
+	v1.POST("/auth/login", handler.Login)
+
+	// Admin routes (protected by JWT)
+	admin := v1.Group("/admin")
+	admin.Use(handler.AuthMiddleware())
+	{
+		admin.GET("/stats", handler.DashboardStats)
+		admin.GET("/devices", handler.ListDevices)
+		admin.GET("/users", handler.ListUsers)
+		admin.POST("/users", handler.CreateUser)
+		admin.DELETE("/users/:username", handler.DeleteUser)
+	}
+
+	// Mobile API routes (protected by static API key)
 	if handler.authKey != "" {
-		v1.Use(func(c *gin.Context) {
+		mobile := v1.Group("/devices")
+		mobile.Use(func(c *gin.Context) {
 			key := c.GetHeader("Authorization")
 			expected := "Bearer " + handler.authKey
 			if key != expected {
@@ -318,13 +525,13 @@ func SetupRouter(handler *Handler) *gin.Engine {
 			}
 			c.Next()
 		})
-	}
-	{
-		v1.POST("/devices/register", handler.RegisterDevice)
-		v1.PUT("/devices/:device_id/refresh", handler.RefreshDevice)
-		v1.DELETE("/devices/:device_id", handler.UnregisterDevice)
-		v1.GET("/devices/:device_id/status", handler.DeviceStatus)
-		v1.POST("/devices/:device_id/reregister", handler.ForceReregister)
+		{
+			mobile.POST("/register", handler.RegisterDevice)
+			mobile.PUT("/:device_id/refresh", handler.RefreshDevice)
+			mobile.DELETE("/:device_id", handler.UnregisterDevice)
+			mobile.GET("/:device_id/status", handler.DeviceStatus)
+			mobile.POST("/:device_id/reregister", handler.ForceReregister)
+		}
 	}
 
 	return r

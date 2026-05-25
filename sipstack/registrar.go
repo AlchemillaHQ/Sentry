@@ -3,13 +3,13 @@ package sipstack
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"sync"
 	"time"
 
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 	"github.com/google/uuid"
+	"github.com/rs/zerolog/log"
 )
 
 const (
@@ -136,11 +136,11 @@ func (ur *UpstreamRegistrar) UnregisterAll(ctx context.Context) {
 	for _, reg := range regs {
 		unregCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 		if err := ur.sendRegister(unregCtx, reg, 0); err != nil {
-			slog.Error("unregister on shutdown failed", "device", reg.DeviceID, "error", err)
+			log.Error().Err(err).Str("device", reg.DeviceID).Msg("unregister on shutdown failed")
 		}
 		cancel()
 	}
-	slog.Info("all upstream registrations cancelled", "count", len(regs))
+	log.Info().Int("count", len(regs)).Msg("all upstream registrations cancelled")
 }
 
 func (ur *UpstreamRegistrar) buildRegisterRequest(reg *UpstreamReg, expires int) *sip.Request {
@@ -200,20 +200,21 @@ func (ur *UpstreamRegistrar) buildRegisterRequest(reg *UpstreamReg, expires int)
 func (ur *UpstreamRegistrar) sendRegister(ctx context.Context, reg *UpstreamReg, expires int) error {
 	req := ur.buildRegisterRequest(reg, expires)
 
-	slog.Info("sending REGISTER",
-		"device", reg.DeviceID,
-		"target", fmt.Sprintf("%s:%d", reg.Host, reg.Port),
-		"transport", reg.Transport,
-		"user", reg.User,
-		"expires", expires)
+	log.Info().
+		Str("device", reg.DeviceID).
+		Str("target", fmt.Sprintf("%s:%d", reg.Host, reg.Port)).
+		Str("transport", reg.Transport).
+		Str("user", reg.User).
+		Int("expires", expires).
+		Msg("sending REGISTER")
 
 	res, err := ur.stack.Client().Do(ctx, req)
 	if err != nil {
-		slog.Error("REGISTER failed",
-			"device", reg.DeviceID,
-			"target", fmt.Sprintf("%s:%d", reg.Host, reg.Port),
-			"transport", reg.Transport,
-			"error", err)
+		log.Error().Err(err).
+			Str("device", reg.DeviceID).
+			Str("target", fmt.Sprintf("%s:%d", reg.Host, reg.Port)).
+			Str("transport", reg.Transport).
+			Msg("REGISTER failed")
 		return fmt.Errorf("send REGISTER: %w", err)
 	}
 
@@ -229,11 +230,12 @@ func (ur *UpstreamRegistrar) sendRegister(ctx context.Context, reg *UpstreamReg,
 	}
 
 	if res.StatusCode >= 200 && res.StatusCode < 300 {
-		slog.Info("upstream registration successful",
-			"device", reg.DeviceID,
-			"user", reg.User,
-			"host", reg.Host,
-			"expires", expires)
+		log.Info().
+			Str("device", reg.DeviceID).
+			Str("user", reg.User).
+			Str("host", reg.Host).
+			Int("expires", expires).
+			Msg("upstream registration successful")
 		return nil
 	}
 
@@ -250,10 +252,10 @@ func (ur *UpstreamRegistrar) reregisterLoop(ctx context.Context, reg *UpstreamRe
 		case <-ticker.C:
 			regCtx, regCancel := context.WithTimeout(ctx, 15*time.Second)
 			if err := ur.sendRegister(regCtx, reg, registerExpiry); err != nil {
-				slog.Error("re-register failed",
-					"device", reg.DeviceID,
-					"user", reg.User,
-					"error", err)
+				log.Error().Err(err).
+					Str("device", reg.DeviceID).
+					Str("user", reg.User).
+					Msg("re-register failed")
 			}
 			regCancel()
 		case <-ctx.Done():

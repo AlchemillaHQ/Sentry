@@ -47,3 +47,10 @@ type Setting struct {
 	Key   string `json:"key"`
 	Value []byte `json:"value"`
 }
+
+type User struct {
+	Username     string             `json:"username"`
+	PasswordHash string             `json:"password_hash"`
+	Role         string             `json:"role"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}

@@ -43,3 +43,10 @@ CREATE TABLE IF NOT EXISTS pending_calls (
 
 CREATE INDEX IF NOT EXISTS idx_pending_calls_device_id ON pending_calls(device_id);
 CREATE INDEX IF NOT EXISTS idx_pending_calls_expires_at ON pending_calls(expires_at);
+
+CREATE TABLE IF NOT EXISTS users (
+    username VARCHAR(255) PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    role VARCHAR(20) NOT NULL DEFAULT 'admin',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);

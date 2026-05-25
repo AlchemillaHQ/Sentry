@@ -70,3 +70,20 @@ DELETE FROM devices WHERE expires_at < $1;
 
 -- name: PrunePendingCalls :exec
 DELETE FROM pending_calls WHERE expires_at < $1;
+
+-- name: GetUser :one
+SELECT * FROM users WHERE username = $1 LIMIT 1;
+
+-- name: CreateUser :exec
+INSERT INTO users (username, password_hash, role)
+VALUES ($1, $2, $3)
+ON CONFLICT (username) DO NOTHING;
+
+-- name: UpdateUserPassword :exec
+UPDATE users SET password_hash = $2 WHERE username = $1;
+
+-- name: ListUsers :many
+SELECT username, role, created_at FROM users ORDER BY created_at DESC;
+
+-- name: DeleteUser :exec
+DELETE FROM users WHERE username = $1;
