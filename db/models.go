@@ -21,6 +21,7 @@ type Device struct {
 	DisplayName       pgtype.Text        `json:"display_name"`
 	B2buaSipUser      string             `json:"b2bua_sip_user"`
 	DeviceContact     pgtype.Text        `json:"device_contact"`
+	UserAgent         pgtype.Text        `json:"user_agent"`
 	PushProvider      pgtype.Text        `json:"push_provider"`
 	PushParam         pgtype.Text        `json:"push_param"`
 	PushPrid          pgtype.Text        `json:"push_prid"`

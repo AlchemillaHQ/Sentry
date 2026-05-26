@@ -169,8 +169,12 @@ func (cm *CallManager) handleRegister(req *sip.Request, tx sip.ServerTransaction
 	}
 
 	contact := req.Contact()
+	userAgent := ""
+	if uaHdr := req.GetHeader("User-Agent"); uaHdr != nil {
+		userAgent = uaHdr.Value()
+	}
 	if contact != nil {
-		cm.updateDeviceFromContact(ctx, device.B2buaSipUser, contact)
+		cm.updateDeviceFromContact(ctx, device.B2buaSipUser, contact, userAgent)
 	}
 
 	cm.mu.RLock()
@@ -187,7 +191,7 @@ func (cm *CallManager) handleRegister(req *sip.Request, tx sip.ServerTransaction
 	}
 }
 
-func (cm *CallManager) updateDeviceFromContact(ctx context.Context, sipUser string, contact *sip.ContactHeader) {
+func (cm *CallManager) updateDeviceFromContact(ctx context.Context, sipUser string, contact *sip.ContactHeader, userAgent string) {
 	device, err := cm.dbQueries.GetDeviceByB2BUASIPUser(ctx, sipUser)
 	if err != nil {
 		return
@@ -230,6 +234,7 @@ func (cm *CallManager) updateDeviceFromContact(ctx context.Context, sipUser stri
 		DisplayName:       device.DisplayName,
 		B2buaSipUser:      device.B2buaSipUser,
 		DeviceContact:     pgtype.Text{String: deviceContact, Valid: true},
+		UserAgent:         pgtype.Text{String: userAgent, Valid: userAgent != ""},
 		PushProvider:      pgtype.Text{String: pushProvider, Valid: pushProvider != ""},
 		PushParam:         pgtype.Text{String: pushParam, Valid: pushParam != ""},
 		PushPrid:          pgtype.Text{String: pushPrid, Valid: pushPrid != ""},

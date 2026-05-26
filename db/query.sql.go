@@ -85,7 +85,7 @@ func (q *Queries) DeleteUser(ctx context.Context, username string) error {
 }
 
 const getDeviceByB2BUASIPUser = `-- name: GetDeviceByB2BUASIPUser :one
-SELECT device_id, platform, push_token, upstream_host, upstream_port, upstream_transport, upstream_user, upstream_password, upstream_realm, display_name, b2bua_sip_user, device_contact, push_provider, push_param, push_prid, registered_at, expires_at, last_seen FROM devices WHERE b2bua_sip_user = $1 LIMIT 1
+SELECT device_id, platform, push_token, upstream_host, upstream_port, upstream_transport, upstream_user, upstream_password, upstream_realm, display_name, b2bua_sip_user, device_contact, user_agent, push_provider, push_param, push_prid, registered_at, expires_at, last_seen FROM devices WHERE b2bua_sip_user = $1 LIMIT 1
 `
 
 func (q *Queries) GetDeviceByB2BUASIPUser(ctx context.Context, b2buaSipUser string) (Device, error) {
@@ -104,6 +104,7 @@ func (q *Queries) GetDeviceByB2BUASIPUser(ctx context.Context, b2buaSipUser stri
 		&i.DisplayName,
 		&i.B2buaSipUser,
 		&i.DeviceContact,
+		&i.UserAgent,
 		&i.PushProvider,
 		&i.PushParam,
 		&i.PushPrid,
@@ -115,7 +116,7 @@ func (q *Queries) GetDeviceByB2BUASIPUser(ctx context.Context, b2buaSipUser stri
 }
 
 const getDeviceByID = `-- name: GetDeviceByID :one
-SELECT device_id, platform, push_token, upstream_host, upstream_port, upstream_transport, upstream_user, upstream_password, upstream_realm, display_name, b2bua_sip_user, device_contact, push_provider, push_param, push_prid, registered_at, expires_at, last_seen FROM devices WHERE device_id = $1 LIMIT 1
+SELECT device_id, platform, push_token, upstream_host, upstream_port, upstream_transport, upstream_user, upstream_password, upstream_realm, display_name, b2bua_sip_user, device_contact, user_agent, push_provider, push_param, push_prid, registered_at, expires_at, last_seen FROM devices WHERE device_id = $1 LIMIT 1
 `
 
 func (q *Queries) GetDeviceByID(ctx context.Context, deviceID string) (Device, error) {
@@ -134,6 +135,7 @@ func (q *Queries) GetDeviceByID(ctx context.Context, deviceID string) (Device, e
 		&i.DisplayName,
 		&i.B2buaSipUser,
 		&i.DeviceContact,
+		&i.UserAgent,
 		&i.PushProvider,
 		&i.PushParam,
 		&i.PushPrid,
@@ -145,7 +147,7 @@ func (q *Queries) GetDeviceByID(ctx context.Context, deviceID string) (Device, e
 }
 
 const getDevicesByUpstreamUser = `-- name: GetDevicesByUpstreamUser :many
-SELECT device_id, platform, push_token, upstream_host, upstream_port, upstream_transport, upstream_user, upstream_password, upstream_realm, display_name, b2bua_sip_user, device_contact, push_provider, push_param, push_prid, registered_at, expires_at, last_seen FROM devices WHERE upstream_user = $1
+SELECT device_id, platform, push_token, upstream_host, upstream_port, upstream_transport, upstream_user, upstream_password, upstream_realm, display_name, b2bua_sip_user, device_contact, user_agent, push_provider, push_param, push_prid, registered_at, expires_at, last_seen FROM devices WHERE upstream_user = $1
 `
 
 func (q *Queries) GetDevicesByUpstreamUser(ctx context.Context, upstreamUser string) ([]Device, error) {
@@ -170,6 +172,7 @@ func (q *Queries) GetDevicesByUpstreamUser(ctx context.Context, upstreamUser str
 			&i.DisplayName,
 			&i.B2buaSipUser,
 			&i.DeviceContact,
+			&i.UserAgent,
 			&i.PushProvider,
 			&i.PushParam,
 			&i.PushPrid,
@@ -286,16 +289,17 @@ func (q *Queries) PrunePendingCalls(ctx context.Context, expiresAt pgtype.Timest
 }
 
 const updateDeviceContact = `-- name: UpdateDeviceContact :exec
-UPDATE devices SET device_contact = $2, last_seen = NOW() WHERE b2bua_sip_user = $1
+UPDATE devices SET device_contact = $2, user_agent = $3, last_seen = NOW() WHERE b2bua_sip_user = $1
 `
 
 type UpdateDeviceContactParams struct {
 	B2buaSipUser  string      `json:"b2bua_sip_user"`
 	DeviceContact pgtype.Text `json:"device_contact"`
+	UserAgent     pgtype.Text `json:"user_agent"`
 }
 
 func (q *Queries) UpdateDeviceContact(ctx context.Context, arg UpdateDeviceContactParams) error {
-	_, err := q.db.Exec(ctx, updateDeviceContact, arg.B2buaSipUser, arg.DeviceContact)
+	_, err := q.db.Exec(ctx, updateDeviceContact, arg.B2buaSipUser, arg.DeviceContact, arg.UserAgent)
 	return err
 }
 
@@ -340,10 +344,10 @@ const upsertDevice = `-- name: UpsertDevice :exec
 INSERT INTO devices (
     device_id, platform, push_token, upstream_host, upstream_port,
     upstream_transport, upstream_user, upstream_password, upstream_realm,
-    display_name, b2bua_sip_user, device_contact, push_provider,
+    display_name, b2bua_sip_user, device_contact, user_agent, push_provider,
     push_param, push_prid, expires_at, last_seen
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
 )
 ON CONFLICT (device_id) DO UPDATE SET
     platform = EXCLUDED.platform,
@@ -357,6 +361,7 @@ ON CONFLICT (device_id) DO UPDATE SET
     display_name = EXCLUDED.display_name,
     b2bua_sip_user = EXCLUDED.b2bua_sip_user,
     device_contact = EXCLUDED.device_contact,
+    user_agent = EXCLUDED.user_agent,
     push_provider = EXCLUDED.push_provider,
     push_param = EXCLUDED.push_param,
     push_prid = EXCLUDED.push_prid,
@@ -377,6 +382,7 @@ type UpsertDeviceParams struct {
 	DisplayName       pgtype.Text        `json:"display_name"`
 	B2buaSipUser      string             `json:"b2bua_sip_user"`
 	DeviceContact     pgtype.Text        `json:"device_contact"`
+	UserAgent         pgtype.Text        `json:"user_agent"`
 	PushProvider      pgtype.Text        `json:"push_provider"`
 	PushParam         pgtype.Text        `json:"push_param"`
 	PushPrid          pgtype.Text        `json:"push_prid"`
@@ -398,6 +404,7 @@ func (q *Queries) UpsertDevice(ctx context.Context, arg UpsertDeviceParams) erro
 		arg.DisplayName,
 		arg.B2buaSipUser,
 		arg.DeviceContact,
+		arg.UserAgent,
 		arg.PushProvider,
 		arg.PushParam,
 		arg.PushPrid,

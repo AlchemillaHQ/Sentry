@@ -19,6 +19,62 @@ type Database struct {
 	Queries Querier
 }
 
+const schema = `
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value BYTEA NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS devices (
+    device_id VARCHAR(36) PRIMARY KEY,
+    platform VARCHAR(10) NOT NULL,
+    push_token BYTEA NOT NULL,
+    upstream_host TEXT NOT NULL,
+    upstream_port INTEGER NOT NULL DEFAULT 5060,
+    upstream_transport VARCHAR(10) NOT NULL DEFAULT 'udp',
+    upstream_user TEXT NOT NULL,
+    upstream_password BYTEA NOT NULL,
+    upstream_realm TEXT,
+    display_name TEXT,
+    b2bua_sip_user TEXT UNIQUE NOT NULL,
+    device_contact TEXT,
+    user_agent TEXT,
+    push_provider VARCHAR(10),
+    push_param TEXT,
+    push_prid VARCHAR(512),
+    registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_devices_b2bua_sip_user ON devices(b2bua_sip_user);
+CREATE INDEX IF NOT EXISTS idx_devices_expires_at ON devices(expires_at);
+
+CREATE TABLE IF NOT EXISTS pending_calls (
+    call_id VARCHAR(36) PRIMARY KEY,
+    device_id VARCHAR(36) NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
+    sip_call_id TEXT NOT NULL,
+    sip_from TEXT NOT NULL,
+    sip_to TEXT NOT NULL,
+    sdp_offer TEXT,
+    caller_uri TEXT NOT NULL,
+    caller_name TEXT,
+    state VARCHAR(30) NOT NULL DEFAULT 'PENDING_PUSH',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_calls_device_id ON pending_calls(device_id);
+CREATE INDEX IF NOT EXISTS idx_pending_calls_expires_at ON pending_calls(expires_at);
+
+CREATE TABLE IF NOT EXISTS users (
+    username TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    role VARCHAR(20) NOT NULL DEFAULT 'admin',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+`
+
 func Open(ctx context.Context, cfg config.DatabaseConfig) (*Database, error) {
 	if cfg.Driver != "postgres" {
 		return nil, fmt.Errorf("only postgres driver is supported with SQLC migration")
@@ -38,10 +94,21 @@ func Open(ctx context.Context, cfg config.DatabaseConfig) (*Database, error) {
 		return nil, fmt.Errorf("ping: %w", err)
 	}
 
-	return &Database{
+	db := &Database{
 		Pool:    pool,
 		Queries: New(pool),
-	}, nil
+	}
+
+	if err := db.Init(ctx); err != nil {
+		return nil, fmt.Errorf("init schema: %w", err)
+	}
+
+	return db, nil
+}
+
+func (db *Database) Init(ctx context.Context) error {
+	_, err := db.Pool.Exec(ctx, schema)
+	return err
 }
 
 func (db *Database) GetOrCreateEncryptionKey(ctx context.Context) ([]byte, error) {
@@ -70,16 +137,16 @@ func (db *Database) GetOrCreateEncryptionKey(ctx context.Context) ([]byte, error
 }
 
 func (db *Database) Reset(ctx context.Context) error {
-	// Truncate all tables. References handle cascade if configured,
-	// but here we list them explicitly for clarity.
-	tables := []string{"pending_calls", "devices", "settings"}
+	// Drop all tables and recreate them from schema.
+	tables := []string{"pending_calls", "devices", "settings", "users"}
 	for _, t := range tables {
-		_, err := db.Pool.Exec(ctx, fmt.Sprintf("TRUNCATE TABLE %s CASCADE", t))
+		_, err := db.Pool.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s CASCADE", t))
 		if err != nil {
-			return fmt.Errorf("truncate %s: %w", t, err)
+			return fmt.Errorf("drop %s: %w", t, err)
 		}
 	}
-	return nil
+
+	return db.Init(ctx)
 }
 
 func (db *Database) CleanupStaleState(ctx context.Context) {
@@ -129,4 +196,3 @@ func (db *Database) BootstrapUsers(ctx context.Context, bootstrapUsers []config.
 	}
 	return nil
 }
-

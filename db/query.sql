@@ -19,10 +19,10 @@ SELECT * FROM devices WHERE upstream_user = $1;
 INSERT INTO devices (
     device_id, platform, push_token, upstream_host, upstream_port,
     upstream_transport, upstream_user, upstream_password, upstream_realm,
-    display_name, b2bua_sip_user, device_contact, push_provider,
+    display_name, b2bua_sip_user, device_contact, user_agent, push_provider,
     push_param, push_prid, expires_at, last_seen
 ) VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
 )
 ON CONFLICT (device_id) DO UPDATE SET
     platform = EXCLUDED.platform,
@@ -36,6 +36,7 @@ ON CONFLICT (device_id) DO UPDATE SET
     display_name = EXCLUDED.display_name,
     b2bua_sip_user = EXCLUDED.b2bua_sip_user,
     device_contact = EXCLUDED.device_contact,
+    user_agent = EXCLUDED.user_agent,
     push_provider = EXCLUDED.push_provider,
     push_param = EXCLUDED.push_param,
     push_prid = EXCLUDED.push_prid,
@@ -43,7 +44,7 @@ ON CONFLICT (device_id) DO UPDATE SET
     last_seen = EXCLUDED.last_seen;
 
 -- name: UpdateDeviceContact :exec
-UPDATE devices SET device_contact = $2, last_seen = NOW() WHERE b2bua_sip_user = $1;
+UPDATE devices SET device_contact = $2, user_agent = $3, last_seen = NOW() WHERE b2bua_sip_user = $1;
 
 -- name: UpdateDeviceLastSeen :exec
 UPDATE devices SET last_seen = NOW() WHERE b2bua_sip_user = $1;
