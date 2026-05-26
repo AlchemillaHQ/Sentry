@@ -66,6 +66,9 @@ UPDATE pending_calls SET state = $2 WHERE call_id = $1;
 -- name: DeletePendingCall :exec
 DELETE FROM pending_calls WHERE call_id = $1;
 
+-- name: SetDeviceDisabled :exec
+UPDATE devices SET disabled = $2 WHERE device_id = $1;
+
 -- name: PruneDevices :exec
 DELETE FROM devices WHERE expires_at < $1;
 

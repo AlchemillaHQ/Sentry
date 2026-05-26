@@ -28,6 +28,7 @@ type Device struct {
 	RegisteredAt      pgtype.Timestamptz `json:"registered_at"`
 	ExpiresAt         pgtype.Timestamptz `json:"expires_at"`
 	LastSeen          pgtype.Timestamptz `json:"last_seen"`
+	Disabled          bool               `json:"disabled"`
 }
 
 type PendingCall struct {

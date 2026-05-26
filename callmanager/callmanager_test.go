@@ -115,6 +115,9 @@ func (m *MockQuerier) UpdateUserPassword(ctx context.Context, arg db.UpdateUserP
 func (m *MockQuerier) UpsertSetting(ctx context.Context, arg db.UpsertSettingParams) error {
 	return m.Called(ctx, arg).Error(0)
 }
+func (m *MockQuerier) SetDeviceDisabled(ctx context.Context, arg db.SetDeviceDisabledParams) error {
+	return m.Called(ctx, arg).Error(0)
+}
 
 func TestMatchDevice(t *testing.T) {
 	ctx := context.Background()

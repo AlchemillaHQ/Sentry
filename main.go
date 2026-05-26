@@ -160,7 +160,7 @@ func main() {
 }
 
 func reregisterDevices(ctx context.Context, database *db.Database, registrar *sipstack.UpstreamRegistrar, box *secrets.Box) {
-	rows, err := database.Pool.Query(ctx, "SELECT device_id, upstream_host, upstream_port, upstream_transport, upstream_user, upstream_password, upstream_realm FROM devices")
+	rows, err := database.Pool.Query(ctx, "SELECT device_id, upstream_host, upstream_port, upstream_transport, upstream_user, upstream_password, upstream_realm FROM devices WHERE disabled = false")
 	if err != nil {
 		log.Error().Err(err).Msg("failed to query devices for re-registration")
 		return

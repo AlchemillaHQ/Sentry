@@ -85,7 +85,7 @@ func (q *Queries) DeleteUser(ctx context.Context, username string) error {
 }
 
 const getDeviceByB2BUASIPUser = `-- name: GetDeviceByB2BUASIPUser :one
-SELECT device_id, platform, push_token, upstream_host, upstream_port, upstream_transport, upstream_user, upstream_password, upstream_realm, display_name, b2bua_sip_user, device_contact, user_agent, push_provider, push_param, push_prid, registered_at, expires_at, last_seen FROM devices WHERE b2bua_sip_user = $1 LIMIT 1
+SELECT device_id, platform, push_token, upstream_host, upstream_port, upstream_transport, upstream_user, upstream_password, upstream_realm, display_name, b2bua_sip_user, device_contact, user_agent, push_provider, push_param, push_prid, registered_at, expires_at, last_seen, disabled FROM devices WHERE b2bua_sip_user = $1 LIMIT 1
 `
 
 func (q *Queries) GetDeviceByB2BUASIPUser(ctx context.Context, b2buaSipUser string) (Device, error) {
@@ -111,12 +111,13 @@ func (q *Queries) GetDeviceByB2BUASIPUser(ctx context.Context, b2buaSipUser stri
 		&i.RegisteredAt,
 		&i.ExpiresAt,
 		&i.LastSeen,
+		&i.Disabled,
 	)
 	return i, err
 }
 
 const getDeviceByID = `-- name: GetDeviceByID :one
-SELECT device_id, platform, push_token, upstream_host, upstream_port, upstream_transport, upstream_user, upstream_password, upstream_realm, display_name, b2bua_sip_user, device_contact, user_agent, push_provider, push_param, push_prid, registered_at, expires_at, last_seen FROM devices WHERE device_id = $1 LIMIT 1
+SELECT device_id, platform, push_token, upstream_host, upstream_port, upstream_transport, upstream_user, upstream_password, upstream_realm, display_name, b2bua_sip_user, device_contact, user_agent, push_provider, push_param, push_prid, registered_at, expires_at, last_seen, disabled FROM devices WHERE device_id = $1 LIMIT 1
 `
 
 func (q *Queries) GetDeviceByID(ctx context.Context, deviceID string) (Device, error) {
@@ -142,12 +143,13 @@ func (q *Queries) GetDeviceByID(ctx context.Context, deviceID string) (Device, e
 		&i.RegisteredAt,
 		&i.ExpiresAt,
 		&i.LastSeen,
+		&i.Disabled,
 	)
 	return i, err
 }
 
 const getDevicesByUpstreamUser = `-- name: GetDevicesByUpstreamUser :many
-SELECT device_id, platform, push_token, upstream_host, upstream_port, upstream_transport, upstream_user, upstream_password, upstream_realm, display_name, b2bua_sip_user, device_contact, user_agent, push_provider, push_param, push_prid, registered_at, expires_at, last_seen FROM devices WHERE upstream_user = $1
+SELECT device_id, platform, push_token, upstream_host, upstream_port, upstream_transport, upstream_user, upstream_password, upstream_realm, display_name, b2bua_sip_user, device_contact, user_agent, push_provider, push_param, push_prid, registered_at, expires_at, last_seen, disabled FROM devices WHERE upstream_user = $1
 `
 
 func (q *Queries) GetDevicesByUpstreamUser(ctx context.Context, upstreamUser string) ([]Device, error) {
@@ -179,6 +181,7 @@ func (q *Queries) GetDevicesByUpstreamUser(ctx context.Context, upstreamUser str
 			&i.RegisteredAt,
 			&i.ExpiresAt,
 			&i.LastSeen,
+			&i.Disabled,
 		); err != nil {
 			return nil, err
 		}
@@ -285,6 +288,20 @@ DELETE FROM pending_calls WHERE expires_at < $1
 
 func (q *Queries) PrunePendingCalls(ctx context.Context, expiresAt pgtype.Timestamptz) error {
 	_, err := q.db.Exec(ctx, prunePendingCalls, expiresAt)
+	return err
+}
+
+const setDeviceDisabled = `-- name: SetDeviceDisabled :exec
+UPDATE devices SET disabled = $2 WHERE device_id = $1
+`
+
+type SetDeviceDisabledParams struct {
+	DeviceID string `json:"device_id"`
+	Disabled bool   `json:"disabled"`
+}
+
+func (q *Queries) SetDeviceDisabled(ctx context.Context, arg SetDeviceDisabledParams) error {
+	_, err := q.db.Exec(ctx, setDeviceDisabled, arg.DeviceID, arg.Disabled)
 	return err
 }
 

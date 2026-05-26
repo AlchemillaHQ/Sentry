@@ -3,12 +3,14 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/AlchemillaHQ/Sentry/db"
+	"github.com/AlchemillaHQ/Sentry/secrets"
 	"github.com/AlchemillaHQ/Sentry/sipstack"
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -107,6 +109,9 @@ func (m *MockQuerier) UpdateUserPassword(ctx context.Context, arg db.UpdateUserP
 func (m *MockQuerier) UpsertSetting(ctx context.Context, arg db.UpsertSettingParams) error {
 	return m.Called(ctx, arg).Error(0)
 }
+func (m *MockQuerier) SetDeviceDisabled(ctx context.Context, arg db.SetDeviceDisabledParams) error {
+	return m.Called(ctx, arg).Error(0)
+}
 
 func TestDeviceStatus(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -153,4 +158,79 @@ func TestRegisterDevice_Validation(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+func TestDisableDevice(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	mockDB := new(MockQuerier)
+	mockReg := new(MockRegistrar)
+	handler := &Handler{
+		dbQueries: mockDB,
+		registrar: mockReg,
+	}
+
+	deviceID := "550e8400-e29b-41d4-a716-446655440000"
+	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
+		DeviceID: deviceID,
+	}, nil)
+	mockReg.On("Unregister", mock.Anything, deviceID).Return(nil)
+	mockDB.On("SetDeviceDisabled", mock.Anything, mock.MatchedBy(func(p db.SetDeviceDisabledParams) bool {
+		return p.DeviceID == deviceID && p.Disabled == true
+	})).Return(nil)
+
+	r := gin.Default()
+	r.POST("/v1/devices/:device_id/disable", handler.DisableDevice)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/devices/"+deviceID+"/disable", nil)
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.Equal(t, "disabled", resp["status"])
+}
+
+func TestEnableDevice(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	mockDB := new(MockQuerier)
+	mockReg := new(MockRegistrar)
+
+	testKey := make([]byte, 32)
+	rand.Read(testKey)
+	box, err := secrets.NewBox(testKey)
+	assert.NoError(t, err)
+
+	encPassword, err := box.Encrypt([]byte("testpassword"))
+	assert.NoError(t, err)
+
+	handler := &Handler{
+		dbQueries: mockDB,
+		registrar: mockReg,
+		box:       box,
+	}
+
+	deviceID := "550e8400-e29b-41d4-a716-446655440000"
+	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
+		DeviceID:         deviceID,
+		UpstreamHost:     "pbx.example.com",
+		UpstreamPort:     5061,
+		UpstreamPassword: encPassword,
+	}, nil)
+	mockReg.On("Register", mock.Anything, mock.Anything).Return(nil)
+	mockDB.On("SetDeviceDisabled", mock.Anything, mock.MatchedBy(func(p db.SetDeviceDisabledParams) bool {
+		return p.DeviceID == deviceID && p.Disabled == false
+	})).Return(nil)
+
+	r := gin.Default()
+	r.POST("/v1/devices/:device_id/enable", handler.EnableDevice)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/devices/"+deviceID+"/enable", nil)
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.Equal(t, "enabled", resp["status"])
 }

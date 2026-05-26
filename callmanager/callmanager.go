@@ -279,6 +279,12 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 		return
 	}
 
+	if device.Disabled {
+		log.Info().Str("device", device.DeviceID).Msg("INVITE rejected: device is disabled")
+		tx.Respond(sip.NewResponseFromRequest(req, 480, "Temporarily Unavailable", nil))
+		return
+	}
+
 	fromHdr := req.From()
 	callerURI := ""
 	callerName := ""

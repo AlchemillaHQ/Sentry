@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS devices (
     push_prid VARCHAR(512),
     registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at TIMESTAMPTZ NOT NULL,
-    last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    disabled BOOLEAN NOT NULL DEFAULT false
 );
 
 CREATE INDEX IF NOT EXISTS idx_devices_b2bua_sip_user ON devices(b2bua_sip_user);

@@ -20,12 +20,17 @@ type Database struct {
 }
 
 const schema = `
-CREATE TABLE IF NOT EXISTS settings (
+DROP TABLE IF EXISTS settings CASCADE;
+DROP TABLE IF EXISTS pending_calls CASCADE;
+DROP TABLE IF EXISTS devices CASCADE;
+DROP TABLE IF EXISTS users CASCADE;
+
+CREATE TABLE settings (
     key TEXT PRIMARY KEY,
     value BYTEA NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS devices (
+CREATE TABLE devices (
     device_id VARCHAR(36) PRIMARY KEY,
     platform VARCHAR(10) NOT NULL,
     push_token BYTEA NOT NULL,
@@ -44,13 +49,14 @@ CREATE TABLE IF NOT EXISTS devices (
     push_prid VARCHAR(512),
     registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at TIMESTAMPTZ NOT NULL,
-    last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    disabled BOOLEAN NOT NULL DEFAULT false
 );
 
-CREATE INDEX IF NOT EXISTS idx_devices_b2bua_sip_user ON devices(b2bua_sip_user);
-CREATE INDEX IF NOT EXISTS idx_devices_expires_at ON devices(expires_at);
+CREATE INDEX idx_devices_b2bua_sip_user ON devices(b2bua_sip_user);
+CREATE INDEX idx_devices_expires_at ON devices(expires_at);
 
-CREATE TABLE IF NOT EXISTS pending_calls (
+CREATE TABLE pending_calls (
     call_id VARCHAR(36) PRIMARY KEY,
     device_id VARCHAR(36) NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
     sip_call_id TEXT NOT NULL,
@@ -64,10 +70,10 @@ CREATE TABLE IF NOT EXISTS pending_calls (
     expires_at TIMESTAMPTZ NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_pending_calls_device_id ON pending_calls(device_id);
-CREATE INDEX IF NOT EXISTS idx_pending_calls_expires_at ON pending_calls(expires_at);
+CREATE INDEX idx_pending_calls_device_id ON pending_calls(device_id);
+CREATE INDEX idx_pending_calls_expires_at ON pending_calls(expires_at);
 
-CREATE TABLE IF NOT EXISTS users (
+CREATE TABLE users (
     username TEXT PRIMARY KEY,
     password_hash TEXT NOT NULL,
     role VARCHAR(20) NOT NULL DEFAULT 'admin',
@@ -137,16 +143,12 @@ func (db *Database) GetOrCreateEncryptionKey(ctx context.Context) ([]byte, error
 }
 
 func (db *Database) Reset(ctx context.Context) error {
-	// Drop all tables and recreate them from schema.
-	tables := []string{"pending_calls", "devices", "settings", "users"}
-	for _, t := range tables {
-		_, err := db.Pool.Exec(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s CASCADE", t))
-		if err != nil {
-			return fmt.Errorf("drop %s: %w", t, err)
-		}
+	log.Info().Msg("performing full database reset (DROP + CREATE)...")
+	_, err := db.Pool.Exec(ctx, schema)
+	if err != nil {
+		return fmt.Errorf("reset schema: %w", err)
 	}
-
-	return db.Init(ctx)
+	return nil
 }
 
 func (db *Database) CleanupStaleState(ctx context.Context) {

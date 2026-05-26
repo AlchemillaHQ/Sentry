@@ -76,6 +76,9 @@ func (m *MockQuerier) ListUsers(ctx context.Context) ([]ListUsersRow, error) {
 func (m *MockQuerier) UpdateUserPassword(ctx context.Context, arg UpdateUserPasswordParams) error {
 	return m.Called(ctx, arg).Error(0)
 }
+func (m *MockQuerier) SetDeviceDisabled(ctx context.Context, arg SetDeviceDisabledParams) error {
+	return m.Called(ctx, arg).Error(0)
+}
 
 func TestDatabase_Cleanup(t *testing.T) {
 	mockQ := new(MockQuerier)
