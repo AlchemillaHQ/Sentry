@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/AlchemillaHQ/Sentry/db"
+	"github.com/AlchemillaHQ/Sentry/push"
 	"github.com/AlchemillaHQ/Sentry/sipstack"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/assert"
@@ -22,6 +23,14 @@ func (m *MockPushSender) Send(ctx context.Context, platform, token, callID, call
 
 func (m *MockPushSender) Start(ctx context.Context) {
 	m.Called(ctx)
+}
+
+func (m *MockPushSender) CancelPush(callID string) {
+	m.Called(callID)
+}
+
+func (m *MockPushSender) OnDeadToken(handler push.DeadTokenHandler) {
+	m.Called(handler)
 }
 
 type MockRegistrar struct {

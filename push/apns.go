@@ -54,8 +54,22 @@ func (a *APNsSender) SendCallPush(ctx context.Context, token, callID, callerURI,
 		return fmt.Errorf("apns send: %w", err)
 	}
 	if !resp.Sent() {
+		if isAPNsTokenInvalid(resp) {
+			return fmt.Errorf("apns send: %w: %d %s", ErrTokenInvalid, resp.StatusCode, resp.Reason)
+		}
 		return fmt.Errorf("apns rejected: %d %s", resp.StatusCode, resp.Reason)
 	}
 	log.Debug().Str("apns_id", resp.ApnsID).Str("call_id", callID).Msg("apns push sent")
 	return nil
+}
+
+func isAPNsTokenInvalid(resp *apns2.Response) bool {
+	switch resp.Reason {
+	case apns2.ReasonBadDeviceToken,
+		apns2.ReasonDeviceTokenNotForTopic,
+		apns2.ReasonUnregistered,
+		apns2.ReasonExpiredToken:
+		return true
+	}
+	return false
 }

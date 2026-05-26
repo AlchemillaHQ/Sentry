@@ -45,6 +45,9 @@ func (f *FCMSender) SendCallPush(ctx context.Context, token, callID, callerURI, 
 	}
 	resp, err := f.client.Send(ctx, msg)
 	if err != nil {
+		if messaging.IsUnregistered(err) || messaging.IsInvalidArgument(err) || messaging.IsSenderIDMismatch(err) {
+			return fmt.Errorf("fcm send: %w: %w", ErrTokenInvalid, err)
+		}
 		return fmt.Errorf("fcm send: %w", err)
 	}
 	log.Debug().Str("response", resp).Str("call_id", callID).Msg("fcm push sent")

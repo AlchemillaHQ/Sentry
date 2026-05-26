@@ -7,7 +7,7 @@ VALUES ($1, $2)
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 
 -- name: GetDeviceByB2BUASIPUser :one
-SELECT * FROM devices WHERE b2bua_sip_user = $1 LIMIT 1;
+SELECT * FROM devices WHERE b2bua_sip_user = $1 AND disabled = false LIMIT 1;
 
 -- name: GetDeviceByID :one
 SELECT * FROM devices WHERE device_id = $1 LIMIT 1;

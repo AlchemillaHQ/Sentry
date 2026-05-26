@@ -85,7 +85,7 @@ func (q *Queries) DeleteUser(ctx context.Context, username string) error {
 }
 
 const getDeviceByB2BUASIPUser = `-- name: GetDeviceByB2BUASIPUser :one
-SELECT device_id, platform, push_token, upstream_host, upstream_port, upstream_transport, upstream_user, upstream_password, upstream_realm, display_name, b2bua_sip_user, device_contact, user_agent, push_provider, push_param, push_prid, registered_at, expires_at, last_seen, disabled FROM devices WHERE b2bua_sip_user = $1 LIMIT 1
+SELECT device_id, platform, push_token, upstream_host, upstream_port, upstream_transport, upstream_user, upstream_password, upstream_realm, display_name, b2bua_sip_user, device_contact, user_agent, push_provider, push_param, push_prid, registered_at, expires_at, last_seen, disabled FROM devices WHERE b2bua_sip_user = $1 AND disabled = false LIMIT 1
 `
 
 func (q *Queries) GetDeviceByB2BUASIPUser(ctx context.Context, b2buaSipUser string) (Device, error) {

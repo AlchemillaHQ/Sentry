@@ -78,6 +78,20 @@ func New(database *db.Database, stack *sipstack.Stack, registrar sipstack.Regist
 		dialogCli:    sipgo.NewDialogClientCache(stack.Client(), contactHdr),
 	}
 
+	pushSender.OnDeadToken(func(platform, token, callID string) {
+		log.Warn().Str("call_id", callID).Str("platform", platform).Msg("push token invalid, disabling device")
+		pc, err := database.Queries.GetPendingCall(context.Background(), callID)
+		if err != nil {
+			log.Error().Err(err).Str("call_id", callID).Msg("failed to get pending call for dead token cleanup")
+			return
+		}
+		_ = database.Queries.SetDeviceDisabled(context.Background(), db.SetDeviceDisabledParams{
+			DeviceID: pc.DeviceID,
+			Disabled: true,
+		})
+		log.Info().Str("device_id", pc.DeviceID).Msg("device disabled due to invalid push token")
+	})
+
 	stack.SetOnInvite(cm.handleInvite)
 	stack.SetOnAck(cm.handleAck)
 	stack.SetOnBye(cm.handleBye)
@@ -187,6 +201,7 @@ func (cm *CallManager) handleRegister(req *sip.Request, tx sip.ServerTransaction
 			default:
 				close(pc.readyCh)
 			}
+			cm.pushSender.CancelPush(pc.id)
 		}
 	}
 }
@@ -602,6 +617,7 @@ func (cm *CallManager) cleanup(callID string) {
 	cm.mu.Lock()
 	delete(cm.pending, callID)
 	cm.mu.Unlock()
+	cm.pushSender.CancelPush(callID)
 }
 
 func (cm *CallManager) RemoveDeviceSource(sipUser string) {
