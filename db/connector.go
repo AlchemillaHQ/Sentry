@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"crypto/rand"
+	_ "embed"
 	"fmt"
 	"time"
 
@@ -14,72 +15,20 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-type Database struct {
-	Pool    *pgxpool.Pool
-	Queries Querier
-}
+//go:embed schema.sql
+var schema string
 
-const schema = `
+const resetPrefix = `
 DROP TABLE IF EXISTS settings CASCADE;
 DROP TABLE IF EXISTS pending_calls CASCADE;
 DROP TABLE IF EXISTS devices CASCADE;
 DROP TABLE IF EXISTS users CASCADE;
-
-CREATE TABLE settings (
-    key TEXT PRIMARY KEY,
-    value BYTEA NOT NULL
-);
-
-CREATE TABLE devices (
-    device_id VARCHAR(36) PRIMARY KEY,
-    platform VARCHAR(10) NOT NULL,
-    push_token BYTEA NOT NULL,
-    upstream_host TEXT NOT NULL,
-    upstream_port INTEGER NOT NULL DEFAULT 5060,
-    upstream_transport VARCHAR(10) NOT NULL DEFAULT 'udp',
-    upstream_user TEXT NOT NULL,
-    upstream_password BYTEA NOT NULL,
-    upstream_realm TEXT,
-    display_name TEXT,
-    b2bua_sip_user TEXT UNIQUE NOT NULL,
-    device_contact TEXT,
-    user_agent TEXT,
-    push_provider VARCHAR(10),
-    push_param TEXT,
-    push_prid VARCHAR(512),
-    registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    expires_at TIMESTAMPTZ NOT NULL,
-    last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    disabled BOOLEAN NOT NULL DEFAULT false
-);
-
-CREATE INDEX idx_devices_b2bua_sip_user ON devices(b2bua_sip_user);
-CREATE INDEX idx_devices_expires_at ON devices(expires_at);
-
-CREATE TABLE pending_calls (
-    call_id VARCHAR(36) PRIMARY KEY,
-    device_id VARCHAR(36) NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
-    sip_call_id TEXT NOT NULL,
-    sip_from TEXT NOT NULL,
-    sip_to TEXT NOT NULL,
-    sdp_offer TEXT,
-    caller_uri TEXT NOT NULL,
-    caller_name TEXT,
-    state VARCHAR(30) NOT NULL DEFAULT 'PENDING_PUSH',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    expires_at TIMESTAMPTZ NOT NULL
-);
-
-CREATE INDEX idx_pending_calls_device_id ON pending_calls(device_id);
-CREATE INDEX idx_pending_calls_expires_at ON pending_calls(expires_at);
-
-CREATE TABLE users (
-    username TEXT PRIMARY KEY,
-    password_hash TEXT NOT NULL,
-    role VARCHAR(20) NOT NULL DEFAULT 'admin',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
 `
+
+type Database struct {
+	Pool    *pgxpool.Pool
+	Queries Querier
+}
 
 func Open(ctx context.Context, cfg config.DatabaseConfig) (*Database, error) {
 	if cfg.Driver != "postgres" {
@@ -144,7 +93,7 @@ func (db *Database) GetOrCreateEncryptionKey(ctx context.Context) ([]byte, error
 
 func (db *Database) Reset(ctx context.Context) error {
 	log.Info().Msg("performing full database reset (DROP + CREATE)...")
-	_, err := db.Pool.Exec(ctx, schema)
+	_, err := db.Pool.Exec(ctx, resetPrefix+schema)
 	if err != nil {
 		return fmt.Errorf("reset schema: %w", err)
 	}

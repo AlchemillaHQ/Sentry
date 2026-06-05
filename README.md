@@ -36,26 +36,43 @@ It works similarly to SIPIS or Flexisip, providing a "Push Wakeup" mechanism for
 
 ### Configuration
 
-Update `config.yaml` with your environment details:
+Update `config.yaml` with your environment details. See `config.example.yaml` for all options.
 
 ```yaml
+sip:
+  udp_addr: "0.0.0.0:5060"
+  tcp_addr: "0.0.0.0:5060"
+  tls_addr: "0.0.0.0:5061"
+  tls_cert: "/path/to/cert.pem"
+  tls_key: "/path/to/key.pem"
+  external_ip: "your-server-public-ip"
+  external_sip_port: 5060
+  external_sip_transport: "tls"
+  user_agent: "Sentry/1.0"
+
+api:
+  addr: "0.0.0.0:8080"
+  jwt_secret: "change-me-to-a-random-string"
+
+admin:
+  bootstrap_users:
+    - username: "admin"
+      password: "admin"
+
 database:
   driver: "postgres"
-  dsn: "postgres://user:pass@localhost:5432/sentry?sslmode=disable"
-
-sip:
-  listen_addr: ":5060"
-  external_ip: "your-server-public-ip"
-  external_port: 5060
-  transport: "tls"
+  dsn: "postgres://user:pass@localhost:5432/sentry?sslmode=require"
 
 push:
   fcm_service_account: "service-account.json"
-  apns_cert: ""
+  apns_cert: "/path/to/apns-cert.pem"
   apns_key_id: ""
   apns_team_id: ""
-  apns_bundle_id: ""
+  apns_bundle_id: "com.example.app"
   apns_production: false
+
+log:
+  level: "info"
 ```
 
 ### Running
@@ -64,8 +81,17 @@ Build and run Sentry:
 
 ```bash
 make build
-./sentry -config config.yaml
+./bin/sentry -config config.yaml
 ```
+
+#### CLI Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-config` | `config.yaml` | Path to configuration file |
+| `-data-dir` | `./data` | Directory for logs and persistent data |
+| `-reset-db` | `false` | Drop and recreate all database tables, then exit |
+| `-version` | | Print version information and exit |
 
 ## Development
 
