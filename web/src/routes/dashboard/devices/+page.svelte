@@ -54,7 +54,7 @@
     );
 
     $effect(() => {
-        const interval = setInterval(fetchDevices, 10000);
+        const interval = setInterval(fetchDevices, 30000);
         fetchDevices();
         return () => clearInterval(interval);
     });

@@ -3,6 +3,7 @@ package sipstack
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -13,7 +14,7 @@ import (
 )
 
 const (
-	registerExpiry    = 120
+	registerExpiry    = 600
 	reregisterPercent = 0.75
 )
 
@@ -244,12 +245,14 @@ func (ur *UpstreamRegistrar) sendRegister(ctx context.Context, reg *UpstreamReg,
 
 func (ur *UpstreamRegistrar) reregisterLoop(ctx context.Context, reg *UpstreamReg) {
 	interval := time.Duration(float64(registerExpiry)*reregisterPercent) * time.Second
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	jitter := time.Duration(rand.Int63n(int64(interval)))
+
+	timer := time.NewTimer(jitter)
+	defer timer.Stop()
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-timer.C:
 			regCtx, regCancel := context.WithTimeout(ctx, 15*time.Second)
 			if err := ur.sendRegister(regCtx, reg, registerExpiry); err != nil {
 				log.Error().Err(err).
@@ -258,6 +261,7 @@ func (ur *UpstreamRegistrar) reregisterLoop(ctx context.Context, reg *UpstreamRe
 					Msg("re-register failed")
 			}
 			regCancel()
+			timer.Reset(interval)
 		case <-ctx.Done():
 			return
 		}
