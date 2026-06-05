@@ -3,7 +3,9 @@ package callmanager
 import (
 	"context"
 	"net"
+	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,6 +22,8 @@ import (
 )
 
 const callTimeout = 30 * time.Second
+const maxRejectsBeforeBan = 10
+const banDuration = 24 * time.Hour
 
 type pendingCall struct {
 	id          string
@@ -55,6 +59,11 @@ type CallManager struct {
 
 	rejectThrottle   map[string]time.Time
 	rejectThrottleMu sync.Mutex
+
+	banlist    map[string]time.Time
+	banlistMu  sync.Mutex
+	failCounts map[string]int
+	failMu     sync.Mutex
 }
 
 func New(database *db.Database, stack *sipstack.Stack, registrar sipstack.Registrar, pushSender push.Sender, box *secrets.Box) *CallManager {
@@ -78,6 +87,8 @@ func New(database *db.Database, stack *sipstack.Stack, registrar sipstack.Regist
 		pending:        make(map[string]*pendingCall),
 		deviceSource:   make(map[string]sip.Uri),
 		rejectThrottle: make(map[string]time.Time),
+		banlist:        make(map[string]time.Time),
+		failCounts:     make(map[string]int),
 		dialogSrv:      sipgo.NewDialogServerCache(stack.Client(), contactHdr),
 		dialogCli:      sipgo.NewDialogClientCache(stack.Client(), contactHdr),
 	}
@@ -145,11 +156,21 @@ func (cm *CallManager) handleRegister(req *sip.Request, tx sip.ServerTransaction
 	}
 
 	sipUser := toHdr.Address.User
+	source := req.Source()
+
+	if host, _, err := net.SplitHostPort(source); err == nil && cm.isBanned(host) {
+		tx.Respond(sip.NewResponseFromRequest(req, 403, "Forbidden", nil))
+		return
+	}
+
 	ctx := context.Background()
 	device, err := cm.matchDevice(ctx, sipUser)
 	if err != nil {
 		if cm.allowRejectLog(sipUser) {
-			log.Warn().Str("sip_user", sipUser).Msg("REGISTER rejected: unknown user")
+			log.Warn().Str("sip_user", sipUser).Str("source", source).Msg("REGISTER rejected: unknown user")
+		}
+		if host, _, err := net.SplitHostPort(source); err == nil {
+			cm.recordReject(host)
 		}
 		tx.Respond(sip.NewResponseFromRequest(req, 403, "Forbidden", nil))
 		return
@@ -163,7 +184,10 @@ func (cm *CallManager) handleRegister(req *sip.Request, tx sip.ServerTransaction
 	res.AppendHeader(&expiresHdr)
 	tx.Respond(res)
 
-	source := req.Source()
+	if host, _, err := net.SplitHostPort(source); err == nil {
+		cm.clearFailures(host)
+	}
+
 	transport := req.Transport()
 	if source != "" {
 		host, portStr, err := net.SplitHostPort(source)
@@ -290,7 +314,7 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 	ctx := context.Background()
 	device, err := cm.matchDevice(ctx, sipUser)
 	if err != nil {
-		log.Warn().Str("user", sipUser).Msg("INVITE rejected: unknown user")
+		log.Warn().Str("user", sipUser).Str("source", req.Source()).Msg("INVITE rejected: unknown user")
 		tx.Respond(sip.NewResponseFromRequest(req, 404, "Not Found", nil))
 		return
 	}
@@ -670,13 +694,82 @@ func (cm *CallManager) cleanupRejectThrottle() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
+		now := time.Now()
+
 		cm.rejectThrottleMu.Lock()
-		cutoff := time.Now().Add(-5 * time.Minute)
+		cutoff := now.Add(-5 * time.Minute)
 		for k, v := range cm.rejectThrottle {
 			if v.Before(cutoff) {
 				delete(cm.rejectThrottle, k)
 			}
 		}
 		cm.rejectThrottleMu.Unlock()
+
+		cm.banlistMu.Lock()
+		for k, v := range cm.banlist {
+			if now.After(v) {
+				delete(cm.banlist, k)
+			}
+		}
+		cm.banlistMu.Unlock()
+
+		cm.failMu.Lock()
+		for k, v := range cm.failCounts {
+			if v >= maxRejectsBeforeBan {
+				delete(cm.failCounts, k)
+			}
+		}
+		cm.failMu.Unlock()
 	}
+}
+
+func (cm *CallManager) isBanned(host string) bool {
+	cm.banlistMu.Lock()
+	expiry, ok := cm.banlist[host]
+	cm.banlistMu.Unlock()
+	if !ok {
+		return false
+	}
+	if time.Now().After(expiry) {
+		cm.banlistMu.Lock()
+		delete(cm.banlist, host)
+		cm.banlistMu.Unlock()
+		return false
+	}
+	return true
+}
+
+func (cm *CallManager) recordReject(host string) {
+	if isPrivateIP(host) {
+		return
+	}
+
+	cm.failMu.Lock()
+	cm.failCounts[host]++
+	count := cm.failCounts[host]
+	cm.failMu.Unlock()
+
+	if count >= maxRejectsBeforeBan {
+		cm.banlistMu.Lock()
+		if _, exists := cm.banlist[host]; !exists {
+			cm.banlist[host] = time.Now().Add(banDuration)
+			log.Warn().Str("host", host).Dur("duration", banDuration).Msg("IP banned due to repeated rejected REGISTERs")
+		}
+		cm.banlistMu.Unlock()
+	}
+}
+
+func isPrivateIP(host string) bool {
+	host = strings.Trim(host, "[]")
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	return addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast()
+}
+
+func (cm *CallManager) clearFailures(host string) {
+	cm.failMu.Lock()
+	delete(cm.failCounts, host)
+	cm.failMu.Unlock()
 }
