@@ -2,4 +2,4 @@ config.yaml
 service-account.json
 /bin/
 /sentry
-
+/data
