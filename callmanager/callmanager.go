@@ -52,6 +52,9 @@ type CallManager struct {
 
 	dialogSrv *sipgo.DialogServerCache
 	dialogCli *sipgo.DialogClientCache
+
+	rejectThrottle   map[string]time.Time
+	rejectThrottleMu sync.Mutex
 }
 
 func New(database *db.Database, stack *sipstack.Stack, registrar sipstack.Registrar, pushSender push.Sender, box *secrets.Box) *CallManager {
@@ -67,15 +70,16 @@ func New(database *db.Database, stack *sipstack.Stack, registrar sipstack.Regist
 	}
 
 	cm := &CallManager{
-		dbQueries:    database.Queries,
-		stack:        stack,
-		registrar:    registrar,
-		pushSender:   pushSender,
-		box:          box,
-		pending:      make(map[string]*pendingCall),
-		deviceSource: make(map[string]sip.Uri),
-		dialogSrv:    sipgo.NewDialogServerCache(stack.Client(), contactHdr),
-		dialogCli:    sipgo.NewDialogClientCache(stack.Client(), contactHdr),
+		dbQueries:      database.Queries,
+		stack:          stack,
+		registrar:      registrar,
+		pushSender:     pushSender,
+		box:            box,
+		pending:        make(map[string]*pendingCall),
+		deviceSource:   make(map[string]sip.Uri),
+		rejectThrottle: make(map[string]time.Time),
+		dialogSrv:      sipgo.NewDialogServerCache(stack.Client(), contactHdr),
+		dialogCli:      sipgo.NewDialogClientCache(stack.Client(), contactHdr),
 	}
 
 	pushSender.OnDeadToken(func(platform, token, callID string) {
@@ -89,14 +93,9 @@ func New(database *db.Database, stack *sipstack.Stack, registrar sipstack.Regist
 			DeviceID: pc.DeviceID,
 			Disabled: true,
 		})
-		log.Info().Str("device_id", pc.DeviceID).Msg("device disabled due to invalid push token")
 	})
 
-	stack.SetOnInvite(cm.handleInvite)
-	stack.SetOnAck(cm.handleAck)
-	stack.SetOnBye(cm.handleBye)
-	stack.SetOnCancel(cm.handleCancel)
-	stack.SetOnRegister(cm.handleRegister)
+	go cm.cleanupRejectThrottle()
 
 	return cm
 }
@@ -149,7 +148,9 @@ func (cm *CallManager) handleRegister(req *sip.Request, tx sip.ServerTransaction
 	ctx := context.Background()
 	device, err := cm.matchDevice(ctx, sipUser)
 	if err != nil {
-		log.Warn().Str("sip_user", sipUser).Msg("REGISTER rejected: unknown user")
+		if cm.allowRejectLog(sipUser) {
+			log.Warn().Str("sip_user", sipUser).Msg("REGISTER rejected: unknown user")
+		}
 		tx.Respond(sip.NewResponseFromRequest(req, 403, "Forbidden", nil))
 		return
 	}
@@ -649,4 +650,33 @@ func (cm *CallManager) SendByeToAllBridgedCalls(ctx context.Context) {
 		pc.clientDlgMu.Unlock()
 	}
 	log.Info().Int("count", len(pendingCalls)).Msg("sent BYE to all bridged calls")
+}
+
+func (cm *CallManager) allowRejectLog(sipUser string) bool {
+	cm.rejectThrottleMu.Lock()
+	defer cm.rejectThrottleMu.Unlock()
+
+	now := time.Now()
+	if last, ok := cm.rejectThrottle[sipUser]; ok {
+		if now.Sub(last) < 30*time.Second {
+			return false
+		}
+	}
+	cm.rejectThrottle[sipUser] = now
+	return true
+}
+
+func (cm *CallManager) cleanupRejectThrottle() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		cm.rejectThrottleMu.Lock()
+		cutoff := time.Now().Add(-5 * time.Minute)
+		for k, v := range cm.rejectThrottle {
+			if v.Before(cutoff) {
+				delete(cm.rejectThrottle, k)
+			}
+		}
+		cm.rejectThrottleMu.Unlock()
+	}
 }
