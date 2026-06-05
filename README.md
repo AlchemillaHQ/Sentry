@@ -41,7 +41,7 @@ Update `config.yaml` with your environment details:
 ```yaml
 database:
   driver: "postgres"
-  dsn: "postgres://user:pass@localhost:5432/difuse?sslmode=disable"
+  dsn: "postgres://user:pass@localhost:5432/sentry?sslmode=disable"
 
 sip:
   listen_addr: ":5060"
@@ -60,7 +60,7 @@ push:
 
 ### Running
 
-Build and run the B2BUA:
+Build and run Sentry:
 
 ```bash
 make build
@@ -78,4 +78,4 @@ A `Makefile` is provided for common development tasks:
 
 ## License
 
-This project is licensed under the GPL v3.0 - see the [LICENSE](LICENSE) file for details.
+This project is dual-licensed under the GNU AGPL v3 for open source use. A commercial license is available for proprietary use. See [LICENSE](LICENSE) for details.

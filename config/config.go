@@ -87,7 +87,7 @@ func Load(path string) (*Config, error) {
 		},
 		Database: DatabaseConfig{
 			Driver: "sqlite",
-			DSN:    "difuse.db",
+			DSN:    "sentry.db",
 		},
 		Log: LogConfig{
 			Level: "info",

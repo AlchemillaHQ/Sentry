@@ -24,7 +24,7 @@ admin:
 
 database:
   driver: "postgres"
-  dsn: "postgres://user:password@localhost:5432/difuse?sslmode=disable"
+  dsn: "postgres://user:password@localhost:5432/sentry?sslmode=disable"
 
 push:
   fcm_service_account: "" # Path to Firebase JSON key
