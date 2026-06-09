@@ -146,7 +146,7 @@ func (h *Handler) ListDevices(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	var devices []map[string]interface{}
+	devices := make([]map[string]interface{}, 0)
 	for rows.Next() {
 		var dID, platform, host, user string
 		var displayName pgtype.Text
