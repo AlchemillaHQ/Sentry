@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	_ "embed"
+	"encoding/hex"
 	"fmt"
 	"time"
 
@@ -26,7 +27,7 @@ DROP TABLE IF EXISTS users CASCADE;
 `
 
 type Database struct {
-	Pool    *pgxpool.Pool
+	Pool    DBTX
 	Queries Querier
 }
 
@@ -66,9 +67,21 @@ func (db *Database) Init(ctx context.Context) error {
 	return err
 }
 
-func (db *Database) GetOrCreateEncryptionKey(ctx context.Context) ([]byte, error) {
+func (db *Database) GetOrCreateEncryptionKey(ctx context.Context, cfgKey string) ([]byte, error) {
+	if cfgKey != "" {
+		key, err := hex.DecodeString(cfgKey)
+		if err != nil || len(key) != 32 {
+			return nil, fmt.Errorf("config encryption_key must be 64 hex characters (32 bytes)")
+		}
+		_ = db.Queries.UpsertSetting(ctx, UpsertSettingParams{
+			Key: "encryption_key", Value: key,
+		})
+		return key, nil
+	}
+
 	val, err := db.Queries.GetSetting(ctx, "encryption_key")
 	if err == nil {
+		log.Warn().Msg("encryption key found in database — move to config file: add 'encryption_key: <hex>' to config.yaml and remove from database for security")
 		return val, nil
 	}
 	if err != pgx.ErrNoRows {
@@ -88,6 +101,7 @@ func (db *Database) GetOrCreateEncryptionKey(ctx context.Context) ([]byte, error
 		return nil, fmt.Errorf("store key: %w", err)
 	}
 
+	log.Warn().Str("key", hex.EncodeToString(key)).Msg("new encryption key generated — save this to your config.yaml as 'encryption_key'")
 	return key, nil
 }
 
@@ -117,7 +131,7 @@ func (db *Database) CleanupJunkDevices(ctx context.Context) int64 {
 	tag, err := db.Pool.Exec(ctx, `
 		DELETE FROM devices
 		WHERE upstream_host !~ '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
-		  AND upstream_host !~ '^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)*[a-zA-Z]{2,}$'
+		  AND upstream_host !~ '^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
 	`)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to cleanup junk devices")
@@ -130,8 +144,10 @@ func (db *Database) CleanupJunkDevices(ctx context.Context) int64 {
 	return count
 }
 
+var cleanupWorkerInterval = 1 * time.Hour
+
 func (db *Database) StartCleanupWorker(ctx context.Context) {
-	ticker := time.NewTicker(1 * time.Hour)
+	ticker := time.NewTicker(cleanupWorkerInterval)
 	go func() {
 		defer ticker.Stop()
 		for {
@@ -147,12 +163,9 @@ func (db *Database) StartCleanupWorker(ctx context.Context) {
 
 func (db *Database) BootstrapUsers(ctx context.Context, bootstrapUsers []config.BootstrapUser) error {
 	for _, u := range bootstrapUsers {
-		hash, err := auth.HashPassword(u.Password)
-		if err != nil {
-			return fmt.Errorf("hash password for %s: %w", u.Username, err)
-		}
+		hash, _ := auth.HashPassword(u.Password)
 
-		err = db.Queries.CreateUser(ctx, CreateUserParams{
+		err := db.Queries.CreateUser(ctx, CreateUserParams{
 			Username:     u.Username,
 			PasswordHash: hash,
 			Role:         "admin",

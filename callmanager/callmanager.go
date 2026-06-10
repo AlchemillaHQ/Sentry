@@ -21,9 +21,32 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-const callTimeout = 30 * time.Second
+var callTimeout = 30 * time.Second
 const maxRejectsBeforeBan = 10
 const banDuration = 24 * time.Hour
+
+type serverSession interface {
+	Respond(statusCode int, reason string, body []byte, headers ...sip.Header) error
+	Close() error
+	Bye(ctx context.Context) error
+}
+
+type clientSession interface {
+	WaitAnswer(ctx context.Context, opts sipgo.AnswerOptions) error
+	Ack(ctx context.Context) error
+	Bye(ctx context.Context) error
+	Close() error
+	Context() context.Context
+	InviteResponse() *sip.Response
+}
+
+type clientSessionWrapper struct {
+	*sipgo.DialogClientSession
+}
+
+func (w *clientSessionWrapper) InviteResponse() *sip.Response {
+	return w.DialogClientSession.InviteResponse
+}
 
 type pendingCall struct {
 	id          string
@@ -35,12 +58,66 @@ type pendingCall struct {
 	callerUser  string
 	callerHost  string
 	sdpOffer    []byte
-	serverDlg   *sipgo.DialogServerSession
-	clientDlg   *sipgo.DialogClientSession
+	serverDlg   serverSession
+	clientDlg   clientSession
 	clientDlgMu sync.Mutex
 	readyCh     chan struct{}
 	ctx         context.Context
 	cancel      context.CancelFunc
+}
+
+type dialogServerReader interface {
+	ReadAck(req *sip.Request, tx sip.ServerTransaction) error
+	ReadBye(req *sip.Request, tx sip.ServerTransaction) error
+	ReadInvite(req *sip.Request, tx sip.ServerTransaction) (serverSession, error)
+}
+
+type dialogClientFull interface {
+	ReadBye(req *sip.Request, tx sip.ServerTransaction) error
+	Invite(ctx context.Context, recipient sip.Uri, body []byte, from *sip.FromHeader, contentType sip.Header) (clientSession, error)
+}
+
+var (
+	newDialogSrv = func(client *sipgo.Client, contactHdr sip.ContactHeader) dialogServerReader {
+		cache := sipgo.NewDialogServerCache(client, contactHdr)
+		return &dialogSrvAdapter{cache: cache}
+	}
+	newDialogCli = func(client *sipgo.Client, contactHdr sip.ContactHeader) dialogClientFull {
+		cache := sipgo.NewDialogClientCache(client, contactHdr)
+		return &dialogCliAdapter{cache: cache}
+	}
+)
+
+type dialogSrvAdapter struct {
+	cache *sipgo.DialogServerCache
+}
+
+func (a *dialogSrvAdapter) ReadAck(req *sip.Request, tx sip.ServerTransaction) error {
+	return a.cache.ReadAck(req, tx)
+}
+
+func (a *dialogSrvAdapter) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
+	return a.cache.ReadBye(req, tx)
+}
+
+func (a *dialogSrvAdapter) ReadInvite(req *sip.Request, tx sip.ServerTransaction) (serverSession, error) {
+	return a.cache.ReadInvite(req, tx)
+}
+
+type dialogCliAdapter struct {
+	cache *sipgo.DialogClientCache
+}
+
+func (a *dialogCliAdapter) ReadBye(req *sip.Request, tx sip.ServerTransaction) error {
+	return a.cache.ReadBye(req, tx)
+}
+
+func (a *dialogCliAdapter) Invite(ctx context.Context, recipient sip.Uri, body []byte, from *sip.FromHeader, contentType sip.Header) (clientSession, error) {
+	s, err := a.cache.Invite(ctx, recipient, body, from, contentType)
+	if err != nil {
+		return nil, err
+	}
+	return &clientSessionWrapper{s}, nil
 }
 
 type CallManager struct {
@@ -54,8 +131,8 @@ type CallManager struct {
 	pending      map[string]*pendingCall
 	deviceSource map[string]sip.Uri
 
-	dialogSrv *sipgo.DialogServerCache
-	dialogCli *sipgo.DialogClientCache
+	dialogSrv dialogServerReader
+	dialogCli dialogClientFull
 
 	rejectThrottle   map[string]time.Time
 	rejectThrottleMu sync.Mutex
@@ -89,8 +166,8 @@ func New(database *db.Database, stack *sipstack.Stack, registrar sipstack.Regist
 		rejectThrottle: make(map[string]time.Time),
 		banlist:        make(map[string]time.Time),
 		failCounts:     make(map[string]int),
-		dialogSrv:      sipgo.NewDialogServerCache(stack.Client(), contactHdr),
-		dialogCli:      sipgo.NewDialogClientCache(stack.Client(), contactHdr),
+		dialogSrv:      newDialogSrv(stack.Client(), contactHdr),
+		dialogCli:      newDialogCli(stack.Client(), contactHdr),
 	}
 
 	pushSender.OnDeadToken(func(platform, token, callID string) {
@@ -501,7 +578,7 @@ func (cm *CallManager) relayCall(ctx context.Context, pc *pendingCall, device *d
 		return
 	}
 
-	inviteResponse := dlgClient.InviteResponse
+	inviteResponse := dlgClient.InviteResponse()
 	if inviteResponse == nil {
 		log.Error().Str("call_id", pc.id).Msg("no invite response from device")
 		pc.serverDlg.Respond(sip.StatusTemporarilyUnavailable, "Temporarily Unavailable", nil)
@@ -694,33 +771,37 @@ func (cm *CallManager) cleanupRejectThrottle() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
-		now := time.Now()
-
-		cm.rejectThrottleMu.Lock()
-		cutoff := now.Add(-5 * time.Minute)
-		for k, v := range cm.rejectThrottle {
-			if v.Before(cutoff) {
-				delete(cm.rejectThrottle, k)
-			}
-		}
-		cm.rejectThrottleMu.Unlock()
-
-		cm.banlistMu.Lock()
-		for k, v := range cm.banlist {
-			if now.After(v) {
-				delete(cm.banlist, k)
-			}
-		}
-		cm.banlistMu.Unlock()
-
-		cm.failMu.Lock()
-		for k, v := range cm.failCounts {
-			if v >= maxRejectsBeforeBan {
-				delete(cm.failCounts, k)
-			}
-		}
-		cm.failMu.Unlock()
+		cm.pruneStaleState()
 	}
+}
+
+func (cm *CallManager) pruneStaleState() {
+	now := time.Now()
+
+	cm.rejectThrottleMu.Lock()
+	cutoff := now.Add(-5 * time.Minute)
+	for k, v := range cm.rejectThrottle {
+		if v.Before(cutoff) {
+			delete(cm.rejectThrottle, k)
+		}
+	}
+	cm.rejectThrottleMu.Unlock()
+
+	cm.banlistMu.Lock()
+	for k, v := range cm.banlist {
+		if now.After(v) {
+			delete(cm.banlist, k)
+		}
+	}
+	cm.banlistMu.Unlock()
+
+	cm.failMu.Lock()
+	for k, v := range cm.failCounts {
+		if v >= maxRejectsBeforeBan {
+			delete(cm.failCounts, k)
+		}
+	}
+	cm.failMu.Unlock()
 }
 
 func (cm *CallManager) isBanned(host string) bool {

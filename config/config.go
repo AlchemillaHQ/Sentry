@@ -65,14 +65,15 @@ type RateLimitConfig struct {
 }
 
 type Config struct {
-	SIP       SIPConfig      `yaml:"sip"`
-	API       APIConfig      `yaml:"api"`
-	Admin     AdminConfig    `yaml:"admin"`
-	Database  DatabaseConfig `yaml:"database"`
-	Push      PushConfig     `yaml:"push"`
-	Pprof     PprofConfig    `yaml:"pprof"`
-	Log       LogConfig      `yaml:"log"`
-	RateLimit RateLimitConfig `yaml:"ratelimit"`
+	SIP           SIPConfig       `yaml:"sip"`
+	API           APIConfig       `yaml:"api"`
+	Admin         AdminConfig     `yaml:"admin"`
+	Database      DatabaseConfig  `yaml:"database"`
+	Push          PushConfig      `yaml:"push"`
+	Pprof         PprofConfig     `yaml:"pprof"`
+	Log           LogConfig       `yaml:"log"`
+	RateLimit     RateLimitConfig `yaml:"ratelimit"`
+	EncryptionKey string          `yaml:"encryption_key"`
 }
 
 func Load(path string) (*Config, error) {

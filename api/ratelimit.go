@@ -44,24 +44,30 @@ func (rl *IPRateLimiter) GetLimiter(ip string) *rate.Limiter {
 	return actual.(*ipLimiter).limiter
 }
 
+var rateLimitCleanupInterval = 10 * time.Minute
+
 func (rl *IPRateLimiter) cleanupLoop() {
-	ticker := time.NewTicker(10 * time.Minute)
+	ticker := time.NewTicker(rateLimitCleanupInterval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			now := time.Now()
-			rl.ips.Range(func(key, value any) bool {
-				il := value.(*ipLimiter)
-				if now.Sub(il.lastSeen) > 30*time.Minute {
-					rl.ips.Delete(key)
-				}
-				return true
-			})
+			rl.purgeStale()
 		case <-rl.stopCh:
 			return
 		}
 	}
+}
+
+func (rl *IPRateLimiter) purgeStale() {
+	now := time.Now()
+	rl.ips.Range(func(key, value any) bool {
+		il := value.(*ipLimiter)
+		if now.Sub(il.lastSeen) > 30*time.Minute {
+			rl.ips.Delete(key)
+		}
+		return true
+	})
 }
 
 func (rl *IPRateLimiter) Stop() {

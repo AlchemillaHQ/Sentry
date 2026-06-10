@@ -18,6 +18,8 @@ const (
 	reregisterPercent = 0.75
 )
 
+var reregisterInterval = time.Duration(float64(registerExpiry)*reregisterPercent) * time.Second
+
 type UpstreamReg struct {
 	DeviceID  string
 	User      string
@@ -39,8 +41,14 @@ type Registrar interface {
 	UnregisterAll(ctx context.Context)
 }
 
+type sipClient interface {
+	Do(ctx context.Context, req *sip.Request, opts ...sipgo.ClientRequestOption) (*sip.Response, error)
+	DoDigestAuth(ctx context.Context, req *sip.Request, res *sip.Response, auth sipgo.DigestAuth) (*sip.Response, error)
+}
+
 type UpstreamRegistrar struct {
-	stack *Stack
+	stack  *Stack
+	client sipClient
 
 	mu   sync.RWMutex
 	regs map[string]*UpstreamReg
@@ -50,9 +58,21 @@ var _ Registrar = (*UpstreamRegistrar)(nil)
 
 
 func NewUpstreamRegistrar(stack *Stack) *UpstreamRegistrar {
-	return &UpstreamRegistrar{
+	ur := &UpstreamRegistrar{
 		stack: stack,
 		regs:  make(map[string]*UpstreamReg),
+	}
+	if stack != nil {
+		ur.client = stack.Client()
+	}
+	return ur
+}
+
+func newUpstreamRegistrarWithClient(stack *Stack, client sipClient) *UpstreamRegistrar {
+	return &UpstreamRegistrar{
+		stack:  stack,
+		client: client,
+		regs:   make(map[string]*UpstreamReg),
 	}
 }
 
@@ -209,7 +229,7 @@ func (ur *UpstreamRegistrar) sendRegister(ctx context.Context, reg *UpstreamReg,
 		Int("expires", expires).
 		Msg("sending REGISTER")
 
-	res, err := ur.stack.Client().Do(ctx, req)
+	res, err := ur.client.Do(ctx, req)
 	if err != nil {
 		log.Error().Err(err).
 			Str("device", reg.DeviceID).
@@ -221,7 +241,7 @@ func (ur *UpstreamRegistrar) sendRegister(ctx context.Context, reg *UpstreamReg,
 
 	if res.StatusCode == 401 || res.StatusCode == 407 {
 		authReq := ur.buildRegisterRequest(reg, expires)
-		res, err = ur.stack.Client().DoDigestAuth(ctx, authReq, res, sipgo.DigestAuth{
+		res, err = ur.client.DoDigestAuth(ctx, authReq, res, sipgo.DigestAuth{
 			Username: reg.User,
 			Password: reg.Password,
 		})
@@ -244,8 +264,7 @@ func (ur *UpstreamRegistrar) sendRegister(ctx context.Context, reg *UpstreamReg,
 }
 
 func (ur *UpstreamRegistrar) reregisterLoop(ctx context.Context, reg *UpstreamReg) {
-	interval := time.Duration(float64(registerExpiry)*reregisterPercent) * time.Second
-	jitter := time.Duration(rand.Int63n(int64(interval)))
+	jitter := time.Duration(rand.Int63n(int64(reregisterInterval)))
 
 	timer := time.NewTimer(jitter)
 	defer timer.Stop()
@@ -261,7 +280,7 @@ func (ur *UpstreamRegistrar) reregisterLoop(ctx context.Context, reg *UpstreamRe
 					Msg("re-register failed")
 			}
 			regCancel()
-			timer.Reset(interval)
+			timer.Reset(reregisterInterval)
 		case <-ctx.Done():
 			return
 		}

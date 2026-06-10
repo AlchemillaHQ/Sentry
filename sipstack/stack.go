@@ -32,6 +32,12 @@ type Stack struct {
 	onCancel   func(req *sip.Request, tx sip.ServerTransaction)
 }
 
+var (
+	newUA     = sipgo.NewUA
+	newServer = sipgo.NewServer
+	newClient = sipgo.NewClient
+)
+
 func New(cfg config.SIPConfig) (*Stack, error) {
 	if cfg.LogSIP {
 		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})))
@@ -58,18 +64,18 @@ func New(cfg config.SIPConfig) (*Stack, error) {
 	}
 	uaOpts = append(uaOpts, sipgo.WithUserAgenTLSConfig(outboundTLS))
 
-	ua, err := sipgo.NewUA(uaOpts...)
+	ua, err := newUA(uaOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("create UA: %w", err)
 	}
 
-	server, err := sipgo.NewServer(ua)
+	server, err := newServer(ua)
 	if err != nil {
 		ua.Close()
 		return nil, fmt.Errorf("create server: %w", err)
 	}
 
-	client, err := sipgo.NewClient(ua)
+	client, err := newClient(ua)
 	if err != nil {
 		ua.Close()
 		return nil, fmt.Errorf("create client: %w", err)
@@ -183,54 +189,65 @@ func (s *Stack) handleCancel(req *sip.Request, tx sip.ServerTransaction) {
 	}
 }
 
+var (
+	serveUDP = serveUDPImpl
+	serveTCP = serveTCPImpl
+	serveTLS = serveTLSImpl
+)
+
+func serveUDPImpl(s *Stack, errCh chan<- error, ctx context.Context) {
+	log.Info().Str("transport", "udp").Str("addr", s.cfg.UDPAddr).Msg("SIP listening")
+
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var opErr error
+			if err := c.Control(func(fd uintptr) {
+				opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+			}); err != nil {
+				return err
+			}
+			return opErr
+		},
+	}
+
+	conn, err := lc.ListenPacket(ctx, "udp", s.cfg.UDPAddr)
+	if err != nil {
+		errCh <- fmt.Errorf("udp listen: %w", err)
+		return
+	}
+
+	if err := s.server.ServeUDP(conn.(*net.UDPConn)); err != nil {
+		errCh <- fmt.Errorf("udp serve: %w", err)
+	}
+}
+
+func serveTCPImpl(s *Stack, errCh chan<- error, ctx context.Context) {
+	log.Info().Str("transport", "tcp").Str("addr", s.cfg.TCPAddr).Msg("SIP listening")
+	if err := s.server.ListenAndServe(ctx, "tcp", s.cfg.TCPAddr); err != nil {
+		errCh <- fmt.Errorf("tcp: %w", err)
+	}
+}
+
+func serveTLSImpl(s *Stack, errCh chan<- error, ctx context.Context) {
+	log.Info().Str("transport", "tls").Str("addr", s.cfg.TLSAddr).Msg("SIP listening")
+	if err := s.server.ListenAndServeTLS(ctx, "tcp", s.cfg.TLSAddr, s.listenTLS); err != nil {
+		errCh <- fmt.Errorf("tls: %w", err)
+	}
+}
+
 func (s *Stack) ListenAndServe(ctx context.Context) error {
 	errCh := make(chan error, 4)
 
 	if s.cfg.UDPAddr != "" {
-		go func() {
-			log.Info().Str("transport", "udp").Str("addr", s.cfg.UDPAddr).Msg("SIP listening")
-
-			// Optimized UDP listener with SO_REUSEPORT
-			lc := net.ListenConfig{
-				Control: func(network, address string, c syscall.RawConn) error {
-					var opErr error
-					if err := c.Control(func(fd uintptr) {
-						opErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
-					}); err != nil {
-						return err
-					}
-					return opErr
-				},
-			}
-
-			conn, err := lc.ListenPacket(ctx, "udp", s.cfg.UDPAddr)
-			if err != nil {
-				errCh <- fmt.Errorf("udp listen: %w", err)
-				return
-			}
-
-			if err := s.server.ServeUDP(conn.(*net.UDPConn)); err != nil {
-				errCh <- fmt.Errorf("udp serve: %w", err)
-			}
-		}()
+		go serveUDP(s, errCh, ctx)
 	}
 
 	if s.cfg.TCPAddr != "" {
-		go func() {
-			log.Info().Str("transport", "tcp").Str("addr", s.cfg.TCPAddr).Msg("SIP listening")
-			if err := s.server.ListenAndServe(ctx, "tcp", s.cfg.TCPAddr); err != nil {
-				errCh <- fmt.Errorf("tcp: %w", err)
-			}
-		}()
+		go serveTCP(s, errCh, ctx)
 	}
 
 	if s.cfg.TLSAddr != "" && s.cfg.TLSCert != "" && s.cfg.TLSKey != "" {
-		go func() {
-			log.Info().Str("transport", "tls").Str("addr", s.cfg.TLSAddr).Msg("SIP listening")
-			if err := s.server.ListenAndServeTLS(ctx, "tcp", s.cfg.TLSAddr, s.listenTLS); err != nil {
-				errCh <- fmt.Errorf("tls: %w", err)
-			}
-		}()
+		go serveTLS(s, errCh, ctx)
 	}
 
 	select {

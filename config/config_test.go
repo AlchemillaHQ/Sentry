@@ -39,3 +39,190 @@ database:
 	assert.Equal(t, "postgres", cfg.Database.Driver)
 	assert.Equal(t, "postgres://localhost:5432", cfg.Database.DSN)
 }
+
+func TestLoad_MissingFile(t *testing.T) {
+	cfg, err := Load("/nonexistent/config.yaml")
+	assert.Nil(t, cfg)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "read config")
+}
+
+func TestLoad_InvalidYAML(t *testing.T) {
+	tmpfile, err := os.CreateTemp("", "config*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.Write([]byte("{{{bad yaml!!!")); err != nil {
+		t.Fatal(err)
+	}
+	tmpfile.Close()
+
+	cfg, err := Load(tmpfile.Name())
+	assert.Nil(t, cfg)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "parse config")
+}
+
+func TestLoad_MissingExternalIP(t *testing.T) {
+	content := `
+sip:
+  udp_addr: ":5060"
+database:
+  dsn: "postgres://localhost:5432"
+`
+	tmpfile, err := os.CreateTemp("", "config*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	tmpfile.Close()
+
+	cfg, err := Load(tmpfile.Name())
+	assert.Nil(t, cfg)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "external_ip")
+}
+
+func TestLoad_Defaults(t *testing.T) {
+	content := `
+sip:
+  external_ip: "10.0.0.1"
+`
+	tmpfile, err := os.CreateTemp("", "config*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	tmpfile.Close()
+
+	cfg, err := Load(tmpfile.Name())
+	assert.NoError(t, err)
+
+	assert.Equal(t, "10.0.0.1", cfg.SIP.ExternalIP)
+	assert.Equal(t, 5060, cfg.SIP.ExternalSIPPort)
+	assert.Equal(t, "udp", cfg.SIP.ExternalSIPTransport)
+	assert.Equal(t, "0.0.0.0:5060", cfg.SIP.UDPAddr)
+	assert.Equal(t, "0.0.0.0:5060", cfg.SIP.TCPAddr)
+	assert.Equal(t, "Sentry/1.0", cfg.SIP.UserAgent)
+	assert.False(t, cfg.SIP.LogSIP)
+	assert.Equal(t, "0.0.0.0:8080", cfg.API.Addr)
+	assert.Equal(t, "sqlite", cfg.Database.Driver)
+	assert.Equal(t, "sentry.db", cfg.Database.DSN)
+	assert.Equal(t, "info", cfg.Log.Level)
+	assert.Equal(t, 0.5, cfg.RateLimit.RegisterRate)
+	assert.Equal(t, 5, cfg.RateLimit.RegisterBurst)
+}
+
+func TestLoad_TransportDefaults(t *testing.T) {
+	tests := []struct {
+		name      string
+		transport string
+		expected  string
+	}{
+		{"empty uses default", "", "udp"},
+		{"explicit udp", "udp", "udp"},
+		{"tls", "tls", "tls"},
+		{"tcp", "tcp", "tcp"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := "sip:\n  external_ip: \"10.0.0.1\"\n"
+			if tt.transport != "" {
+				content += "  external_sip_transport: \"" + tt.transport + "\"\n"
+			}
+
+			tmpfile, err := os.CreateTemp("", "config*.yaml")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.Remove(tmpfile.Name())
+
+			if _, err := tmpfile.Write([]byte(content)); err != nil {
+				t.Fatal(err)
+			}
+			tmpfile.Close()
+
+			cfg, err := Load(tmpfile.Name())
+			assert.NoError(t, err)
+			assert.Equal(t, tt.expected, cfg.SIP.ExternalSIPTransport)
+		})
+	}
+}
+
+func TestLoad_ExternalSIPPortDefault(t *testing.T) {
+	content := `
+sip:
+  external_ip: "10.0.0.1"
+`
+	tmpfile, err := os.CreateTemp("", "config*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	tmpfile.Close()
+
+	cfg, err := Load(tmpfile.Name())
+	assert.NoError(t, err)
+	assert.Equal(t, 5060, cfg.SIP.ExternalSIPPort)
+}
+
+func TestLoad_AllDefaultsPreserved(t *testing.T) {
+	content := `
+sip:
+  external_ip: "1.2.3.4"
+  external_sip_port: 5080
+  external_sip_transport: "tls"
+  log_sip: true
+api:
+  addr: ":9000"
+  jwt_secret: "test-secret"
+database:
+  driver: "postgres"
+  dsn: "user=test dbname=sentry"
+log:
+  level: "debug"
+ratelimit:
+  register_rate: 0.2
+  register_burst: 10
+`
+	tmpfile, err := os.CreateTemp("", "config*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if _, err := tmpfile.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	tmpfile.Close()
+
+	cfg, err := Load(tmpfile.Name())
+	assert.NoError(t, err)
+
+	assert.Equal(t, "1.2.3.4", cfg.SIP.ExternalIP)
+	assert.Equal(t, 5080, cfg.SIP.ExternalSIPPort)
+	assert.Equal(t, "tls", cfg.SIP.ExternalSIPTransport)
+	assert.True(t, cfg.SIP.LogSIP)
+	assert.Equal(t, ":9000", cfg.API.Addr)
+	assert.Equal(t, "test-secret", cfg.API.JWTSecret)
+	assert.Equal(t, "postgres", cfg.Database.Driver)
+	assert.Equal(t, "user=test dbname=sentry", cfg.Database.DSN)
+	assert.Equal(t, "debug", cfg.Log.Level)
+	assert.Equal(t, 0.2, cfg.RateLimit.RegisterRate)
+	assert.Equal(t, 10, cfg.RateLimit.RegisterBurst)
+}

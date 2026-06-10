@@ -72,7 +72,7 @@ func main() {
 		return
 	}
 
-	encKey, err := database.GetOrCreateEncryptionKey(ctx)
+	encKey, err := database.GetOrCreateEncryptionKey(ctx, cfg.EncryptionKey)
 	if err != nil {
 		log.Error().Err(err).Msg("encryption key failed")
 		os.Exit(1)

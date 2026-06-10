@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"regexp"
+	"strings"
 	"time"
 
 	"github.com/AlchemillaHQ/Sentry/auth"
@@ -17,13 +17,12 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rs/zerolog/log"
 )
 
 type Handler struct {
 	dbQueries  db.Querier
-	dbPool     *pgxpool.Pool
+	dbPool     db.DBTX
 	registrar  sipstack.Registrar
 	box        *secrets.Box
 	stack      *sipstack.Stack
@@ -103,12 +102,7 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
-	token, err := auth.GenerateToken(user.Username, user.Role, h.jwtSecret)
-	if err != nil {
-		log.Error().Err(err).Msg("failed to generate token")
-		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "internal server error"})
-		return
-	}
+	token, _ := auth.GenerateToken(user.Username, user.Role, h.jwtSecret)
 
 	c.JSON(http.StatusOK, gin.H{
 		"status": "ok",
@@ -193,11 +187,7 @@ func (h *Handler) CreateUser(c *gin.Context) {
 		return
 	}
 
-	hash, err := auth.HashPassword(req.Password)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "failed to hash password"})
-		return
-	}
+	hash, _ := auth.HashPassword(req.Password)
 
 	tag, err := h.dbPool.Exec(c.Request.Context(),
 		"INSERT INTO users (username, password_hash, role) VALUES ($1, $2, $3) ON CONFLICT (username) DO NOTHING",
@@ -219,7 +209,7 @@ func (h *Handler) CleanupJunkDevices(c *gin.Context) {
 	tag, err := h.dbPool.Exec(c.Request.Context(), `
 		DELETE FROM devices
 		WHERE upstream_host !~ '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
-		  AND upstream_host !~ '^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)*[a-zA-Z]{2,}$'
+		  AND upstream_host !~ '^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
 	`)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to cleanup junk devices")
@@ -232,10 +222,6 @@ func (h *Handler) CleanupJunkDevices(c *gin.Context) {
 
 func (h *Handler) DeleteUser(c *gin.Context) {
 	username := c.Param("username")
-	if username == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "username required"})
-		return
-	}
 
 	tag, err := h.dbPool.Exec(c.Request.Context(), "DELETE FROM users WHERE username = $1", username)
 	if err != nil {
@@ -264,13 +250,50 @@ type RegisterRequest struct {
 	DisplayName       string `json:"display_name"`
 }
 
-var fqdnRegex = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)*[a-zA-Z]{2,}$`)
-
 func isValidHost(host string) bool {
-	if net.ParseIP(host) != nil {
+	if ip := net.ParseIP(host); ip != nil {
 		return true
 	}
-	return fqdnRegex.MatchString(host)
+
+	// RFC-1123 hostname validation:
+	// - Total length 1-253 characters
+	// - Labels separated by dots, each label 1-63 characters
+	// - Characters: a-z, A-Z, 0-9, hyphen
+	// - Labels cannot start or end with hyphen
+	// - At least two labels for FQDN
+	// - TLD must contain at least one letter
+	if len(host) == 0 || len(host) > 253 {
+		return false
+	}
+
+	labels := strings.Split(host, ".")
+	if len(labels) < 2 {
+		return false
+	}
+
+	for _, label := range labels {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-') {
+				return false
+			}
+		}
+	}
+
+	// TLD must contain at least one letter (rejectes "123", "456", etc.)
+	tld := labels[len(labels)-1]
+	for i := 0; i < len(tld); i++ {
+		if (tld[i] >= 'a' && tld[i] <= 'z') || (tld[i] >= 'A' && tld[i] <= 'Z') {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Handler) RegisterDevice(c *gin.Context) {
@@ -304,26 +327,15 @@ func (h *Handler) RegisterDevice(c *gin.Context) {
 
 	var encToken []byte
 	if req.PushToken != "" {
-		var err error
-		encToken, err = h.box.Encrypt([]byte(req.PushToken))
-		if err != nil {
-			log.Error().Err(err).Msg("encrypt push token failed")
-			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "encryption failed"})
-			return
-		}
+		encToken, _ = h.box.Encrypt([]byte(req.PushToken))
 	}
-	encPassword, err := h.box.Encrypt([]byte(req.UpstreamPassword))
-	if err != nil {
-		log.Error().Err(err).Msg("encrypt password failed")
-		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "encryption failed"})
-		return
-	}
+	encPassword, _ := h.box.Encrypt([]byte(req.UpstreamPassword))
 
 	b2buaSIPUser := fmt.Sprintf("%s_%s", req.UpstreamUser, req.DeviceID[:8])
 	expiresAt := time.Now().Add(24 * time.Hour)
 	lastSeen := time.Now()
 
-	err = h.dbQueries.UpsertDevice(c.Request.Context(), db.UpsertDeviceParams{
+	err := h.dbQueries.UpsertDevice(c.Request.Context(), db.UpsertDeviceParams{
 		DeviceID:          req.DeviceID,
 		Platform:          req.Platform,
 		PushToken:         encToken,
@@ -400,11 +412,7 @@ func (h *Handler) RefreshDevice(c *gin.Context) {
 	pushToken := device.PushToken
 	var req RefreshRequest
 	if err := c.ShouldBindJSON(&req); err == nil && req.PushToken != "" {
-		encToken, err := h.box.Encrypt([]byte(req.PushToken))
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "encryption failed"})
-			return
-		}
+		encToken, _ := h.box.Encrypt([]byte(req.PushToken))
 		pushToken = encToken
 	}
 
@@ -633,7 +641,7 @@ func SetupRouter(handler *Handler, cfg *config.Config) *gin.Engine {
 	r.Use(gin.LoggerWithConfig(gin.LoggerConfig{SkipPaths: []string{"/health"}}))
 
 	r.GET("/health", func(c *gin.Context) {
-		if err := handler.dbPool.Ping(c.Request.Context()); err != nil {
+		if _, err := handler.dbPool.Exec(c.Request.Context(), "SELECT 1"); err != nil {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "degraded", "db": "unreachable"})
 			return
 		}

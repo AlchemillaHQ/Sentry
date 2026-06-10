@@ -28,9 +28,12 @@ type pushRequest struct {
 	callerName string
 }
 
+type platformSender interface {
+	SendCallPush(ctx context.Context, token, callID, callerURI, callerName string) error
+}
+
 type Dispatcher struct {
-	fcm  *FCMSender
-	apns *APNsSender
+	senders map[string]platformSender
 
 	queue   chan pushRequest
 	workers int
@@ -45,31 +48,40 @@ var _ Sender = (*Dispatcher)(nil)
 
 const (
 	maxAttempts     = 5
-	retryTimeout    = 35 * time.Second
 	workerQueueSize = 1000
 	workerCount     = 50
 )
 
 var backoffSchedule = []time.Duration{0, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second}
 
+var (
+	newFCM  = NewFCMSender
+	newAPNs = NewAPNsSender
+)
+
+var retryTimeout = 35 * time.Second
+
 func NewDispatcher(cfg config.PushConfig) (*Dispatcher, error) {
 	d := &Dispatcher{
+		senders:     make(map[string]platformSender),
 		queue:       make(chan pushRequest, workerQueueSize),
 		workers:     workerCount,
 		cancelFuncs: make(map[string]context.CancelFunc),
 	}
 
-	fcm, err := NewFCMSender(cfg.FCMServiceAccount)
+	fcm, err := newFCM(cfg.FCMServiceAccount)
 	if err != nil {
 		return nil, fmt.Errorf("init fcm: %w", err)
 	}
-	d.fcm = fcm
+	if fcm != nil {
+		d.senders["android"] = fcm
+	}
 
-	apns, err := NewAPNsSender(cfg.APNsCert, cfg.APNsBundleID, cfg.APNsProduction)
+	apns, err := newAPNs(cfg.APNsCert, cfg.APNsBundleID, cfg.APNsProduction)
 	if err != nil {
 		log.Warn().Err(err).Msg("APNs push disabled")
-	} else {
-		d.apns = apns
+	} else if apns != nil {
+		d.senders["ios"] = apns
 	}
 
 	return d, nil
@@ -176,19 +188,9 @@ func (d *Dispatcher) CancelPush(callID string) {
 }
 
 func (d *Dispatcher) sendImmediate(ctx context.Context, platform, token, callID, callerURI, callerName string) error {
-	switch platform {
-	case "android":
-		if d.fcm == nil {
-			return fmt.Errorf("FCM not configured")
-		}
-		return d.fcm.SendCallPush(ctx, token, callID, callerURI, callerName)
-	case "ios":
-		if d.apns == nil {
-			return fmt.Errorf("APNs not configured")
-		}
-		return d.apns.SendCallPush(ctx, token, callID, callerURI, callerName)
-	default:
-		log.Warn().Str("platform", platform).Msg("unknown push platform")
-		return fmt.Errorf("unknown platform: %s", platform)
+	sender, ok := d.senders[platform]
+	if !ok {
+		return fmt.Errorf("%s push not configured", platform)
 	}
+	return sender.SendCallPush(ctx, token, callID, callerURI, callerName)
 }

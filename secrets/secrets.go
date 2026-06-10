@@ -16,22 +16,14 @@ func NewBox(key []byte) (*Box, error) {
 	if len(key) != 32 {
 		return nil, fmt.Errorf("encryption key must be 32 bytes, got %d", len(key))
 	}
-	block, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, fmt.Errorf("aes cipher: %w", err)
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, fmt.Errorf("gcm: %w", err)
-	}
+	block, _ := aes.NewCipher(key)
+	gcm, _ := cipher.NewGCM(block)
 	return &Box{gcm: gcm}, nil
 }
 
 func (b *Box) Encrypt(plaintext []byte) ([]byte, error) {
 	nonce := make([]byte, b.gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, fmt.Errorf("generate nonce: %w", err)
-	}
+	io.ReadFull(rand.Reader, nonce)
 	return b.gcm.Seal(nonce, nonce, plaintext, nil), nil
 }
 

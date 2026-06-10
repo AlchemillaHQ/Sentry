@@ -10,12 +10,18 @@ import (
 	"github.com/sideshow/apns2/payload"
 )
 
+type apnsClient interface {
+	PushWithContext(ctx apns2.Context, n *apns2.Notification) (*apns2.Response, error)
+}
+
 type APNsSender struct {
-	client   *apns2.Client
+	client   apnsClient
 	bundleID string
 }
 
-func NewAPNsSender(certPath, bundleID string, production bool) (*APNsSender, error) {
+var initAPNs = createAPNsClient
+
+func createAPNsClient(certPath, bundleID string, production bool) (apnsClient, error) {
 	if certPath == "" {
 		return nil, nil
 	}
@@ -23,13 +29,28 @@ func NewAPNsSender(certPath, bundleID string, production bool) (*APNsSender, err
 	if err != nil {
 		return nil, fmt.Errorf("load apns cert: %w", err)
 	}
-	var client *apns2.Client
+	var client apnsClient
 	if production {
 		client = apns2.NewClient(cert).Production()
 	} else {
 		client = apns2.NewClient(cert).Development()
 	}
+	return client, nil
+}
+
+func NewAPNsSender(certPath, bundleID string, production bool) (*APNsSender, error) {
+	client, err := initAPNs(certPath, bundleID, production)
+	if err != nil {
+		return nil, err
+	}
+	if client == nil {
+		return nil, nil
+	}
 	return &APNsSender{client: client, bundleID: bundleID}, nil
+}
+
+func newAPNsSenderWithClient(client apnsClient, bundleID string) *APNsSender {
+	return &APNsSender{client: client, bundleID: bundleID}
 }
 
 func (a *APNsSender) SendCallPush(ctx context.Context, token, callID, callerURI, callerName string) error {
