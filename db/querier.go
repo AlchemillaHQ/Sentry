@@ -13,6 +13,7 @@ import (
 type Querier interface {
 	CreatePendingCall(ctx context.Context, arg CreatePendingCallParams) error
 	CreateUser(ctx context.Context, arg CreateUserParams) error
+	DeleteDeviceByID(ctx context.Context, deviceID string) error
 	DeletePendingCall(ctx context.Context, callID string) error
 	DeleteUser(ctx context.Context, username string) error
 	GetDeviceByB2BUASIPUser(ctx context.Context, b2buaSipUser string) (Device, error)

@@ -59,14 +59,20 @@ type LogConfig struct {
 	Level string `yaml:"level"`
 }
 
+type RateLimitConfig struct {
+	RegisterRate  float64 `yaml:"register_rate"`
+	RegisterBurst int     `yaml:"register_burst"`
+}
+
 type Config struct {
-	SIP      SIPConfig      `yaml:"sip"`
-	API      APIConfig      `yaml:"api"`
-	Admin    AdminConfig    `yaml:"admin"`
-	Database DatabaseConfig `yaml:"database"`
-	Push     PushConfig     `yaml:"push"`
-	Pprof    PprofConfig    `yaml:"pprof"`
-	Log      LogConfig      `yaml:"log"`
+	SIP       SIPConfig      `yaml:"sip"`
+	API       APIConfig      `yaml:"api"`
+	Admin     AdminConfig    `yaml:"admin"`
+	Database  DatabaseConfig `yaml:"database"`
+	Push      PushConfig     `yaml:"push"`
+	Pprof     PprofConfig    `yaml:"pprof"`
+	Log       LogConfig      `yaml:"log"`
+	RateLimit RateLimitConfig `yaml:"ratelimit"`
 }
 
 func Load(path string) (*Config, error) {
@@ -91,6 +97,10 @@ func Load(path string) (*Config, error) {
 		},
 		Log: LogConfig{
 			Level: "info",
+		},
+		RateLimit: RateLimitConfig{
+			RegisterRate:  0.5,
+			RegisterBurst: 5,
 		},
 	}
 

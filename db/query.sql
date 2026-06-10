@@ -72,6 +72,9 @@ UPDATE devices SET disabled = $2 WHERE device_id = $1;
 -- name: PruneDevices :exec
 DELETE FROM devices WHERE expires_at < $1;
 
+-- name: DeleteDeviceByID :exec
+DELETE FROM devices WHERE device_id = $1;
+
 -- name: PrunePendingCalls :exec
 DELETE FROM pending_calls WHERE expires_at < $1;
 

@@ -37,5 +37,9 @@ push:
 pprof:
   addr: ""
 
+ratelimit:
+  register_rate: 0.5   # requests per second per IP (0.5 = 30/min)
+  register_burst: 5    # burst capacity
+
 log:
   level: "info"

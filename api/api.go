@@ -3,7 +3,9 @@ package api
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
+	"regexp"
 	"time"
 
 	"github.com/AlchemillaHQ/Sentry/auth"
@@ -152,7 +154,10 @@ func (h *Handler) ListDevices(c *gin.Context) {
 		var displayName pgtype.Text
 		var lastSeen pgtype.Timestamptz
 		var disabled bool
-		rows.Scan(&dID, &platform, &host, &user, &displayName, &lastSeen, &disabled)
+		if err := rows.Scan(&dID, &platform, &host, &user, &displayName, &lastSeen, &disabled); err != nil {
+			log.Error().Err(err).Msg("failed to scan device row")
+			continue
+		}
 		devices = append(devices, map[string]interface{}{
 			"device_id":     dID,
 			"platform":      platform,
@@ -194,17 +199,35 @@ func (h *Handler) CreateUser(c *gin.Context) {
 		return
 	}
 
-	err = h.dbQueries.CreateUser(c.Request.Context(), db.CreateUserParams{
-		Username:     req.Username,
-		PasswordHash: hash,
-		Role:         req.Role,
-	})
+	tag, err := h.dbPool.Exec(c.Request.Context(),
+		"INSERT INTO users (username, password_hash, role) VALUES ($1, $2, $3) ON CONFLICT (username) DO NOTHING",
+		req.Username, hash, req.Role)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "failed to create user"})
 		return
 	}
 
+	if tag.RowsAffected() == 0 {
+		c.JSON(http.StatusConflict, gin.H{"status": "error", "message": "username already exists"})
+		return
+	}
+
 	c.JSON(http.StatusCreated, gin.H{"status": "ok"})
+}
+
+func (h *Handler) CleanupJunkDevices(c *gin.Context) {
+	tag, err := h.dbPool.Exec(c.Request.Context(), `
+		DELETE FROM devices
+		WHERE upstream_host !~ '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+		  AND upstream_host !~ '^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)*[a-zA-Z]{2,}$'
+	`)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to cleanup junk devices")
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "cleanup failed"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "deleted": tag.RowsAffected()})
 }
 
 func (h *Handler) DeleteUser(c *gin.Context) {
@@ -214,9 +237,14 @@ func (h *Handler) DeleteUser(c *gin.Context) {
 		return
 	}
 
-	err := h.dbQueries.DeleteUser(c.Request.Context(), username)
+	tag, err := h.dbPool.Exec(c.Request.Context(), "DELETE FROM users WHERE username = $1", username)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "failed to delete user"})
+		return
+	}
+
+	if tag.RowsAffected() == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "message": "user not found"})
 		return
 	}
 
@@ -236,6 +264,15 @@ type RegisterRequest struct {
 	DisplayName       string `json:"display_name"`
 }
 
+var fqdnRegex = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)*[a-zA-Z]{2,}$`)
+
+func isValidHost(host string) bool {
+	if net.ParseIP(host) != nil {
+		return true
+	}
+	return fqdnRegex.MatchString(host)
+}
+
 func (h *Handler) RegisterDevice(c *gin.Context) {
 	var req RegisterRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -244,8 +281,22 @@ func (h *Handler) RegisterDevice(c *gin.Context) {
 		return
 	}
 
+	if _, err := uuid.Parse(req.DeviceID); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "invalid device_id: must be a valid UUID"})
+		return
+	}
+
+	if !isValidHost(req.UpstreamHost) {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "invalid upstream_host: must be a valid IP address or FQDN"})
+		return
+	}
+
 	if req.UpstreamPort == 0 {
 		req.UpstreamPort = 5060
+	}
+	if req.UpstreamPort < 1 || req.UpstreamPort > 65535 {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "invalid upstream_port: must be 1-65535"})
+		return
 	}
 	if req.UpstreamTransport == "" {
 		req.UpstreamTransport = "udp"
@@ -403,10 +454,11 @@ func (h *Handler) UnregisterDevice(c *gin.Context) {
 		}
 	}
 
-	h.dbQueries.PruneDevices(c.Request.Context(), pgtype.Timestamptz{Time: time.Now().Add(100 * time.Hour), Valid: true}) // Force delete this one specifically
-	// Actually I should add a DeleteDeviceByID query to SQLC
-	// For now, I'll just use the pgx pool directly to delete
-	h.dbPool.Exec(c.Request.Context(), "DELETE FROM devices WHERE device_id = $1", deviceID)
+	if err := h.dbQueries.DeleteDeviceByID(c.Request.Context(), deviceID); err != nil {
+		log.Error().Err(err).Str("device", deviceID).Msg("failed to delete device")
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "database error"})
+		return
+	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "unregistered"})
 }
@@ -559,12 +611,14 @@ func (h *Handler) ForceReregister(c *gin.Context) {
 		return
 	}
 
-	h.dbQueries.UpdateDeviceLastSeen(c.Request.Context(), device.B2buaSipUser)
+	if err := h.dbQueries.UpdateDeviceLastSeen(c.Request.Context(), device.B2buaSipUser); err != nil {
+		log.Error().Err(err).Str("device", deviceID).Msg("failed to update last_seen after re-register")
+	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "registered", "device_id": deviceID})
 }
 
-func SetupRouter(handler *Handler) *gin.Engine {
+func SetupRouter(handler *Handler, cfg *config.Config) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -597,6 +651,7 @@ func SetupRouter(handler *Handler) *gin.Engine {
 	{
 		admin.GET("/stats", handler.DashboardStats)
 		admin.GET("/devices", handler.ListDevices)
+		admin.POST("/devices/cleanup-junk", handler.CleanupJunkDevices)
 		admin.GET("/users", handler.ListUsers)
 		admin.POST("/users", handler.CreateUser)
 		admin.DELETE("/users/:username", handler.DeleteUser)
@@ -605,7 +660,13 @@ func SetupRouter(handler *Handler) *gin.Engine {
 	// Mobile API routes
 	mobile := v1.Group("/devices")
 	{
-		mobile.POST("/register", handler.RegisterDevice)
+		if cfg != nil && cfg.RateLimit.RegisterRate > 0 {
+			rl := NewIPRateLimiter(cfg.RateLimit.RegisterRate, cfg.RateLimit.RegisterBurst)
+			mobile.POST("/register", RateLimitMiddleware(rl), handler.RegisterDevice)
+		} else {
+			mobile.POST("/register", handler.RegisterDevice)
+		}
+		mobile.PUT("/:device_id/refresh", handler.RefreshDevice)
 		mobile.PUT("/:device_id/refresh", handler.RefreshDevice)
 		mobile.DELETE("/:device_id", handler.UnregisterDevice)
 		mobile.GET("/:device_id/status", handler.DeviceStatus)

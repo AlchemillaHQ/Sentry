@@ -18,7 +18,7 @@ test:
 	go test -v ./...
 
 generate:
-	$(go env GOPATH)/bin/sqlc generate
+	$$(go env GOPATH)/bin/sqlc generate
 
 lint:
 	go vet ./...

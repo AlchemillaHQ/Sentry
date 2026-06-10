@@ -51,6 +51,9 @@ func (m *MockQuerier) CreatePendingCall(ctx context.Context, arg db.CreatePendin
 func (m *MockQuerier) DeletePendingCall(ctx context.Context, callID string) error {
 	return m.Called(ctx, callID).Error(0)
 }
+func (m *MockQuerier) DeleteDeviceByID(ctx context.Context, deviceID string) error {
+	return m.Called(ctx, deviceID).Error(0)
+}
 func (m *MockQuerier) GetDeviceByB2BUASIPUser(ctx context.Context, b2buaSipUser string) (db.Device, error) {
 	args := m.Called(ctx, b2buaSipUser)
 	return args.Get(0).(db.Device), args.Error(1)

@@ -49,6 +49,10 @@ func main() {
 	// Initialize new zerolog/lumberjack logger
 	logger.Init(cfg.Log.Level, *dataDir, true)
 
+	if cfg.API.JWTSecret == "" || cfg.API.JWTSecret == "CHANGE_ME_FOR_DASHBOARD" {
+		log.Warn().Msg("JWT secret is not configured or uses the default example value — set api.jwt_secret in config.yaml")
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -111,6 +115,7 @@ func main() {
 	<-sipReady
 
 	database.CleanupStaleState(ctx)
+	database.CleanupJunkDevices(ctx)
 	database.StartCleanupWorker(ctx)
 
 	if err := database.BootstrapUsers(ctx, cfg.Admin.BootstrapUsers); err != nil {
@@ -119,7 +124,7 @@ func main() {
 
 	handler := api.NewHandler(database, registrar, box, stack, cfg.API)
 	handler.SetCallManager(cm)
-	router := api.SetupRouter(handler)
+	router := api.SetupRouter(handler, cfg)
 	ServeSPA(router)
 
 	srv := &http.Server{

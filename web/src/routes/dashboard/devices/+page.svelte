@@ -8,12 +8,14 @@
         Loader2,
         CheckCircle2,
         Clock,
-        Globe
+        Globe,
+        Sparkles
     } from 'lucide-svelte';
 
     let devices = $state<any[]>([]);
     let loading = $state(true);
     let searchQuery = $state('');
+    let purging = $state(false);
 
     async function fetchDevices() {
         try {
@@ -46,6 +48,20 @@
         }
     }
 
+    async function handlePurgeJunk() {
+        if (!confirm('Remove all devices with invalid hostnames (non-FQDN, non-IP)?')) return;
+        purging = true;
+        try {
+            const result = await apiFetch('/admin/devices/cleanup-junk', { method: 'POST' });
+            alert(`Purged ${result.deleted} junk device(s)`);
+            await fetchDevices();
+        } catch (err) {
+            alert('Failed to purge junk devices');
+        } finally {
+            purging = false;
+        }
+    }
+
     const filteredDevices = $derived(
         devices.filter(d =>
             d.device_id.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -66,13 +82,23 @@
             <h1 class="text-3xl font-bold tracking-tight text-white">Registered Devices</h1>
             <p class="text-zinc-400 mt-1">Monitor and manage active mobile SIP registrations.</p>
         </div>
-        <button
-            onclick={fetchDevices}
-            class="inline-flex items-center justify-center rounded-md border border-zinc-800 bg-zinc-900 px-4 py-2 text-sm font-medium text-zinc-300 hover:bg-zinc-800 transition-colors"
-        >
-            <RefreshCcw class="mr-2 h-4 w-4" />
-            Refresh
-        </button>
+        <div class="flex gap-2">
+            <button
+                onclick={handlePurgeJunk}
+                disabled={purging}
+                class="inline-flex items-center justify-center rounded-md border border-amber-800 bg-amber-900/30 px-4 py-2 text-sm font-medium text-amber-300 hover:bg-amber-900/50 transition-colors disabled:opacity-50"
+            >
+                <Sparkles class="mr-2 h-4 w-4" />
+                {purging ? 'Purging...' : 'Purge Junk'}
+            </button>
+            <button
+                onclick={fetchDevices}
+                class="inline-flex items-center justify-center rounded-md border border-zinc-800 bg-zinc-900 px-4 py-2 text-sm font-medium text-zinc-300 hover:bg-zinc-800 transition-colors"
+            >
+                <RefreshCcw class="mr-2 h-4 w-4" />
+                Refresh
+            </button>
+        </div>
     </div>
 
     <div class="flex items-center rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2">

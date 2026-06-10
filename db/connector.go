@@ -113,6 +113,23 @@ func (db *Database) CleanupStaleState(ctx context.Context) {
 	}
 }
 
+func (db *Database) CleanupJunkDevices(ctx context.Context) int64 {
+	tag, err := db.Pool.Exec(ctx, `
+		DELETE FROM devices
+		WHERE upstream_host !~ '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+		  AND upstream_host !~ '^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)*[a-zA-Z]{2,}$'
+	`)
+	if err != nil {
+		log.Error().Err(err).Msg("failed to cleanup junk devices")
+		return 0
+	}
+	count := tag.RowsAffected()
+	if count > 0 {
+		log.Info().Int64("count", count).Msg("cleaned up junk devices at startup")
+	}
+	return count
+}
+
 func (db *Database) StartCleanupWorker(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Hour)
 	go func() {
