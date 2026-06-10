@@ -667,7 +667,6 @@ func SetupRouter(handler *Handler, cfg *config.Config) *gin.Engine {
 			mobile.POST("/register", handler.RegisterDevice)
 		}
 		mobile.PUT("/:device_id/refresh", handler.RefreshDevice)
-		mobile.PUT("/:device_id/refresh", handler.RefreshDevice)
 		mobile.DELETE("/:device_id", handler.UnregisterDevice)
 		mobile.GET("/:device_id/status", handler.DeviceStatus)
 		mobile.POST("/:device_id/reregister", handler.ForceReregister)
