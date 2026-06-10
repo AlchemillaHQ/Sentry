@@ -81,7 +81,6 @@ func (db *Database) GetOrCreateEncryptionKey(ctx context.Context, cfgKey string)
 
 	val, err := db.Queries.GetSetting(ctx, "encryption_key")
 	if err == nil {
-		log.Warn().Msg("encryption key found in database — move to config file: add 'encryption_key: <hex>' to config.yaml and remove from database for security")
 		return val, nil
 	}
 	if err != pgx.ErrNoRows {
@@ -101,7 +100,6 @@ func (db *Database) GetOrCreateEncryptionKey(ctx context.Context, cfgKey string)
 		return nil, fmt.Errorf("store key: %w", err)
 	}
 
-	log.Warn().Str("key", hex.EncodeToString(key)).Msg("new encryption key generated — save this to your config.yaml as 'encryption_key'")
 	return key, nil
 }
 

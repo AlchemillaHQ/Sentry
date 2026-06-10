@@ -638,7 +638,6 @@ func SetupRouter(handler *Handler, cfg *config.Config) *gin.Engine {
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
 	}))
-	r.Use(gin.LoggerWithConfig(gin.LoggerConfig{SkipPaths: []string{"/health"}}))
 
 	r.GET("/health", func(c *gin.Context) {
 		if _, err := handler.dbPool.Exec(c.Request.Context(), "SELECT 1"); err != nil {
