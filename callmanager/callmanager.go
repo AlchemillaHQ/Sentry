@@ -183,6 +183,12 @@ func New(database *db.Database, stack *sipstack.Stack, registrar sipstack.Regist
 		})
 	})
 
+	stack.SetOnRegister(cm.handleRegister)
+	stack.SetOnInvite(cm.handleInvite)
+	stack.SetOnAck(cm.handleAck)
+	stack.SetOnBye(cm.handleBye)
+	stack.SetOnCancel(cm.handleCancel)
+
 	go cm.cleanupRejectThrottle()
 
 	return cm
