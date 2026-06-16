@@ -59,7 +59,7 @@ func createDevice(t *testing.T, q Querier, deviceID, user string) Device {
 		UpstreamRealm:     pgtype.Text{String: "realm", Valid: true},
 		DisplayName:       pgtype.Text{String: "Test Device", Valid: true},
 		B2buaSipUser:      user + "_" + deviceID[:8],
-		ExpiresAt:         pgtype.Timestamptz{Time: now.Add(24 * time.Hour), Valid: true},
+		ExpiresAt:         pgtype.Timestamptz{Time: now.Add(7 * 24 * time.Hour), Valid: true},
 		LastSeen:          pgtype.Timestamptz{Time: now, Valid: true},
 	})
 	require.NoError(t, err)

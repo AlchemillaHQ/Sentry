@@ -100,6 +100,9 @@ func (m *MockQuerier) PruneDevices(ctx context.Context, expiresAt pgtype.Timesta
 func (m *MockQuerier) PrunePendingCalls(ctx context.Context, expiresAt pgtype.Timestamptz) error {
 	return m.Called(ctx, expiresAt).Error(0)
 }
+func (m *MockQuerier) RefreshDeviceExpiry(ctx context.Context, arg db.RefreshDeviceExpiryParams) error {
+	return m.Called(ctx, arg).Error(0)
+}
 func (m *MockQuerier) UpdateDeviceContact(ctx context.Context, arg db.UpdateDeviceContactParams) error {
 	return m.Called(ctx, arg).Error(0)
 }
@@ -286,6 +289,9 @@ func TestDeviceStatus_Success(t *testing.T) {
 		LastSeen:  pgtype.Timestamptz{Time: time.Now(), Valid: true},
 	}, nil)
 	mockReg.On("IsRegistered", deviceID).Return(true)
+	mockDB.On("RefreshDeviceExpiry", mock.Anything, mock.MatchedBy(func(p db.RefreshDeviceExpiryParams) bool {
+		return p.DeviceID == deviceID
+	})).Return(nil)
 
 	r := gin.Default()
 	r.GET("/v1/devices/:device_id/status", handler.DeviceStatus)
@@ -852,7 +858,9 @@ func TestForceReregister_Success(t *testing.T) {
 		UpstreamRealm:     pgtype.Text{String: "realm", Valid: true},
 	}, nil)
 	mockReg.On("Register", mock.Anything, mock.Anything).Return(nil)
-	mockDB.On("UpdateDeviceLastSeen", mock.Anything, "user1_device-1").Return(nil)
+	mockDB.On("RefreshDeviceExpiry", mock.Anything, mock.MatchedBy(func(p db.RefreshDeviceExpiryParams) bool {
+		return p.DeviceID == deviceID
+	})).Return(nil)
 
 	r := gin.Default()
 	r.POST("/v1/devices/:device_id/reregister", handler.ForceReregister)
@@ -1921,7 +1929,7 @@ func TestUnregisterDevice_UnregisterError(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
-func TestForceReregister_UpdateLastSeenError(t *testing.T) {
+func TestForceReregister_RefreshExpiryError(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	box := newTestBox(t)
 	encPassword, err := box.Encrypt([]byte("secret"))
@@ -1943,7 +1951,9 @@ func TestForceReregister_UpdateLastSeenError(t *testing.T) {
 		UpstreamRealm:     pgtype.Text{String: "realm", Valid: true},
 	}, nil)
 	mockReg.On("Register", mock.Anything, mock.Anything).Return(nil)
-	mockDB.On("UpdateDeviceLastSeen", mock.Anything, "user1_device-1").Return(assert.AnError)
+	mockDB.On("RefreshDeviceExpiry", mock.Anything, mock.MatchedBy(func(p db.RefreshDeviceExpiryParams) bool {
+		return p.DeviceID == deviceID
+	})).Return(assert.AnError)
 
 	r := gin.Default()
 	r.POST("/v1/devices/:device_id/reregister", handler.ForceReregister)

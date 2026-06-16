@@ -300,6 +300,20 @@ func (q *Queries) PrunePendingCalls(ctx context.Context, expiresAt pgtype.Timest
 	return err
 }
 
+const refreshDeviceExpiry = `-- name: RefreshDeviceExpiry :exec
+UPDATE devices SET expires_at = $2, last_seen = NOW() WHERE device_id = $1
+`
+
+type RefreshDeviceExpiryParams struct {
+	DeviceID  string             `json:"device_id"`
+	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
+}
+
+func (q *Queries) RefreshDeviceExpiry(ctx context.Context, arg RefreshDeviceExpiryParams) error {
+	_, err := q.db.Exec(ctx, refreshDeviceExpiry, arg.DeviceID, arg.ExpiresAt)
+	return err
+}
+
 const setDeviceDisabled = `-- name: SetDeviceDisabled :exec
 UPDATE devices SET disabled = $2 WHERE device_id = $1
 `

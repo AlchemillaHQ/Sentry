@@ -20,6 +20,8 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
+const deviceExpiryDuration = 7 * 24 * time.Hour
+
 type Handler struct {
 	dbQueries  db.Querier
 	dbPool     db.DBTX
@@ -332,7 +334,7 @@ func (h *Handler) RegisterDevice(c *gin.Context) {
 	encPassword, _ := h.box.Encrypt([]byte(req.UpstreamPassword))
 
 	b2buaSIPUser := fmt.Sprintf("%s_%s", req.UpstreamUser, req.DeviceID[:8])
-	expiresAt := time.Now().Add(24 * time.Hour)
+	expiresAt := time.Now().Add(deviceExpiryDuration)
 	lastSeen := time.Now()
 
 	err := h.dbQueries.UpsertDevice(c.Request.Context(), db.UpsertDeviceParams{
@@ -433,7 +435,7 @@ func (h *Handler) RefreshDevice(c *gin.Context) {
 		PushProvider:      device.PushProvider,
 		PushParam:         device.PushParam,
 		PushPrid:          device.PushPrid,
-		ExpiresAt:         pgtype.Timestamptz{Time: time.Now().Add(24 * time.Hour), Valid: true},
+		ExpiresAt:         pgtype.Timestamptz{Time: time.Now().Add(deviceExpiryDuration), Valid: true},
 		LastSeen:          pgtype.Timestamptz{Time: time.Now(), Valid: true},
 	})
 	if err != nil {
@@ -482,6 +484,13 @@ func (h *Handler) DeviceStatus(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"status": "error", "message": "device not found"})
 		return
+	}
+
+	if err := h.dbQueries.RefreshDeviceExpiry(c.Request.Context(), db.RefreshDeviceExpiryParams{
+		DeviceID:  deviceID,
+		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(deviceExpiryDuration), Valid: true},
+	}); err != nil {
+		log.Error().Err(err).Str("device", deviceID).Msg("failed to refresh device expiry")
 	}
 
 	registered := h.registrar.IsRegistered(deviceID)
@@ -619,8 +628,11 @@ func (h *Handler) ForceReregister(c *gin.Context) {
 		return
 	}
 
-	if err := h.dbQueries.UpdateDeviceLastSeen(c.Request.Context(), device.B2buaSipUser); err != nil {
-		log.Error().Err(err).Str("device", deviceID).Msg("failed to update last_seen after re-register")
+	if err := h.dbQueries.RefreshDeviceExpiry(c.Request.Context(), db.RefreshDeviceExpiryParams{
+		DeviceID:  device.DeviceID,
+		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(deviceExpiryDuration), Valid: true},
+	}); err != nil {
+		log.Error().Err(err).Str("device", deviceID).Msg("failed to refresh device expiry")
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "registered", "device_id": deviceID})

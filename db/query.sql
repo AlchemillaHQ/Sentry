@@ -46,6 +46,9 @@ ON CONFLICT (device_id) DO UPDATE SET
 -- name: UpdateDeviceContact :exec
 UPDATE devices SET device_contact = $2, user_agent = $3, last_seen = NOW() WHERE b2bua_sip_user = $1;
 
+-- name: RefreshDeviceExpiry :exec
+UPDATE devices SET expires_at = $2, last_seen = NOW() WHERE device_id = $1;
+
 -- name: UpdateDeviceLastSeen :exec
 UPDATE devices SET last_seen = NOW() WHERE b2bua_sip_user = $1;
 

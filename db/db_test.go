@@ -53,6 +53,9 @@ func (m *MockQuerier) PruneDevices(ctx context.Context, expiresAt pgtype.Timesta
 func (m *MockQuerier) PrunePendingCalls(ctx context.Context, expiresAt pgtype.Timestamptz) error {
 	return m.Called(ctx, expiresAt).Error(0)
 }
+func (m *MockQuerier) RefreshDeviceExpiry(ctx context.Context, arg RefreshDeviceExpiryParams) error {
+	return m.Called(ctx, arg).Error(0)
+}
 func (m *MockQuerier) UpdateDeviceContact(ctx context.Context, arg UpdateDeviceContactParams) error {
 	return m.Called(ctx, arg).Error(0)
 }
