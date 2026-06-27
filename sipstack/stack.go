@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"os"
 	"sync"
 	"syscall"
 
 	"github.com/AlchemillaHQ/Sentry/config"
+	"github.com/AlchemillaHQ/Sentry/logger"
 	"github.com/emiago/sipgo"
 	"github.com/emiago/sipgo/sip"
 	"github.com/rs/zerolog/log"
@@ -39,13 +39,19 @@ var (
 )
 
 func New(cfg config.SIPConfig) (*Stack, error) {
+	var level slog.Level
 	if cfg.LogSIP {
-		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})))
-		sip.SetDefaultLogger(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})))
+		level = slog.LevelDebug
 	} else {
-		slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn})))
-		sip.SetDefaultLogger(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelWarn})))
+		level = slog.LevelWarn
 	}
+
+	zl := log.With().Str("subsys", "sipgo").Logger()
+	bridge := logger.NewSlogBridge(zl, level)
+	sl := slog.New(bridge)
+
+	slog.SetDefault(sl)
+	sip.SetDefaultLogger(sl)
 
 	uaOpts := []sipgo.UserAgentOption{
 		sipgo.WithUserAgent(cfg.UserAgent),
