@@ -154,13 +154,24 @@ func (ur *UpstreamRegistrar) UnregisterAll(ctx context.Context) {
 	ur.regs = make(map[string]*UpstreamReg)
 	ur.mu.Unlock()
 
+	const maxConcurrent = 50
+	sem := make(chan struct{}, maxConcurrent)
+	var wg sync.WaitGroup
+
 	for _, reg := range regs {
-		unregCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		if err := ur.sendRegister(unregCtx, reg, 0); err != nil {
-			log.Error().Err(err).Str("device", reg.DeviceID).Msg("unregister on shutdown failed")
-		}
-		cancel()
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(r *UpstreamReg) {
+			defer func() { <-sem }()
+			defer wg.Done()
+			unregCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			if err := ur.sendRegister(unregCtx, r, 0); err != nil {
+				log.Error().Err(err).Str("device", r.DeviceID).Msg("unregister on shutdown failed")
+			}
+		}(reg)
 	}
+	wg.Wait()
 	log.Info().Int("count", len(regs)).Msg("all upstream registrations cancelled")
 }
 

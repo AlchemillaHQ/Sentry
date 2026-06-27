@@ -8,6 +8,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -172,6 +173,10 @@ func reregisterDevices(ctx context.Context, database *db.Database, registrar *si
 	}
 	defer rows.Close()
 
+	const maxConcurrent = 50
+	sem := make(chan struct{}, maxConcurrent)
+
+	var wg sync.WaitGroup
 	for rows.Next() {
 		var dID, host, transport, user string
 		var password []byte
@@ -201,11 +206,18 @@ func reregisterDevices(ctx context.Context, database *db.Database, registrar *si
 			Password:  string(pwBytes),
 			Realm:     string(realm),
 		}
-		regCtx, regCancel := context.WithTimeout(ctx, 15*time.Second)
-		if err := registrar.Register(regCtx, reg); err != nil {
-			log.Error().Err(err).Str("device", dID).Msg("re-register on startup failed")
-		}
-		regCancel()
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem }()
+			defer wg.Done()
+			regCtx, regCancel := context.WithTimeout(ctx, 15*time.Second)
+			defer regCancel()
+			if err := registrar.Register(regCtx, reg); err != nil {
+				log.Error().Err(err).Str("device", dID).Msg("re-register on startup failed")
+			}
+		}()
 	}
+	wg.Wait()
 	log.Info().Msg("startup re-registration complete")
 }
