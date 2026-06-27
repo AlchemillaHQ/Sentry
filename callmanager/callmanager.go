@@ -467,13 +467,19 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 		pc.clientDlgMu.Lock()
 		d := pc.clientDlg
 		pc.clientDlgMu.Unlock()
-		if d != nil {
-			if ir := d.InviteResponse(); ir != nil && ir.StatusCode == 200 {
-				byeCtx, byeCancel := context.WithTimeout(context.Background(), 5*time.Second)
-				d.Bye(byeCtx)
-				byeCancel()
-				log.Info().Str("call_id", callID).Msg("BYE sent to device")
-			} else if irq := d.InviteRequest(); irq != nil {
+		if d == nil {
+			callCancel()
+			return
+		}
+
+		ir := d.InviteResponse()
+		if ir != nil && ir.StatusCode == 200 {
+			byeCtx, byeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			d.Bye(byeCtx)
+			byeCancel()
+			log.Info().Str("call_id", callID).Msg("BYE sent to device")
+		} else if ir == nil || ir.IsProvisional() {
+			if irq := d.InviteRequest(); irq != nil {
 				creq := sip.NewRequest(sip.CANCEL, irq.Recipient)
 				creq.AppendHeader(sip.HeaderClone(irq.Via()))
 				creq.AppendHeader(sip.HeaderClone(irq.From()))
