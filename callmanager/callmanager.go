@@ -29,6 +29,7 @@ type serverSession interface {
 	Respond(statusCode int, reason string, body []byte, headers ...sip.Header) error
 	Close() error
 	Bye(ctx context.Context) error
+	Context() context.Context
 }
 
 type clientSession interface {
@@ -38,6 +39,8 @@ type clientSession interface {
 	Close() error
 	Context() context.Context
 	InviteResponse() *sip.Response
+	InviteRequest() *sip.Request
+	Do(ctx context.Context, req *sip.Request) (*sip.Response, error)
 }
 
 type clientSessionWrapper struct {
@@ -46,6 +49,10 @@ type clientSessionWrapper struct {
 
 func (w *clientSessionWrapper) InviteResponse() *sip.Response {
 	return w.DialogClientSession.InviteResponse
+}
+
+func (w *clientSessionWrapper) InviteRequest() *sip.Request {
+	return w.DialogClientSession.InviteRequest
 }
 
 type pendingCall struct {
@@ -447,6 +454,48 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 	cm.pending[callID] = pc
 	cm.mu.Unlock()
 
+	go func() {
+		<-dlg.Context().Done()
+		log.Info().Str("call_id", callID).Msg("PBX dialog ended, propagating to device")
+
+		select {
+		case <-callCtx.Done():
+			return
+		default:
+		}
+
+		pc.clientDlgMu.Lock()
+		d := pc.clientDlg
+		pc.clientDlgMu.Unlock()
+		if d != nil {
+			if ir := d.InviteResponse(); ir != nil && ir.StatusCode == 200 {
+				byeCtx, byeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				d.Bye(byeCtx)
+				byeCancel()
+				log.Info().Str("call_id", callID).Msg("BYE sent to device")
+			} else if irq := d.InviteRequest(); irq != nil {
+				creq := sip.NewRequest(sip.CANCEL, irq.Recipient)
+				creq.AppendHeader(sip.HeaderClone(irq.Via()))
+				creq.AppendHeader(sip.HeaderClone(irq.From()))
+				creq.AppendHeader(sip.HeaderClone(irq.To()))
+				creq.AppendHeader(sip.HeaderClone(irq.CallID()))
+				sip.CopyHeaders("Route", irq, creq)
+				creq.SetSource(irq.Source())
+				cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
+				resp, err := d.Do(cctx, creq)
+				ccancel()
+				if err != nil {
+					log.Error().Err(err).Str("call_id", callID).Msg("failed to send CANCEL to device")
+				} else if resp.StatusCode != 200 {
+					log.Warn().Str("call_id", callID).Int("status", int(resp.StatusCode)).Msg("CANCEL got non-200")
+				} else {
+					log.Info().Str("call_id", callID).Msg("CANCEL sent to device")
+				}
+			}
+		}
+		callCancel()
+	}()
+
 	defer cm.cleanup(callID)
 
 	err = cm.dbQueries.CreatePendingCall(ctx, db.CreatePendingCallParams{
@@ -701,17 +750,7 @@ func (cm *CallManager) handleCancel(req *sip.Request, tx sip.ServerTransaction) 
 	}
 
 	log.Info().Str("call_id", found.id).Str("sip_call_id", callIDVal).Msg("call cancelled by PBX")
-
-	found.clientDlgMu.Lock()
-	if found.clientDlg != nil {
-		byeCtx, byeCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		found.clientDlg.Bye(byeCtx)
-		byeCancel()
-	}
-	found.clientDlgMu.Unlock()
-
-	found.cancel()
-
+	cm.pushSender.CancelPush(found.id)
 	tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
 }
 

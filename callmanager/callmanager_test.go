@@ -119,6 +119,7 @@ func (m *mockDialogCli) Invite(ctx context.Context, recipient sip.Uri, body []by
 type mockSrvSess struct {
 	respond func(int, string, []byte) error
 	bye     func(ctx context.Context) error
+	ctx     func() context.Context
 }
 func (m *mockSrvSess) Respond(statusCode int, reason string, body []byte, headers ...sip.Header) error {
 	return m.respond(statusCode, reason, body)
@@ -130,6 +131,12 @@ func (m *mockSrvSess) Bye(ctx context.Context) error {
 	}
 	return nil
 }
+func (m *mockSrvSess) Context() context.Context {
+	if m.ctx != nil {
+		return m.ctx()
+	}
+	return context.Background()
+}
 
 type mockCliSess struct {
 	waitAnswer    func(ctx context.Context, opts sipgo.AnswerOptions) error
@@ -138,6 +145,8 @@ type mockCliSess struct {
 	close         func() error
 	ctx           func() context.Context
 	inviteResp    func() *sip.Response
+	inviteReq     func() *sip.Request
+	do            func(ctx context.Context, req *sip.Request) (*sip.Response, error)
 }
 func (m *mockCliSess) WaitAnswer(ctx context.Context, opts sipgo.AnswerOptions) error { return m.waitAnswer(ctx, opts) }
 func (m *mockCliSess) Ack(ctx context.Context) error  { return m.ack(ctx) }
@@ -145,6 +154,8 @@ func (m *mockCliSess) Bye(ctx context.Context) error  { return m.bye(ctx) }
 func (m *mockCliSess) Close() error                   { return m.close() }
 func (m *mockCliSess) Context() context.Context       { return m.ctx() }
 func (m *mockCliSess) InviteResponse() *sip.Response  { return m.inviteResp() }
+func (m *mockCliSess) InviteRequest() *sip.Request    { return m.inviteReq() }
+func (m *mockCliSess) Do(ctx context.Context, req *sip.Request) (*sip.Response, error) { return m.do(ctx, req) }
 
 func TestHandleInvite_DisabledDevice(t *testing.T) {
 	mockDB := new(MockQuerier)
@@ -297,18 +308,20 @@ func TestHandleBye_UnknownDialog(t *testing.T) {
 func TestHandleCancel(t *testing.T) {
 	ua, _ := sipgo.NewUA(sipgo.WithUserAgent("test")); defer ua.Close()
 	client, _ := sipgo.NewClient(ua)
-	var cancelled bool
-	pc := &pendingCall{id: "c1", callID: "cancel-1", cancel: func() { cancelled = true }, sipUser: "u"}
+	pc := &pendingCall{id: "c1", callID: "cancel-1", cancel: func() {}, sipUser: "u"}
+	mockPush := new(MockPushSender); mockPush.On("CancelPush", "c1").Return()
 	cm := &CallManager{
-		pending:   map[string]*pendingCall{"c1": pc},
-		dialogSrv: &dialogSrvAdapter{cache: sipgo.NewDialogServerCache(client, sip.ContactHeader{Address: sip.Uri{Host: "10.0.0.1", Port: 5060}})},
-		dialogCli: &dialogCliAdapter{cache: sipgo.NewDialogClientCache(client, sip.ContactHeader{Address: sip.Uri{Host: "10.0.0.1", Port: 5060}})},
+		pending:    map[string]*pendingCall{"c1": pc},
+		pushSender: mockPush,
+		dialogSrv:  &dialogSrvAdapter{cache: sipgo.NewDialogServerCache(client, sip.ContactHeader{Address: sip.Uri{Host: "10.0.0.1", Port: 5060}})},
+		dialogCli:  &dialogCliAdapter{cache: sipgo.NewDialogClientCache(client, sip.ContactHeader{Address: sip.Uri{Host: "10.0.0.1", Port: 5060}})},
 	}
 	req := sip.NewRequest(sip.CANCEL, sip.Uri{Host: "test"})
 	cid := sip.CallIDHeader("cancel-1"); req.AppendHeader(&cid)
 	tx := new(mockServerTx); tx.On("Respond", mock.Anything).Return(nil)
 	cm.handleCancel(req, tx)
-	assert.True(t, cancelled)
+	mockPush.AssertCalled(t, "CancelPush", "c1")
+	tx.AssertCalled(t, "Respond", mock.Anything)
 }
 
 func TestHandleCancel_UnknownCall(t *testing.T) {
@@ -339,21 +352,21 @@ func TestSendByeToAllBridgedCalls(t *testing.T) {
 func TestHandleCancel_WithClientDialog(t *testing.T) {
 	ua, _ := sipgo.NewUA(sipgo.WithUserAgent("test")); defer ua.Close()
 	client, _ := sipgo.NewClient(ua)
-	cliByeCalled := false
-	cli := &mockCliSess{bye: func(ctx context.Context) error { cliByeCalled = true; return nil }}
-	var cancelled bool
-	pc := &pendingCall{id: "c1", callID: "cancel-cli", clientDlg: cli, clientDlgMu: sync.Mutex{}, cancel: func() { cancelled = true }, sipUser: "u"}
+	cli := &mockCliSess{bye: func(ctx context.Context) error { return nil }}
+	pc := &pendingCall{id: "c1", callID: "cancel-cli", clientDlg: cli, clientDlgMu: sync.Mutex{}, cancel: func() {}, sipUser: "u"}
+	mockPush := new(MockPushSender); mockPush.On("CancelPush", "c1").Return()
 	cm := &CallManager{
-		pending:   map[string]*pendingCall{"c1": pc},
-		dialogSrv: &dialogSrvAdapter{cache: sipgo.NewDialogServerCache(client, sip.ContactHeader{Address: sip.Uri{Host: "10.0.0.1", Port: 5060}})},
-		dialogCli: &dialogCliAdapter{cache: sipgo.NewDialogClientCache(client, sip.ContactHeader{Address: sip.Uri{Host: "10.0.0.1", Port: 5060}})},
+		pending:    map[string]*pendingCall{"c1": pc},
+		pushSender: mockPush,
+		dialogSrv:  &dialogSrvAdapter{cache: sipgo.NewDialogServerCache(client, sip.ContactHeader{Address: sip.Uri{Host: "10.0.0.1", Port: 5060}})},
+		dialogCli:  &dialogCliAdapter{cache: sipgo.NewDialogClientCache(client, sip.ContactHeader{Address: sip.Uri{Host: "10.0.0.1", Port: 5060}})},
 	}
 	req := sip.NewRequest(sip.CANCEL, sip.Uri{Host: "test"})
 	cid := sip.CallIDHeader("cancel-cli"); req.AppendHeader(&cid)
 	tx := new(mockServerTx); tx.On("Respond", mock.Anything).Return(nil)
 	cm.handleCancel(req, tx)
-	assert.True(t, cancelled)
-	assert.True(t, cliByeCalled)
+	mockPush.AssertCalled(t, "CancelPush", "c1")
+	tx.AssertCalled(t, "Respond", mock.Anything)
 }
 
 func TestMatchDevice(t *testing.T) {
