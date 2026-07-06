@@ -69,6 +69,7 @@ type pendingCall struct {
 	clientDlg   clientSession
 	clientDlgMu sync.Mutex
 	readyCh     chan struct{}
+	readyOnce   sync.Once
 	ctx         context.Context
 	cancel      context.CancelFunc
 }
@@ -311,11 +312,9 @@ func (cm *CallManager) handleRegister(req *sip.Request, tx sip.ServerTransaction
 
 	for _, pc := range cm.pending {
 		if pc.sipUser == deviceKey {
-			select {
-			case <-pc.readyCh:
-			default:
+			pc.readyOnce.Do(func() {
 				close(pc.readyCh)
-			}
+			})
 			cm.pushSender.CancelPush(pc.id)
 		}
 	}
@@ -485,10 +484,12 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 				creq.AppendHeader(sip.HeaderClone(irq.From()))
 				creq.AppendHeader(sip.HeaderClone(irq.To()))
 				creq.AppendHeader(sip.HeaderClone(irq.CallID()))
+				cseq := irq.CSeq()
+				creq.AppendHeader(&sip.CSeqHeader{SeqNo: cseq.SeqNo, MethodName: sip.CANCEL})
 				sip.CopyHeaders("Route", irq, creq)
 				creq.SetSource(irq.Source())
 				cctx, ccancel := context.WithTimeout(context.Background(), 5*time.Second)
-				resp, err := d.Do(cctx, creq)
+				resp, err := cm.stack.Client().Do(cctx, creq)
 				ccancel()
 				if err != nil {
 					log.Error().Err(err).Str("call_id", callID).Msg("failed to send CANCEL to device")
@@ -618,7 +619,12 @@ func (cm *CallManager) relayCall(ctx context.Context, pc *pendingCall, device *d
 		pc.serverDlg.Close()
 		return
 	}
-	defer dlgClient.Close()
+	defer func() {
+		dlgClient.Close()
+		pc.clientDlgMu.Lock()
+		pc.clientDlg = nil
+		pc.clientDlgMu.Unlock()
+	}()
 
 	pc.clientDlgMu.Lock()
 	pc.clientDlg = dlgClient
