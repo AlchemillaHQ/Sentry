@@ -198,13 +198,17 @@ func (ur *UpstreamRegistrar) buildRegisterRequest(reg *UpstreamReg, expires int)
 	contactHost := ur.stack.ExternalIP()
 	b2buaSIPUser := fmt.Sprintf("%s_%s", reg.User, reg.DeviceID[:8])
 
-	req.AppendHeader(&sip.ContactHeader{
-		Address: sip.Uri{
-			User: b2buaSIPUser,
-			Host: contactHost,
-			Port: ur.stack.ExternalSIPPort(),
-		},
-	})
+	contactAddr := sip.Uri{
+		User: b2buaSIPUser,
+		Host: contactHost,
+		Port: ur.stack.ExternalSIPPort(),
+	}
+	if reg.Transport != "" && reg.Transport != "udp" {
+		contactAddr.UriParams = sip.NewParams()
+		contactAddr.UriParams.Add("transport", reg.Transport)
+	}
+
+	req.AppendHeader(&sip.ContactHeader{Address: contactAddr})
 
 	expiresHdr := sip.ExpiresHeader(expires)
 	req.AppendHeader(&expiresHdr)
