@@ -96,8 +96,8 @@ func (h *Handler) EnsureEnabledRegistration(ctx context.Context, deviceID, reaso
 		log.Info().Str("device", deviceID).Str("reason", reason).Msg("automatic registration suppressed for disabled device")
 		return false, nil
 	}
-	if h.registrar.IsRegistered(deviceID) {
-		return true, nil
+	if h.registrar.GetReg(deviceID) != nil {
+		return h.registrar.IsRegistered(deviceID), nil
 	}
 
 	password, err := h.box.Decrypt(device.UpstreamPassword)
@@ -105,12 +105,10 @@ func (h *Handler) EnsureEnabledRegistration(ctx context.Context, deviceID, reaso
 		return false, fmt.Errorf("decrypt password: %w", err)
 	}
 
-	registerCtx, registerCancel := context.WithTimeout(ctx, 15*time.Second)
-	defer registerCancel()
-	if err := h.registrar.Register(registerCtx, h.upstreamRegistration(device, string(password))); err != nil {
-		return false, fmt.Errorf("register upstream: %w", err)
+	if err := h.registrar.Manage(h.upstreamRegistration(device, string(password))); err != nil {
+		return false, fmt.Errorf("manage upstream registration: %w", err)
 	}
-	return true, nil
+	return h.registrar.IsRegistered(deviceID), nil
 }
 
 func (h *Handler) AuthMiddleware() gin.HandlerFunc {
@@ -762,6 +760,16 @@ func (h *Handler) EnableDevice(c *gin.Context) {
 	defer regCancel()
 	if err := h.registrar.Register(regCtx, h.upstreamRegistration(device, string(password))); err != nil {
 		log.Error().Err(err).Str("device", deviceID).Msg("upstream re-registration on enable failed")
+		if device.Disabled {
+			// Register keeps enabled accounts under background supervision after a
+			// transient failure. This account is still disabled in the database, so
+			// remove that desired state before returning the failed enable request.
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			if cleanupErr := h.registrar.Unregister(cleanupCtx, deviceID); cleanupErr != nil {
+				log.Debug().Err(cleanupErr).Str("device", deviceID).Msg("failed enable registration cleanup did not complete upstream")
+			}
+			cleanupCancel()
+		}
 		c.JSON(http.StatusBadGateway, gin.H{"status": "error", "message": "upstream registration failed"})
 		return
 	}
@@ -875,7 +883,11 @@ func SetupRouter(handler *Handler, cfg *config.Config) *gin.Engine {
 			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "degraded", "db": "unreachable"})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		response := gin.H{"status": "ok"}
+		if reporter, ok := handler.registrar.(sipstack.RegistrarHealthReporter); ok {
+			response["registrar"] = reporter.HealthSummary()
+		}
+		c.JSON(http.StatusOK, response)
 	})
 
 	v1 := r.Group("/v1")

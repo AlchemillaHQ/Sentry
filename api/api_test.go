@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
 // --------------- Mocks ---------------
@@ -32,6 +33,9 @@ type MockRegistrar struct {
 
 func (m *MockRegistrar) Register(ctx context.Context, reg *sipstack.UpstreamReg) error {
 	return m.Called(ctx, reg).Error(0)
+}
+func (m *MockRegistrar) Manage(reg *sipstack.UpstreamReg) error {
+	return m.Called(reg).Error(0)
 }
 func (m *MockRegistrar) Unregister(ctx context.Context, deviceID string) error {
 	return m.Called(ctx, deviceID).Error(0)
@@ -985,6 +989,38 @@ func TestEnsureEnabledRegistration_SuppressesDisabledDevice(t *testing.T) {
 	assert.NoError(t, err)
 	assert.False(t, registered)
 	mockReg.AssertNotCalled(t, "Register", mock.Anything, mock.Anything)
+	mockReg.AssertNotCalled(t, "Manage", mock.Anything)
+}
+
+func TestEnsureEnabledRegistration_QueuesWithoutWaiting(t *testing.T) {
+	box := newTestBox(t)
+	password, err := box.Encrypt([]byte("secret"))
+	require.NoError(t, err)
+	mockDB := new(MockQuerier)
+	mockReg := new(MockRegistrar)
+	handler := &Handler{dbQueries: mockDB, registrar: mockReg, box: box}
+
+	deviceID := "550e8400-e29b-41d4-a716-446655440000"
+	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
+		DeviceID:          deviceID,
+		UpstreamUser:      "1001",
+		UpstreamHost:      "pbx.example.com",
+		UpstreamPort:      5060,
+		UpstreamTransport: "udp",
+		UpstreamPassword:  password,
+	}, nil)
+	mockReg.On("GetReg", deviceID).Return((*sipstack.UpstreamReg)(nil))
+	mockReg.On("Manage", mock.MatchedBy(func(reg *sipstack.UpstreamReg) bool {
+		return reg.DeviceID == deviceID && reg.Password == "secret"
+	})).Return(nil)
+	mockReg.On("IsRegistered", deviceID).Return(false)
+
+	registered, err := handler.EnsureEnabledRegistration(context.Background(), deviceID, "startup")
+
+	require.NoError(t, err)
+	assert.False(t, registered)
+	mockReg.AssertCalled(t, "Manage", mock.Anything)
+	mockReg.AssertNotCalled(t, "Register", mock.Anything, mock.Anything)
 }
 
 // --------------- ForceReregister tests ---------------
@@ -1885,6 +1921,41 @@ func TestEnableDevice_RegisterError(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusBadGateway, w.Code)
+	mockReg.AssertNotCalled(t, "Unregister", mock.Anything, deviceID)
+}
+
+func TestEnableDevice_DisabledRegisterErrorCancelsManagedState(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	box := newTestBox(t)
+	encPassword, err := box.Encrypt([]byte("secret"))
+	require.NoError(t, err)
+
+	mockDB := new(MockQuerier)
+	mockReg := new(MockRegistrar)
+	handler := &Handler{dbQueries: mockDB, registrar: mockReg, box: box}
+
+	deviceID := "550e8400-e29b-41d4-a716-446655440000"
+	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
+		DeviceID:          deviceID,
+		Disabled:          true,
+		UpstreamUser:      "user1",
+		UpstreamHost:      "pbx.example.com",
+		UpstreamPort:      5060,
+		UpstreamTransport: "udp",
+		UpstreamPassword:  encPassword,
+	}, nil)
+	mockReg.On("Register", mock.Anything, mock.Anything).Return(assert.AnError)
+	mockReg.On("Unregister", mock.Anything, deviceID).Return(nil)
+
+	r := gin.New()
+	r.POST("/v1/devices/:device_id/enable", handler.EnableDevice)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/devices/"+deviceID+"/enable", nil)
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadGateway, w.Code)
+	mockReg.AssertCalled(t, "Unregister", mock.Anything, deviceID)
+	mockDB.AssertNotCalled(t, "SetDeviceDisabled", mock.Anything, mock.Anything)
 }
 
 func TestEnableDevice_SetDisabledError(t *testing.T) {

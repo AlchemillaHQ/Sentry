@@ -41,5 +41,24 @@ ratelimit:
   register_rate: 0.5   # requests per second per IP (0.5 = 30/min)
   register_burst: 5    # burst capacity
 
+# Upstream registration health and self-healing. Probes are shared by every
+# extension using the same host, port, and transport.
+registrar:
+  expires_seconds: 600
+  refresh_percent: 70
+  attempt_timeout_seconds: 8
+  probe_enabled: true
+  probe_interval_milliseconds: 3000
+  probe_timeout_milliseconds: 1200
+  probe_failure_threshold: 2
+  down_probe_interval_milliseconds: 1000
+  probe_global_workers: 128
+  probe_global_max_rate: 1000
+  recovery_workers_per_gateway: 64
+  recovery_initial_rate: 25
+  recovery_max_rate: 500
+  recovery_global_workers: 512
+  recovery_global_max_rate: 1000
+
 log:
   level: "info"

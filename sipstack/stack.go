@@ -55,6 +55,9 @@ func New(cfg config.SIPConfig) (*Stack, error) {
 
 	uaOpts := []sipgo.UserAgentOption{
 		sipgo.WithUserAgent(cfg.UserAgent),
+		sipgo.WithUserAgentTransportLayerOptions(
+			sip.WithTransportLayerConnectionReuse(true),
+		),
 	}
 
 	outboundTLS := &tls.Config{

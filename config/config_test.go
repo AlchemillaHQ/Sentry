@@ -121,6 +121,7 @@ sip:
 	assert.Equal(t, "info", cfg.Log.Level)
 	assert.Equal(t, 0.5, cfg.RateLimit.RegisterRate)
 	assert.Equal(t, 5, cfg.RateLimit.RegisterBurst)
+	assert.Equal(t, DefaultRegistrarConfig(), cfg.Registrar)
 }
 
 func TestLoad_TransportDefaults(t *testing.T) {
@@ -199,6 +200,10 @@ log:
 ratelimit:
   register_rate: 0.2
   register_burst: 10
+registrar:
+  probe_interval_milliseconds: 5000
+  recovery_initial_rate: 40
+  recovery_max_rate: 300
 `
 	tmpfile, err := os.CreateTemp("", "config*.yaml")
 	if err != nil {
@@ -225,4 +230,61 @@ ratelimit:
 	assert.Equal(t, "debug", cfg.Log.Level)
 	assert.Equal(t, 0.2, cfg.RateLimit.RegisterRate)
 	assert.Equal(t, 10, cfg.RateLimit.RegisterBurst)
+	assert.Equal(t, 5000, cfg.Registrar.ProbeIntervalMilliseconds)
+	assert.Equal(t, float64(40), cfg.Registrar.RecoveryInitialRate)
+	assert.Equal(t, float64(300), cfg.Registrar.RecoveryMaxRate)
+	assert.True(t, cfg.Registrar.ProbeEnabled)
+}
+
+func TestLoad_RegistrarValidation(t *testing.T) {
+	tests := []struct {
+		name      string
+		registrar string
+		errorText string
+	}{
+		{
+			name:      "refresh percentage",
+			registrar: "refresh_percent: 95",
+			errorText: "refresh_percent",
+		},
+		{
+			name:      "failure threshold",
+			registrar: "probe_failure_threshold: 1",
+			errorText: "probe_failure_threshold",
+		},
+		{
+			name:      "probe traffic floor",
+			registrar: "probe_interval_milliseconds: 100",
+			errorText: "probe_interval_milliseconds",
+		},
+		{
+			name:      "rate ordering",
+			registrar: "recovery_initial_rate: 300\n  recovery_max_rate: 200",
+			errorText: "recovery_max_rate",
+		},
+		{
+			name:      "worker ordering",
+			registrar: "recovery_workers_per_gateway: 64\n  recovery_global_workers: 32",
+			errorText: "recovery_global_workers",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := "sip:\n  external_ip: 10.0.0.1\nregistrar:\n  " + tt.registrar + "\n"
+			tmpfile, err := os.CreateTemp("", "config*.yaml")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.Remove(tmpfile.Name())
+			if _, err := tmpfile.Write([]byte(content)); err != nil {
+				t.Fatal(err)
+			}
+			tmpfile.Close()
+
+			cfg, err := Load(tmpfile.Name())
+			assert.Nil(t, cfg)
+			assert.ErrorContains(t, err, tt.errorText)
+		})
+	}
 }

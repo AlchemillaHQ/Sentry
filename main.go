@@ -97,7 +97,7 @@ func main() {
 	}
 	defer stack.Close()
 
-	registrar := sipstack.NewUpstreamRegistrar(stack)
+	registrar := sipstack.NewUpstreamRegistrar(stack, cfg.Registrar)
 
 	cm := callmanager.New(database, stack, registrar, pushSender, box)
 	handler := api.NewHandler(database, registrar, box, stack, cfg.API)
@@ -159,7 +159,7 @@ func main() {
 		}
 	}()
 
-	go reregisterDevices(ctx, database, handler)
+	go reconcileRegistrations(ctx, database, handler)
 
 	log.Info().Str("version", Version).Msg("Sentry started")
 	<-ctx.Done()
@@ -177,7 +177,7 @@ func main() {
 	log.Info().Msg("shutdown complete")
 }
 
-func reregisterDevices(ctx context.Context, database *db.Database, handler *api.Handler) {
+func reconcileRegistrations(ctx context.Context, database *db.Database, handler *api.Handler) {
 	rows, err := database.Pool.Query(ctx, "SELECT device_id FROM devices WHERE disabled = false")
 	if err != nil {
 		log.Error().Err(err).Msg("failed to query devices for re-registration")
@@ -212,5 +212,5 @@ func reregisterDevices(ctx context.Context, database *db.Database, handler *api.
 		}(dID)
 	}
 	wg.Wait()
-	log.Info().Msg("startup re-registration complete")
+	log.Info().Msg("startup registration reconciliation queued")
 }

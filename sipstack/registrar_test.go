@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,7 +22,11 @@ func TestUpstreamRegistrar_State(t *testing.T) {
 	reg := &UpstreamReg{DeviceID: deviceID, User: "user", Host: "pbx.com"}
 
 	ur.mu.Lock()
-	ur.regs[deviceID] = reg
+	ur.regs[deviceID] = &registrationState{
+		reg:        reg,
+		registered: true,
+		expiresAt:  time.Now().Add(time.Minute),
+	}
 	ur.mu.Unlock()
 
 	assert.True(t, ur.IsRegistered(deviceID))
@@ -95,12 +100,25 @@ func TestBuildRegisterRequest_ContactUser(t *testing.T) {
 	assert.Equal(t, "7337_abcdefgh", req.Contact().Address.User)
 }
 
+func TestBuildRegisterRequest_PreservesIdentityAndIncreasesCSeq(t *testing.T) {
+	ur := NewUpstreamRegistrar(&Stack{cfg: config.SIPConfig{ExternalIP: "10.0.0.1", ExternalSIPPort: 5060}})
+	t.Cleanup(ur.StopAll)
+	reg := &UpstreamReg{DeviceID: "device-abcdefgh", User: "7337", Host: "pbx.com", Port: 5060}
+
+	first := ur.buildRegisterRequest(reg, 600)
+	second := ur.buildRegisterRequest(reg, 0)
+
+	assert.Equal(t, first.CallID().Value(), second.CallID().Value())
+	assert.Equal(t, uint32(1), first.CSeq().SeqNo)
+	assert.Equal(t, uint32(2), second.CSeq().SeqNo)
+}
+
 func TestStopAll(t *testing.T) {
 	ur := NewUpstreamRegistrar(nil)
 	var cancelled []string
-	ur.regs["d1"] = &UpstreamReg{DeviceID: "d1", cancel: context.CancelFunc(func() { cancelled = append(cancelled, "d1") })}
-	ur.regs["d2"] = &UpstreamReg{DeviceID: "d2", cancel: context.CancelFunc(func() { cancelled = append(cancelled, "d2") })}
-	ur.regs["d3"] = &UpstreamReg{DeviceID: "d3", cancel: nil}
+	ur.regs["d1"] = &registrationState{reg: &UpstreamReg{DeviceID: "d1"}, cancelAttempt: context.CancelFunc(func() { cancelled = append(cancelled, "d1") })}
+	ur.regs["d2"] = &registrationState{reg: &UpstreamReg{DeviceID: "d2"}, cancelAttempt: context.CancelFunc(func() { cancelled = append(cancelled, "d2") })}
+	ur.regs["d3"] = &registrationState{reg: &UpstreamReg{DeviceID: "d3"}}
 	ur.StopAll()
 	assert.ElementsMatch(t, []string{"d1", "d2"}, cancelled)
 	assert.Empty(t, ur.regs)
@@ -176,17 +194,17 @@ type mockServerTx struct {
 	mock.Mock
 }
 
-func (m *mockServerTx) Origin() *sip.Request                 { return nil }
-func (m *mockServerTx) String() string                       { return "mock" }
-func (m *mockServerTx) Errors() <-chan error                 { return nil }
-func (m *mockServerTx) Done() <-chan struct{}                { return nil }
-func (m *mockServerTx) Terminate()                           {}
+func (m *mockServerTx) Origin() *sip.Request                  { return nil }
+func (m *mockServerTx) String() string                        { return "mock" }
+func (m *mockServerTx) Errors() <-chan error                  { return nil }
+func (m *mockServerTx) Done() <-chan struct{}                 { return nil }
+func (m *mockServerTx) Terminate()                            {}
 func (m *mockServerTx) OnTerminate(fn sip.FnTxTerminate) bool { return false }
 func (m *mockServerTx) OnCancel(fn sip.FnTxCancel) bool       { return false }
-func (m *mockServerTx) Err() error                           { return nil }
-func (m *mockServerTx) Respond(res *sip.Response) error      { return m.Called(res).Error(0) }
-func (m *mockServerTx) Acks() <-chan *sip.Request            { return nil }
-func (m *mockServerTx) Cancels() <-chan *sip.Request         { return nil }
+func (m *mockServerTx) Err() error                            { return nil }
+func (m *mockServerTx) Respond(res *sip.Response) error       { return m.Called(res).Error(0) }
+func (m *mockServerTx) Acks() <-chan *sip.Request             { return nil }
+func (m *mockServerTx) Cancels() <-chan *sip.Request          { return nil }
 
 func testStack() *Stack {
 	return &Stack{cfg: config.SIPConfig{ExternalIP: "10.0.0.1", ExternalSIPPort: 5060, ExternalSIPTransport: "udp"}}
@@ -293,9 +311,16 @@ func TestStackClose(t *testing.T) {
 
 type mockSipClient struct {
 	mock.Mock
+	registerCalls atomic.Int64
+	optionCalls   atomic.Int64
 }
 
 func (m *mockSipClient) Do(ctx context.Context, req *sip.Request, opts ...sipgo.ClientRequestOption) (*sip.Response, error) {
+	if req.Method == sip.REGISTER {
+		m.registerCalls.Add(1)
+	} else if req.Method == sip.OPTIONS {
+		m.optionCalls.Add(1)
+	}
 	args := m.Called(ctx, req, opts)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
@@ -304,6 +329,9 @@ func (m *mockSipClient) Do(ctx context.Context, req *sip.Request, opts ...sipgo.
 }
 
 func (m *mockSipClient) DoDigestAuth(ctx context.Context, req *sip.Request, res *sip.Response, auth sipgo.DigestAuth) (*sip.Response, error) {
+	if req.Method == sip.REGISTER {
+		m.registerCalls.Add(1)
+	}
 	args := m.Called(ctx, req, res, auth)
 	if args.Get(0) == nil {
 		return nil, args.Error(1)
@@ -314,7 +342,19 @@ func (m *mockSipClient) DoDigestAuth(ctx context.Context, req *sip.Request, res 
 func newURWithMock(t *testing.T, stack *Stack) (*UpstreamRegistrar, *mockSipClient) {
 	mc := new(mockSipClient)
 	ur := newUpstreamRegistrarWithClient(stack, mc)
+	t.Cleanup(ur.StopAll)
 	return ur, mc
+}
+
+func methodCallCount(mc *mockSipClient, method sip.RequestMethod) int {
+	switch method {
+	case sip.REGISTER:
+		return int(mc.registerCalls.Load())
+	case sip.OPTIONS:
+		return int(mc.optionCalls.Load())
+	default:
+		return 0
+	}
 }
 
 func TestSendRegister_Success(t *testing.T) {
@@ -356,6 +396,22 @@ func TestSendRegister_Rejected(t *testing.T) {
 	assert.Contains(t, err.Error(), "REGISTER rejected")
 }
 
+func TestResponseDelay_ParsesRetryAfterComment(t *testing.T) {
+	res := sip.NewResponse(sip.StatusServiceUnavailable, "Unavailable")
+	res.AppendHeader(sip.NewHeader("Retry-After", "12 (maintenance);duration=5"))
+	assert.Equal(t, 12*time.Second, responseDelay(res, "Retry-After"))
+}
+
+func TestRegistrationFailureClassification(t *testing.T) {
+	assert.True(t, isPermanentRegistrationStatus(sip.StatusForbidden))
+	assert.True(t, isPermanentRegistrationStatus(sip.StatusNotImplemented))
+	assert.True(t, isPermanentRegistrationStatus(sip.StatusGlobalDecline))
+	assert.False(t, isPermanentRegistrationStatus(sip.StatusServiceUnavailable))
+	assert.False(t, isPermanentRegistrationStatus(sip.StatusRequestTimeout))
+	assert.True(t, isOverloadStatus(sip.StatusRequestTimeout))
+	assert.True(t, isOverloadStatus(sip.StatusServiceUnavailable))
+}
+
 func TestSendRegister_DoDigestAuthError(t *testing.T) {
 	ur, mc := newURWithMock(t, testStack())
 	reg := &UpstreamReg{DeviceID: "dev-12345678", User: "user", Host: "pbx.com", Port: 5060, Password: "secret"}
@@ -384,32 +440,34 @@ func TestRegister_Failure(t *testing.T) {
 	err := ur.Register(context.Background(), reg)
 	assert.Error(t, err)
 	assert.False(t, ur.IsRegistered("dev-12345678"))
+	assert.NotNil(t, ur.GetReg("dev-12345678"), "failed enabled registrations remain managed for recovery")
+	assert.Equal(t, 1, ur.HealthSummary().PendingRegistrations)
+	ur.StopAll()
 }
 
 func TestRegister_ReplacesExisting(t *testing.T) {
 	ur, mc := newURWithMock(t, testStack())
-	var cancelled bool
-	existing := &UpstreamReg{DeviceID: "dev-12345678", cancel: func() { cancelled = true }}
-	ur.regs["dev-12345678"] = existing
-	reg := &UpstreamReg{DeviceID: "dev-12345678", User: "user", Host: "pbx.com", Port: 5060}
 	mc.On("Do", mock.Anything, mock.Anything, mock.Anything).Return(
 		sip.NewResponseFromRequest(sip.NewRequest(sip.REGISTER, sip.Uri{Host: "pbx.com"}), 200, "OK", nil), nil)
-	err := ur.Register(context.Background(), reg)
-	assert.NoError(t, err)
-	assert.True(t, cancelled)
+	first := &UpstreamReg{DeviceID: "dev-12345678", User: "user", Host: "pbx.com", Port: 5060}
+	assert.NoError(t, ur.Register(context.Background(), first))
+	second := &UpstreamReg{DeviceID: "dev-12345678", User: "updated", Host: "pbx.com", Port: 5060}
+	assert.NoError(t, ur.Register(context.Background(), second))
+	assert.Equal(t, "updated", ur.GetReg("dev-12345678").User)
+	mc.AssertNumberOfCalls(t, "Do", 2)
+	ur.StopAll()
 }
 
 func TestUnregister_Success(t *testing.T) {
 	ur, mc := newURWithMock(t, testStack())
-	var cancelled bool
-	reg := &UpstreamReg{DeviceID: "dev-12345678", User: "user", Host: "pbx.com", Port: 5060, cancel: func() { cancelled = true }}
-	ur.regs["dev-12345678"] = reg
+	reg := &UpstreamReg{DeviceID: "dev-12345678", User: "user", Host: "pbx.com", Port: 5060}
 	mc.On("Do", mock.Anything, mock.Anything, mock.Anything).Return(
 		sip.NewResponseFromRequest(sip.NewRequest(sip.REGISTER, sip.Uri{Host: "pbx.com"}), 200, "OK", nil), nil)
+	assert.NoError(t, ur.Register(context.Background(), reg))
 	err := ur.Unregister(context.Background(), "dev-12345678")
 	assert.NoError(t, err)
-	assert.True(t, cancelled)
 	assert.False(t, ur.IsRegistered("dev-12345678"))
+	mc.AssertNumberOfCalls(t, "Do", 2)
 }
 
 func TestUnregister_NotFound(t *testing.T) {
@@ -418,42 +476,40 @@ func TestUnregister_NotFound(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-func TestReregisterLoop(t *testing.T) {
-	oldInterval := reregisterInterval
-	reregisterInterval = 50 * time.Millisecond
-	defer func() { reregisterInterval = oldInterval }()
+func TestManagedRegistrationRefreshes(t *testing.T) {
+	cfg := config.DefaultRegistrarConfig()
+	cfg.ProbeEnabled = false
+	cfg.ExpiresSeconds = 1
+	cfg.RefreshPercent = 50
+	cfg.RecoveryInitialRate = 1000
+	cfg.RecoveryMaxRate = 1000
 	ur, mc := newURWithMock(t, testStack())
+	ur.cfg = cfg
 	reg := &UpstreamReg{DeviceID: "dev-12345678", User: "user", Host: "pbx.com", Port: 5060}
 	mc.On("Do", mock.Anything, mock.Anything, mock.Anything).Return(
 		sip.NewResponseFromRequest(sip.NewRequest(sip.REGISTER, sip.Uri{Host: "pbx.com"}), 200, "OK", nil), nil)
-	regCtx, cancel := context.WithCancel(context.Background())
-	go ur.reregisterLoop(regCtx, reg)
-	time.Sleep(100 * time.Millisecond)
-	cancel()
-	time.Sleep(10 * time.Millisecond)
-	mc.AssertNumberOfCalls(t, "Do", 2)
+	assert.NoError(t, ur.Register(context.Background(), reg))
+	assert.Eventually(t, func() bool { return methodCallCount(mc, sip.REGISTER) >= 2 }, 750*time.Millisecond, 10*time.Millisecond)
+	ur.StopAll()
 }
 
-func TestReregisterLoop_SendError(t *testing.T) {
-	oldInterval := reregisterInterval
-	reregisterInterval = 50 * time.Millisecond
-	defer func() { reregisterInterval = oldInterval }()
+func TestManagedRegistrationRetriesFailure(t *testing.T) {
+	oldDelay := transientRetryDelays[0]
+	transientRetryDelays[0] = 20 * time.Millisecond
+	defer func() { transientRetryDelays[0] = oldDelay }()
 	ur, mc := newURWithMock(t, testStack())
 	reg := &UpstreamReg{DeviceID: "dev-12345678", User: "user", Host: "pbx.com", Port: 5060}
 	mc.On("Do", mock.Anything, mock.Anything, mock.Anything).Return(nil, assert.AnError)
-	regCtx, cancel := context.WithCancel(context.Background())
-	go ur.reregisterLoop(regCtx, reg)
-	time.Sleep(100 * time.Millisecond)
-	cancel()
-	time.Sleep(10 * time.Millisecond)
-	mc.AssertNumberOfCalls(t, "Do", 2)
+	assert.Error(t, ur.Register(context.Background(), reg))
+	assert.Eventually(t, func() bool { return methodCallCount(mc, sip.REGISTER) >= 2 }, 200*time.Millisecond, 5*time.Millisecond)
+	ur.StopAll()
 }
 
 func TestUnregisterAll(t *testing.T) {
 	ur, mc := newURWithMock(t, testStack())
 	var cancelled []string
-	ur.regs["d1"] = &UpstreamReg{DeviceID: "d1abcdefgh", User: "u1", Host: "h1", Port: 5060, cancel: context.CancelFunc(func() { cancelled = append(cancelled, "d1") })}
-	ur.regs["d2"] = &UpstreamReg{DeviceID: "d2abcdefgh", User: "u2", Host: "h2", Port: 5060, cancel: context.CancelFunc(func() { cancelled = append(cancelled, "d2") })}
+	ur.regs["d1"] = &registrationState{reg: &UpstreamReg{DeviceID: "d1abcdefgh", User: "u1", Host: "h1", Port: 5060}, cancelAttempt: context.CancelFunc(func() { cancelled = append(cancelled, "d1") })}
+	ur.regs["d2"] = &registrationState{reg: &UpstreamReg{DeviceID: "d2abcdefgh", User: "u2", Host: "h2", Port: 5060}, cancelAttempt: context.CancelFunc(func() { cancelled = append(cancelled, "d2") })}
 	mc.On("Do", mock.Anything, mock.Anything, mock.Anything).Return(
 		sip.NewResponseFromRequest(sip.NewRequest(sip.REGISTER, sip.Uri{Host: "test"}), 200, "OK", nil), nil)
 	ur.UnregisterAll(context.Background())
@@ -464,7 +520,7 @@ func TestUnregisterAll(t *testing.T) {
 
 func TestUnregisterAll_SendError(t *testing.T) {
 	ur, mc := newURWithMock(t, testStack())
-	ur.regs["d1"] = &UpstreamReg{DeviceID: "d1abcdefgh", User: "u1", Host: "h1", Port: 5060}
+	ur.regs["d1"] = &registrationState{reg: &UpstreamReg{DeviceID: "d1abcdefgh", User: "u1", Host: "h1", Port: 5060}}
 	mc.On("Do", mock.Anything, mock.Anything, mock.Anything).Return(nil, assert.AnError)
 	ur.UnregisterAll(context.Background())
 	assert.Empty(t, ur.regs)
@@ -526,7 +582,9 @@ func TestNew_ServerError(t *testing.T) {
 	ua, _ := sipgo.NewUA()
 	defer ua.Close()
 	newUA = func(opts ...sipgo.UserAgentOption) (*sipgo.UserAgent, error) { return ua, nil }
-	newServer = func(ua *sipgo.UserAgent, options ...sipgo.ServerOption) (*sipgo.Server, error) { return nil, assert.AnError }
+	newServer = func(ua *sipgo.UserAgent, options ...sipgo.ServerOption) (*sipgo.Server, error) {
+		return nil, assert.AnError
+	}
 	_, err := New(config.SIPConfig{ExternalIP: "1.2.3.4"})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "create server")
@@ -542,7 +600,9 @@ func TestNew_ClientError(t *testing.T) {
 	srv, _ := sipgo.NewServer(ua)
 	newUA = func(opts ...sipgo.UserAgentOption) (*sipgo.UserAgent, error) { return ua, nil }
 	newServer = func(ua *sipgo.UserAgent, options ...sipgo.ServerOption) (*sipgo.Server, error) { return srv, nil }
-	newClient = func(ua *sipgo.UserAgent, options ...sipgo.ClientOption) (*sipgo.Client, error) { return nil, assert.AnError }
+	newClient = func(ua *sipgo.UserAgent, options ...sipgo.ClientOption) (*sipgo.Client, error) {
+		return nil, assert.AnError
+	}
 	_, err := New(config.SIPConfig{ExternalIP: "1.2.3.4"})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "create client")

@@ -33,6 +33,7 @@ type MockRegistrar struct{ mock.Mock }
 func (m *MockRegistrar) Register(ctx context.Context, reg *sipstack.UpstreamReg) error {
 	return m.Called(ctx, reg).Error(0)
 }
+func (m *MockRegistrar) Manage(reg *sipstack.UpstreamReg) error { return m.Called(reg).Error(0) }
 func (m *MockRegistrar) Unregister(ctx context.Context, deviceID string) error {
 	return m.Called(ctx, deviceID).Error(0)
 }

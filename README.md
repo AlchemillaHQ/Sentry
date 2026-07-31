@@ -2,7 +2,7 @@
 
 Sentry (Back-to-Back User Agent) is a production-grade SIP signaling gateway designed to bridge standard PBX systems (like Asterisk, FreePBX, or FreeSWITCH) with mobile applications using push notifications.
 
-It works similarly to SIPIS or Flexisip, providing a "Push Wakeup" mechanism for mobile clients while maintaining transparent signaling with the upstream PBX.
+It provides a push-wakeup mechanism for mobile clients while maintaining transparent signaling with the upstream PBX.
 
 ## Key Features
 
@@ -12,7 +12,7 @@ It works similarly to SIPIS or Flexisip, providing a "Push Wakeup" mechanism for
 - **Type-Safe Database Layer**: Leverages `sqlc` for zero-reflection, high-performance database operations.
 - **B2BUA Signaling**: Manages call legs independently to ensure compatibility with strict PBX requirements.
 - **Composite Device IDs**: Supports multiple accounts per device without database collisions.
-- **Self-Healing Heartbeat**: Monitors device status and automatically repairs registration state.
+- **Self-Healing Registration**: Monitors shared upstream gateways and automatically repairs account registration state.
 
 ## Getting Started
 
@@ -74,6 +74,31 @@ push:
 log:
   level: "info"
 ```
+
+#### Upstream registration health
+
+Enabled accounts targeting the same normalized host, port, and transport share
+one gateway supervisor. The default policy sends one SIP OPTIONS probe per
+gateway every three seconds, confirms a failure before opening the circuit,
+and probes an unavailable gateway aggressively for recovery. It never sends a
+probe per extension, and process-wide probe limits prevent large gateway sets
+from creating an outbound traffic spike. A gateway must answer at least one
+probe before probe failures can open its circuit; gateways that silently drop
+OPTIONS retain bounded REGISTER retries as a safe fallback.
+
+When a gateway becomes reachable, registrations enter a bounded parallel
+queue. The queue starts at 25 registrations per second, increases toward the
+configured 500-per-second ceiling only while successful recovery work is
+backlogged, and immediately reduces its learned rate on overload responses or
+registration-latency spikes.
+`Retry-After`, per-gateway worker limits, and process-wide rate and concurrency
+limits are always honored. Normal registrations request a 600-second lifetime
+and refresh around 70 percent of the lifetime negotiated by the upstream
+server.
+
+The `/health` response includes aggregate registrar counts for managed,
+healthy, and pending registrations plus suspect or unavailable gateways.
+Every value is configurable under `registrar`; see `config.example.yaml`.
 
 ### Running
 
