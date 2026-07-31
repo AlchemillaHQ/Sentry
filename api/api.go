@@ -192,35 +192,99 @@ func (h *Handler) DashboardStats(c *gin.Context) {
 	})
 }
 
+type adminDeviceResponse struct {
+	DeviceID          string                         `json:"device_id"`
+	Platform          string                         `json:"platform"`
+	UpstreamHost      string                         `json:"upstream_host"`
+	UpstreamPort      int32                          `json:"upstream_port"`
+	UpstreamTransport string                         `json:"upstream_transport"`
+	UpstreamUser      string                         `json:"upstream_user"`
+	UpstreamRealm     string                         `json:"upstream_realm,omitempty"`
+	DisplayName       string                         `json:"display_name,omitempty"`
+	B2BUASIPUser      string                         `json:"b2bua_sip_user"`
+	DeviceContact     string                         `json:"device_contact,omitempty"`
+	UserAgent         string                         `json:"user_agent,omitempty"`
+	PushProvider      string                         `json:"push_provider,omitempty"`
+	PushConfigured    bool                           `json:"push_configured"`
+	RegisteredAt      time.Time                      `json:"registered_at"`
+	ExpiresAt         time.Time                      `json:"expires_at"`
+	LastSeen          time.Time                      `json:"last_seen"`
+	Disabled          bool                           `json:"disabled"`
+	Registration      sipstack.RegistrarDeviceHealth `json:"registration"`
+}
+
 func (h *Handler) ListDevices(c *gin.Context) {
-	// We could use SQLC for this, but for simple lists a raw query is fine too.
-	// For consistency with SQLC models, let's use a query that matches.
-	rows, err := h.dbPool.Query(c.Request.Context(), "SELECT device_id, platform, upstream_host, upstream_user, display_name, last_seen, disabled FROM devices ORDER BY last_seen DESC")
+	rows, err := h.dbPool.Query(c.Request.Context(), `
+		SELECT device_id, platform, upstream_host, upstream_port, upstream_transport,
+		       upstream_user, upstream_realm, display_name, b2bua_sip_user,
+		       device_contact, user_agent, push_provider, registered_at, expires_at,
+		       last_seen, disabled, COALESCE(octet_length(push_token), 0) > 0
+		FROM devices
+		ORDER BY last_seen DESC`)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "failed to list devices"})
 		return
 	}
 	defer rows.Close()
 
-	devices := make([]map[string]interface{}, 0)
+	var healthSnapshot map[string]sipstack.RegistrarDeviceHealth
+	healthAvailable := false
+	if reporter, ok := h.registrar.(sipstack.RegistrarDeviceHealthReporter); ok {
+		healthSnapshot = reporter.DeviceHealthSnapshot()
+		healthAvailable = true
+	}
+
+	devices := make([]adminDeviceResponse, 0)
 	for rows.Next() {
-		var dID, platform, host, user string
-		var displayName pgtype.Text
-		var lastSeen pgtype.Timestamptz
-		var disabled bool
-		if err := rows.Scan(&dID, &platform, &host, &user, &displayName, &lastSeen, &disabled); err != nil {
+		var device adminDeviceResponse
+		var realm, displayName, deviceContact, userAgent, pushProvider pgtype.Text
+		var registeredAt, expiresAt, lastSeen pgtype.Timestamptz
+		if err := rows.Scan(
+			&device.DeviceID,
+			&device.Platform,
+			&device.UpstreamHost,
+			&device.UpstreamPort,
+			&device.UpstreamTransport,
+			&device.UpstreamUser,
+			&realm,
+			&displayName,
+			&device.B2BUASIPUser,
+			&deviceContact,
+			&userAgent,
+			&pushProvider,
+			&registeredAt,
+			&expiresAt,
+			&lastSeen,
+			&device.Disabled,
+			&device.PushConfigured,
+		); err != nil {
 			log.Error().Err(err).Msg("failed to scan device row")
 			continue
 		}
-		devices = append(devices, map[string]interface{}{
-			"device_id":     dID,
-			"platform":      platform,
-			"upstream_host": host,
-			"upstream_user": user,
-			"display_name":  displayName.String,
-			"last_seen":     lastSeen.Time,
-			"disabled":      disabled,
-		})
+		device.UpstreamRealm = realm.String
+		device.DisplayName = displayName.String
+		device.DeviceContact = deviceContact.String
+		device.UserAgent = userAgent.String
+		device.PushProvider = pushProvider.String
+		device.RegisteredAt = registeredAt.Time
+		device.ExpiresAt = expiresAt.Time
+		device.LastSeen = lastSeen.Time
+		device.Registration = sipstack.RegistrarDeviceHealth{
+			State:        "unknown",
+			GatewayState: "unknown",
+			ProbeMode:    "unknown",
+		}
+		if healthAvailable {
+			device.Registration = sipstack.RegistrarDeviceHealth{
+				State:        "unmanaged",
+				GatewayState: "unknown",
+				ProbeMode:    "unknown",
+			}
+			if health, ok := healthSnapshot[device.DeviceID]; ok {
+				device.Registration = health
+			}
+		}
+		devices = append(devices, device)
 	}
 	c.JSON(http.StatusOK, devices)
 }

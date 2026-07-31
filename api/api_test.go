@@ -29,6 +29,7 @@ import (
 
 type MockRegistrar struct {
 	mock.Mock
+	deviceHealth map[string]sipstack.RegistrarDeviceHealth
 }
 
 func (m *MockRegistrar) Register(ctx context.Context, reg *sipstack.UpstreamReg) error {
@@ -51,6 +52,9 @@ func (m *MockRegistrar) StopAll() {
 }
 func (m *MockRegistrar) UnregisterAll(ctx context.Context) {
 	m.Called(ctx)
+}
+func (m *MockRegistrar) DeviceHealthSnapshot() map[string]sipstack.RegistrarDeviceHealth {
+	return m.deviceHealth
 }
 
 type mockCallManager struct {
@@ -1468,6 +1472,8 @@ func (m *MockRows) Scan(dest ...interface{}) error {
 			*v = row[i].(string)
 		case *bool:
 			*v = row[i].(bool)
+		case *int32:
+			*v = row[i].(int32)
 		case *pgtype.Text:
 			*v = row[i].(pgtype.Text)
 		case *pgtype.Timestamptz:
@@ -1523,14 +1529,33 @@ func TestDashboardStats_Success(t *testing.T) {
 func TestListDevices_Success(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	mockPool := new(MockDBTX)
-	handler := &Handler{dbPool: mockPool}
+	now := time.Now().UTC().Truncate(time.Second)
+	lastSuccess := now.Add(-time.Minute)
+	mockReg := &MockRegistrar{deviceHealth: map[string]sipstack.RegistrarDeviceHealth{
+		"device-1": {
+			Managed:      true,
+			Registered:   true,
+			State:        "registered",
+			GatewayState: "available",
+			ProbeMode:    "options",
+			LastSuccess:  &lastSuccess,
+		},
+	}}
+	handler := &Handler{dbPool: mockPool, registrar: mockReg}
 
 	mockRows := NewMockRows(nil, [][]interface{}{
 		{
-			"device-1", "android", "office.example.com", "2025",
+			"device-1", "android", "office.example.com", int32(6069), "tls", "2025",
+			pgtype.Text{String: "office", Valid: true},
 			pgtype.Text{String: "Hayzam", Valid: true},
-			pgtype.Timestamptz{Time: time.Now(), Valid: true},
-			false,
+			"2025_device",
+			pgtype.Text{String: "sip:2025_device@sentry.example", Valid: true},
+			pgtype.Text{String: "Difuse/1.0", Valid: true},
+			pgtype.Text{String: "fcm", Valid: true},
+			pgtype.Timestamptz{Time: now.Add(-24 * time.Hour), Valid: true},
+			pgtype.Timestamptz{Time: now.Add(7 * 24 * time.Hour), Valid: true},
+			pgtype.Timestamptz{Time: now, Valid: true},
+			false, true,
 		},
 	})
 	mockPool.On("Query", mock.Anything, mock.AnythingOfType("string")).Return(mockRows, nil)
@@ -1548,6 +1573,15 @@ func TestListDevices_Success(t *testing.T) {
 	assert.Len(t, resp, 1)
 	assert.Equal(t, "device-1", resp[0]["device_id"])
 	assert.Equal(t, "2025", resp[0]["upstream_user"])
+	assert.Equal(t, float64(6069), resp[0]["upstream_port"])
+	assert.Equal(t, "tls", resp[0]["upstream_transport"])
+	assert.Equal(t, "Hayzam", resp[0]["display_name"])
+	assert.NotContains(t, resp[0], "push_token")
+	assert.NotContains(t, resp[0], "push_prid")
+	assert.NotContains(t, resp[0], "upstream_password")
+	registration := resp[0]["registration"].(map[string]interface{})
+	assert.Equal(t, "registered", registration["state"])
+	assert.Equal(t, "available", registration["gateway_state"])
 }
 
 func TestListDevices_QueryError(t *testing.T) {

@@ -75,7 +75,7 @@
                     <div class="rounded-lg {card.bg} p-2.5">
                         <card.icon class="h-6 w-6 {card.color}" />
                     </div>
-                    {#if card.label === 'Active Call Legs' && card.value > 0}
+                    {#if card.label === 'Active Call Legs' && typeof card.value === 'number' && card.value > 0}
                         <div class="flex items-center text-xs font-medium text-emerald-500 bg-emerald-500/10 px-2 py-1 rounded-full">
                             <TrendingUp class="h-3 w-3 mr-1" />
                             Live

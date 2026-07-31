@@ -464,3 +464,44 @@ func TestRegistrationHealthExpiresWithoutARefresh(t *testing.T) {
 	assert.False(t, ur.IsRegistered(state.reg.DeviceID))
 	assert.Equal(t, 0, ur.HealthSummary().HealthyRegistrations)
 }
+
+func TestDeviceHealthSnapshotIncludesRegistrationAndGatewayDiagnostics(t *testing.T) {
+	client := newSupervisorTestClient()
+	cfg := config.DefaultRegistrarConfig()
+	ur := newUpstreamRegistrarWithClientConfig(testStack(), client, cfg)
+	t.Cleanup(ur.StopAll)
+
+	reg := &UpstreamReg{DeviceID: "device-11111111", User: "1001", Host: "pbx.example.com", Port: 5061, Transport: "tls"}
+	require.NoError(t, ur.Register(context.Background(), reg))
+
+	health := ur.DeviceHealthSnapshot()[reg.DeviceID]
+	assert.True(t, health.Managed)
+	assert.True(t, health.Registered)
+	assert.Equal(t, "registered", health.State)
+	assert.Equal(t, "available", health.GatewayState)
+	assert.Equal(t, "options", health.ProbeMode)
+	assert.NotNil(t, health.LastSuccess)
+	assert.NotNil(t, health.SIPExpiresAt)
+
+	ur.mu.Lock()
+	state := ur.regs[reg.DeviceID]
+	state.registered = false
+	state.retryAttempts = 2
+	state.lastError = "connection refused"
+	state.gateway.reachable = false
+	state.gateway.probeUnsupported = true
+	state.gateway.lastProbeAt = time.Now()
+	state.gateway.lastProbeRTT = 25 * time.Millisecond
+	ur.mu.Unlock()
+
+	health = ur.DeviceHealthSnapshot()[reg.DeviceID]
+	assert.False(t, health.Registered)
+	assert.True(t, health.Pending)
+	assert.Equal(t, "gateway_unavailable", health.State)
+	assert.Equal(t, "unavailable", health.GatewayState)
+	assert.Equal(t, "register_canary", health.ProbeMode)
+	assert.Equal(t, 2, health.RetryAttempts)
+	assert.Equal(t, "connection refused", health.LastError)
+	assert.Equal(t, int64(25), health.GatewayLastProbeRTTMillis)
+	assert.NotNil(t, health.GatewayLastProbeAt)
+}

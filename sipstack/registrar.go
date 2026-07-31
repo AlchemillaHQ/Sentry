@@ -73,6 +73,30 @@ type RegistrarHealthReporter interface {
 	HealthSummary() RegistrarHealthSummary
 }
 
+// RegistrarDeviceHealthReporter exposes a point-in-time, read-only snapshot
+// for administrative diagnostics without leaking registration credentials.
+// A bulk snapshot keeps the device-list endpoint O(1) lock acquisitions even
+// when many extensions share a gateway.
+type RegistrarDeviceHealthReporter interface {
+	DeviceHealthSnapshot() map[string]RegistrarDeviceHealth
+}
+
+type RegistrarDeviceHealth struct {
+	Managed                   bool       `json:"managed"`
+	Registered                bool       `json:"registered"`
+	Pending                   bool       `json:"pending"`
+	State                     string     `json:"state"`
+	GatewayState              string     `json:"gateway_state"`
+	ProbeMode                 string     `json:"probe_mode"`
+	RetryAttempts             int        `json:"retry_attempts"`
+	LastError                 string     `json:"last_error,omitempty"`
+	LastSuccess               *time.Time `json:"last_success,omitempty"`
+	SIPExpiresAt              *time.Time `json:"sip_expires_at,omitempty"`
+	GatewayLastProbeAt        *time.Time `json:"gateway_last_probe_at,omitempty"`
+	GatewayLastProbeRTTMillis int64      `json:"gateway_last_probe_rtt_ms,omitempty"`
+	GatewayLastSIPAt          *time.Time `json:"gateway_last_sip_at,omitempty"`
+}
+
 type RegistrarHealthSummary struct {
 	ManagedRegistrations int `json:"managed_registrations"`
 	HealthyRegistrations int `json:"healthy_registrations"`
@@ -105,6 +129,7 @@ type UpstreamRegistrar struct {
 
 var _ Registrar = (*UpstreamRegistrar)(nil)
 var _ RegistrarHealthReporter = (*UpstreamRegistrar)(nil)
+var _ RegistrarDeviceHealthReporter = (*UpstreamRegistrar)(nil)
 
 func NewUpstreamRegistrar(stack *Stack, configs ...config.RegistrarConfig) *UpstreamRegistrar {
 	cfg := config.DefaultRegistrarConfig()
@@ -303,6 +328,82 @@ func (ur *UpstreamRegistrar) HealthSummary() RegistrarHealthSummary {
 		}
 	}
 	return summary
+}
+
+func (ur *UpstreamRegistrar) DeviceHealthSnapshot() map[string]RegistrarDeviceHealth {
+	now := time.Now()
+	ur.mu.RLock()
+	defer ur.mu.RUnlock()
+
+	snapshot := make(map[string]RegistrarDeviceHealth, len(ur.regs))
+	for deviceID, state := range ur.regs {
+		registered := state.registered && state.expiresAt.After(now)
+		pending := state.queued || state.inFlight || state.retryAttempts > 0
+		health := RegistrarDeviceHealth{
+			Managed:       true,
+			Registered:    registered,
+			Pending:       pending,
+			State:         "managed",
+			GatewayState:  "unknown",
+			ProbeMode:     "unknown",
+			RetryAttempts: state.retryAttempts,
+			LastError:     state.lastError,
+			LastSuccess:   optionalTime(state.lastSuccess),
+			SIPExpiresAt:  optionalTime(state.expiresAt),
+		}
+
+		if state.gateway != nil {
+			gateway := state.gateway
+			switch {
+			case !gateway.reachable:
+				health.GatewayState = "unavailable"
+			case gateway.suspect:
+				health.GatewayState = "suspect"
+			default:
+				health.GatewayState = "available"
+			}
+			switch {
+			case !ur.cfg.ProbeEnabled:
+				health.ProbeMode = "disabled"
+			case gateway.probeUnsupported:
+				health.ProbeMode = "register_canary"
+			default:
+				health.ProbeMode = "options"
+			}
+			health.GatewayLastProbeAt = optionalTime(gateway.lastProbeAt)
+			health.GatewayLastProbeRTTMillis = gateway.lastProbeRTT.Milliseconds()
+			health.GatewayLastSIPAt = optionalTime(gateway.lastSIPAt)
+		}
+
+		switch {
+		case health.GatewayState == "unavailable":
+			health.State = "gateway_unavailable"
+		case health.GatewayState == "suspect":
+			health.State = "gateway_suspect"
+		case registered && pending:
+			health.State = "refreshing"
+		case registered:
+			health.State = "registered"
+		case state.inFlight:
+			health.State = "registering"
+		case state.queued:
+			health.State = "queued"
+		case state.retryAttempts > 0:
+			health.State = "retrying"
+		default:
+			health.State = "pending"
+		}
+		snapshot[deviceID] = health
+	}
+	return snapshot
+}
+
+func optionalTime(value time.Time) *time.Time {
+	if value.IsZero() {
+		return nil
+	}
+	copy := value
+	return &copy
 }
 
 func (ur *UpstreamRegistrar) StopAll() {
