@@ -53,18 +53,20 @@ func newAPNsSenderWithClient(client apnsClient, bundleID string) *APNsSender {
 	return &APNsSender{client: client, bundleID: bundleID}
 }
 
-func (a *APNsSender) SendCallPush(ctx context.Context, token, callID, callerURI, callerName string) error {
+func (a *APNsSender) SendCallPush(ctx context.Context, call CallPush) error {
 	p := payload.NewPayload().
 		AlertTitle("Incoming Call").
-		AlertBody(callerName).
+		AlertBody(call.CallerName).
 		Sound("default").
 		ContentAvailable().
-		Custom("call-id", callID).
-		Custom("caller-uri", callerURI).
-		Custom("caller-name", callerName)
+		Custom("call-id", call.CallID).
+		Custom("device-id", call.DeviceID).
+		Custom("caller-uri", call.CallerURI).
+		Custom("caller-name", call.CallerName).
+		Custom("content-type", "application/call-info")
 
 	notification := &apns2.Notification{
-		DeviceToken: token,
+		DeviceToken: call.Token,
 		Topic:       a.bundleID + ".voip",
 		Payload:     p,
 		PushType:    apns2.PushTypeVOIP,
@@ -80,7 +82,7 @@ func (a *APNsSender) SendCallPush(ctx context.Context, token, callID, callerURI,
 		}
 		return fmt.Errorf("apns rejected: %d %s", resp.StatusCode, resp.Reason)
 	}
-	log.Debug().Str("apns_id", resp.ApnsID).Str("call_id", callID).Msg("apns push sent")
+	log.Debug().Str("apns_id", resp.ApnsID).Str("call_id", call.CallID).Str("device", call.DeviceID).Msg("apns push sent")
 	return nil
 }
 

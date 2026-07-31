@@ -84,6 +84,36 @@ make build
 ./bin/sentry -config config.yaml
 ```
 
+### Mobile Device Contract
+
+`devices.disabled` is the authoritative Sentry-side account intent:
+
+- Registering or refreshing an existing disabled device updates its metadata
+  but does not enable or register it upstream.
+- `POST /v1/devices/{device_id}/enable` is the only operation that changes a
+  disabled device to enabled.
+- `POST /v1/devices/{device_id}/reregister` repairs only enabled devices and
+  returns `409` with code `device_disabled` for a disabled device.
+- Disabling a device blocks new routing before Sentry unregisters it from the
+  upstream PBX and cancels pending wake-up work.
+
+Incoming-call pushes use these data keys:
+
+```json
+{
+  "call-id": "sentry-call-uuid",
+  "device-id": "sentry-device-uuid",
+  "caller-uri": "sip:caller@example.com",
+  "caller-name": "Caller",
+  "content-type": "application/call-info"
+}
+```
+
+The mobile client uses `device-id` to select one account pair and temporarily
+registers the hidden account returned as `b2bua_sip_uri`. Sentry relays the
+pending INVITE to that hidden B2BUA account; the visible direct-PBX account is
+not the relay destination.
+
 #### CLI Flags
 
 | Flag | Default | Description |

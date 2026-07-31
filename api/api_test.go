@@ -51,10 +51,25 @@ func (m *MockRegistrar) UnregisterAll(ctx context.Context) {
 
 type mockCallManager struct {
 	removeCalls []string
+	suspended   [][2]string
+	resumed     []string
+	forgotten   [][2]string
 }
 
 func (m *mockCallManager) RemoveDeviceSource(sipUser string) {
 	m.removeCalls = append(m.removeCalls, sipUser)
+}
+
+func (m *mockCallManager) SuspendDevice(deviceID, sipUser string) {
+	m.suspended = append(m.suspended, [2]string{deviceID, sipUser})
+}
+
+func (m *mockCallManager) ResumeDevice(deviceID string) {
+	m.resumed = append(m.resumed, deviceID)
+}
+
+func (m *mockCallManager) ForgetDevice(deviceID, sipUser string) {
+	m.forgotten = append(m.forgotten, [2]string{deviceID, sipUser})
 }
 
 func (m *mockCallManager) GetPendingCallsCount() int {
@@ -283,9 +298,10 @@ func TestDeviceStatus_Success(t *testing.T) {
 	handler := &Handler{dbQueries: mockDB, registrar: mockReg}
 
 	deviceID := "550e8400-e29b-41d4-a716-446655440000"
+	oldExpiry := time.Now().Add(time.Hour)
 	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
 		DeviceID:  deviceID,
-		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
+		ExpiresAt: pgtype.Timestamptz{Time: oldExpiry, Valid: true},
 		LastSeen:  pgtype.Timestamptz{Time: time.Now(), Valid: true},
 	}, nil)
 	mockReg.On("IsRegistered", deviceID).Return(true)
@@ -301,16 +317,75 @@ func TestDeviceStatus_Success(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusOK, w.Code)
+	var response map[string]interface{}
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Equal(t, false, response["db_expired"])
+	assert.Equal(t, false, response["was_db_expired"])
+	assert.NotEqual(t, oldExpiry.Format(time.RFC3339Nano), response["expires_at"])
+}
+
+func TestDeviceStatus_ReportsPreRefreshExpiry(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	mockDB := new(MockQuerier)
+	mockReg := new(MockRegistrar)
+	handler := &Handler{dbQueries: mockDB, registrar: mockReg}
+
+	deviceID := "550e8400-e29b-41d4-a716-446655440000"
+	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
+		DeviceID:  deviceID,
+		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true},
+		LastSeen:  pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true},
+	}, nil)
+	mockDB.On("RefreshDeviceExpiry", mock.Anything, mock.Anything).Return(nil)
+	mockReg.On("IsRegistered", deviceID).Return(false)
+
+	r := gin.Default()
+	r.GET("/v1/devices/:device_id/status", handler.DeviceStatus)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/devices/"+deviceID+"/status", nil)
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var response map[string]interface{}
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Equal(t, true, response["db_expired"])
+	assert.Equal(t, true, response["was_db_expired"])
+}
+
+func TestDeviceStatus_RefreshFailureIsReported(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	mockDB := new(MockQuerier)
+	handler := &Handler{dbQueries: mockDB}
+
+	deviceID := "550e8400-e29b-41d4-a716-446655440000"
+	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
+		DeviceID:  deviceID,
+		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
+	}, nil)
+	mockDB.On("RefreshDeviceExpiry", mock.Anything, mock.Anything).Return(assert.AnError)
+
+	r := gin.Default()
+	r.GET("/v1/devices/:device_id/status", handler.DeviceStatus)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/devices/"+deviceID+"/status", nil)
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }
 
 func TestRegisterDevice_DefaultPortAndTransport(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	box := newTestBox(t)
 	mockDB := new(MockQuerier)
-	handler := &Handler{dbQueries: mockDB, box: box}
+	mockReg := new(MockRegistrar)
+	handler := &Handler{dbQueries: mockDB, registrar: mockReg, box: box, stack: &sipstack.Stack{}}
 
 	deviceID := "550e8400-e29b-41d4-a716-446655440000"
+	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{}, pgx.ErrNoRows)
 	mockDB.On("UpsertDevice", mock.Anything, mock.Anything).Return(nil)
+	mockReg.On("Register", mock.Anything, mock.Anything).Return(nil)
 
 	r := gin.Default()
 	r.POST("/v1/devices/register", handler.RegisterDevice)
@@ -474,11 +549,11 @@ func TestRegisterDevice_InvalidUUID(t *testing.T) {
 	r.POST("/v1/devices/register", handler.RegisterDevice)
 
 	body, _ := json.Marshal(map[string]interface{}{
-		"device_id":          "not-a-uuid",
-		"platform":           "android",
-		"upstream_host":      "pbx.example.com",
-		"upstream_user":      "user1",
-		"upstream_password":  "pass",
+		"device_id":         "not-a-uuid",
+		"platform":          "android",
+		"upstream_host":     "pbx.example.com",
+		"upstream_user":     "user1",
+		"upstream_password": "pass",
 	})
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("POST", "/v1/devices/register", bytes.NewBuffer(body))
@@ -499,11 +574,11 @@ func TestRegisterDevice_InvalidHost(t *testing.T) {
 	r.POST("/v1/devices/register", handler.RegisterDevice)
 
 	body, _ := json.Marshal(map[string]interface{}{
-		"device_id":          "550e8400-e29b-41d4-a716-446655440000",
-		"platform":           "android",
-		"upstream_host":      "no-dot-host",
-		"upstream_user":      "user1",
-		"upstream_password":  "pass",
+		"device_id":         "550e8400-e29b-41d4-a716-446655440000",
+		"platform":          "android",
+		"upstream_host":     "no-dot-host",
+		"upstream_user":     "user1",
+		"upstream_password": "pass",
 	})
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("POST", "/v1/devices/register", bytes.NewBuffer(body))
@@ -523,6 +598,7 @@ func TestRegisterDevice_ValidIP(t *testing.T) {
 	stack := &sipstack.Stack{}
 	handler := &Handler{dbQueries: mockDB, registrar: mockReg, box: box, stack: stack}
 
+	mockDB.On("GetDeviceByID", mock.Anything, "550e8400-e29b-41d4-a716-446655440000").Return(db.Device{}, pgx.ErrNoRows)
 	mockDB.On("UpsertDevice", mock.Anything, mock.Anything).Return(nil)
 	mockReg.On("Register", mock.Anything, mock.Anything).Return(nil)
 
@@ -550,6 +626,55 @@ func TestRegisterDevice_ValidIP(t *testing.T) {
 	assert.NotEqual(t, http.StatusBadRequest, w.Code)
 }
 
+func TestRegisterDevice_ExistingDisabledStaysDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	box := newTestBox(t)
+	mockDB := new(MockQuerier)
+	mockReg := new(MockRegistrar)
+	handler := &Handler{
+		dbQueries: mockDB,
+		registrar: mockReg,
+		box:       box,
+		stack:     &sipstack.Stack{},
+	}
+
+	deviceID := "550e8400-e29b-41d4-a716-446655440000"
+	contact := pgtype.Text{String: "sip:shadow@10.0.0.2:5060", Valid: true}
+	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
+		DeviceID:      deviceID,
+		Disabled:      true,
+		DeviceContact: contact,
+	}, nil)
+	mockDB.On("UpsertDevice", mock.Anything, mock.MatchedBy(func(params db.UpsertDeviceParams) bool {
+		return params.DeviceID == deviceID && params.DeviceContact == contact
+	})).Return(nil)
+
+	r := gin.Default()
+	r.POST("/v1/devices/register", handler.RegisterDevice)
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"device_id":          deviceID,
+		"platform":           "android",
+		"push_token":         "new-token",
+		"upstream_host":      "pbx.example.com",
+		"upstream_port":      5060,
+		"upstream_transport": "udp",
+		"upstream_user":      "2025",
+		"upstream_password":  "secret",
+	})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/devices/register", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var response map[string]interface{}
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Equal(t, "disabled", response["status"])
+	assert.Equal(t, true, response["disabled"])
+	mockReg.AssertNotCalled(t, "Register", mock.Anything, mock.Anything)
+}
+
 func TestRegisterDevice_InvalidPort(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	handler := &Handler{}
@@ -558,12 +683,12 @@ func TestRegisterDevice_InvalidPort(t *testing.T) {
 	r.POST("/v1/devices/register", handler.RegisterDevice)
 
 	body, _ := json.Marshal(map[string]interface{}{
-		"device_id":          "550e8400-e29b-41d4-a716-446655440000",
-		"platform":           "android",
-		"upstream_host":      "pbx.example.com",
-		"upstream_port":      99999,
-		"upstream_user":      "user1",
-		"upstream_password":  "pass",
+		"device_id":         "550e8400-e29b-41d4-a716-446655440000",
+		"platform":          "android",
+		"upstream_host":     "pbx.example.com",
+		"upstream_port":     99999,
+		"upstream_user":     "user1",
+		"upstream_password": "pass",
 	})
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("POST", "/v1/devices/register", bytes.NewBuffer(body))
@@ -588,6 +713,10 @@ func TestUnregisterDevice_Success(t *testing.T) {
 		DeviceID:     deviceID,
 		B2buaSipUser: "2025_abcdefgh",
 	}, nil)
+	mockDB.On("SetDeviceDisabled", mock.Anything, db.SetDeviceDisabledParams{
+		DeviceID: deviceID,
+		Disabled: true,
+	}).Return(nil)
 	mockReg.On("Unregister", mock.Anything, deviceID).Return(nil)
 	mockDB.On("DeleteDeviceByID", mock.Anything, deviceID).Return(nil)
 
@@ -630,6 +759,10 @@ func TestUnregisterDevice_DeleteFails(t *testing.T) {
 		DeviceID:     deviceID,
 		B2buaSipUser: "2025_abcdefgh",
 	}, nil)
+	mockDB.On("SetDeviceDisabled", mock.Anything, db.SetDeviceDisabledParams{
+		DeviceID: deviceID,
+		Disabled: true,
+	}).Return(nil)
 	mockReg.On("Unregister", mock.Anything, deviceID).Return(nil)
 	mockDB.On("DeleteDeviceByID", mock.Anything, deviceID).Return(assert.AnError)
 
@@ -665,7 +798,7 @@ func TestDisableDevice_NotFound(t *testing.T) {
 	handler := &Handler{dbQueries: mockDB}
 
 	deviceID := "550e8400-e29b-41d4-a716-446655440000"
-	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{}, assert.AnError)
+	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{}, pgx.ErrNoRows)
 
 	r := gin.Default()
 	r.POST("/v1/devices/:device_id/disable", handler.DisableDevice)
@@ -687,10 +820,15 @@ func TestDisableDevice_Success(t *testing.T) {
 	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
 		DeviceID: deviceID,
 	}, nil)
-	mockReg.On("Unregister", mock.Anything, deviceID).Return(nil)
+	disabledPersisted := false
 	mockDB.On("SetDeviceDisabled", mock.Anything, db.SetDeviceDisabledParams{
 		DeviceID: deviceID,
 		Disabled: true,
+	}).Run(func(mock.Arguments) {
+		disabledPersisted = true
+	}).Return(nil)
+	mockReg.On("Unregister", mock.Anything, deviceID).Run(func(mock.Arguments) {
+		assert.True(t, disabledPersisted, "disabled state must be persisted before upstream cleanup")
 	}).Return(nil)
 
 	r := gin.Default()
@@ -772,16 +910,19 @@ func TestEnableDevice_Success(t *testing.T) {
 	mockDB := new(MockQuerier)
 	mockReg := new(MockRegistrar)
 	handler := &Handler{dbQueries: mockDB, registrar: mockReg, box: box}
+	callMgr := &mockCallManager{}
+	handler.SetCallManager(callMgr)
 
 	deviceID := "550e8400-e29b-41d4-a716-446655440000"
 	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
-		DeviceID:         deviceID,
-		UpstreamUser:     "user1",
-		UpstreamHost:     "pbx.example.com",
-		UpstreamPort:     5060,
+		DeviceID:          deviceID,
+		Disabled:          true,
+		UpstreamUser:      "user1",
+		UpstreamHost:      "pbx.example.com",
+		UpstreamPort:      5060,
 		UpstreamTransport: "udp",
 		UpstreamPassword:  encPassword,
-		UpstreamRealm:    pgtype.Text{String: "realm", Valid: true},
+		UpstreamRealm:     pgtype.Text{String: "realm", Valid: true},
 	}, nil)
 	mockReg.On("Register", mock.Anything, mock.Anything).Return(nil)
 	mockDB.On("SetDeviceDisabled", mock.Anything, db.SetDeviceDisabledParams{
@@ -800,6 +941,50 @@ func TestEnableDevice_Success(t *testing.T) {
 	var resp map[string]interface{}
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	assert.Equal(t, "enabled", resp["status"])
+	assert.Equal(t, []string{deviceID}, callMgr.resumed)
+}
+
+func TestEnableDevice_AlreadyEnabledAndRegisteredIsIdempotent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	mockDB := new(MockQuerier)
+	mockReg := new(MockRegistrar)
+	handler := &Handler{dbQueries: mockDB, registrar: mockReg}
+
+	deviceID := "550e8400-e29b-41d4-a716-446655440000"
+	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
+		DeviceID: deviceID,
+		Disabled: false,
+	}, nil)
+	mockReg.On("IsRegistered", deviceID).Return(true)
+
+	r := gin.Default()
+	r.POST("/v1/devices/:device_id/enable", handler.EnableDevice)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/devices/"+deviceID+"/enable", nil)
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	mockReg.AssertNotCalled(t, "Register", mock.Anything, mock.Anything)
+	mockDB.AssertNotCalled(t, "SetDeviceDisabled", mock.Anything, mock.Anything)
+}
+
+func TestEnsureEnabledRegistration_SuppressesDisabledDevice(t *testing.T) {
+	mockDB := new(MockQuerier)
+	mockReg := new(MockRegistrar)
+	handler := &Handler{dbQueries: mockDB, registrar: mockReg}
+
+	deviceID := "550e8400-e29b-41d4-a716-446655440000"
+	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
+		DeviceID: deviceID,
+		Disabled: true,
+	}, nil)
+
+	registered, err := handler.EnsureEnabledRegistration(context.Background(), deviceID, "startup")
+
+	assert.NoError(t, err)
+	assert.False(t, registered)
+	mockReg.AssertNotCalled(t, "Register", mock.Anything, mock.Anything)
 }
 
 // --------------- ForceReregister tests ---------------
@@ -872,6 +1057,32 @@ func TestForceReregister_Success(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
+func TestForceReregister_DisabledDeviceIsRejected(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	mockDB := new(MockQuerier)
+	mockReg := new(MockRegistrar)
+	handler := &Handler{dbQueries: mockDB, registrar: mockReg}
+
+	deviceID := "550e8400-e29b-41d4-a716-446655440000"
+	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
+		DeviceID: deviceID,
+		Disabled: true,
+	}, nil)
+
+	r := gin.Default()
+	r.POST("/v1/devices/:device_id/reregister", handler.ForceReregister)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/devices/"+deviceID+"/reregister", nil)
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusConflict, w.Code)
+	var response map[string]interface{}
+	assert.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Equal(t, "device_disabled", response["code"])
+	mockReg.AssertNotCalled(t, "Register", mock.Anything, mock.Anything)
+}
+
 // --------------- RefreshDevice tests ---------------
 
 func TestRefreshDevice_InvalidUUID(t *testing.T) {
@@ -914,13 +1125,13 @@ func TestRefreshDevice_Success(t *testing.T) {
 
 	deviceID := "550e8400-e29b-41d4-a716-446655440000"
 	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
-		DeviceID:         deviceID,
-		UpstreamUser:     "user1",
-		UpstreamHost:     "pbx.example.com",
-		UpstreamPort:     5060,
+		DeviceID:          deviceID,
+		UpstreamUser:      "user1",
+		UpstreamHost:      "pbx.example.com",
+		UpstreamPort:      5060,
 		UpstreamTransport: "udp",
 		UpstreamPassword:  []byte("encrypted"),
-		UpstreamRealm:    pgtype.Text{String: "realm", Valid: true},
+		UpstreamRealm:     pgtype.Text{String: "realm", Valid: true},
 	}, nil)
 	mockDB.On("UpsertDevice", mock.Anything, mock.Anything).Return(nil)
 
@@ -946,13 +1157,13 @@ func TestRefreshDevice_Success_NoTokenUpdate(t *testing.T) {
 
 	deviceID := "550e8400-e29b-41d4-a716-446655440000"
 	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
-		DeviceID:         deviceID,
-		UpstreamUser:     "user1",
-		UpstreamHost:     "pbx.example.com",
-		UpstreamPort:     5060,
+		DeviceID:          deviceID,
+		UpstreamUser:      "user1",
+		UpstreamHost:      "pbx.example.com",
+		UpstreamPort:      5060,
 		UpstreamTransport: "udp",
 		UpstreamPassword:  []byte("encrypted"),
-		UpstreamRealm:    pgtype.Text{String: "realm", Valid: true},
+		UpstreamRealm:     pgtype.Text{String: "realm", Valid: true},
 	}, nil)
 	mockDB.On("UpsertDevice", mock.Anything, mock.Anything).Return(nil)
 
@@ -1199,10 +1410,10 @@ func NewMockRowsWithScanError(data [][]interface{}, scanErr error) *MockRows {
 	return &MockRows{rows: data, scanErr: scanErr}
 }
 
-func (m *MockRows) Close()                                         {}
-func (m *MockRows) Err() error                                     { return nil }
-func (m *MockRows) CommandTag() pgconn.CommandTag                   { return pgconn.CommandTag{} }
-func (m *MockRows) FieldDescriptions() []pgconn.FieldDescription    { return nil }
+func (m *MockRows) Close()                                       {}
+func (m *MockRows) Err() error                                   { return nil }
+func (m *MockRows) CommandTag() pgconn.CommandTag                { return pgconn.CommandTag{} }
+func (m *MockRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
 func (m *MockRows) Next() bool {
 	if m.idx < len(m.rows) {
 		m.idx++
@@ -1229,16 +1440,19 @@ func (m *MockRows) Scan(dest ...interface{}) error {
 	}
 	return nil
 }
-func (m *MockRows) Values() ([]interface{}, error)         { return nil, nil }
-func (m *MockRows) RawValues() [][]byte                    { return nil }
-func (m *MockRows) Conn() *pgx.Conn                        { return nil }
+func (m *MockRows) Values() ([]interface{}, error) { return nil, nil }
+func (m *MockRows) RawValues() [][]byte            { return nil }
+func (m *MockRows) Conn() *pgx.Conn                { return nil }
 
 // --------------- DashboardStats tests ---------------
 
 type fakeCallMgr struct{ count int }
 
-func (f *fakeCallMgr) RemoveDeviceSource(string) {}
-func (f *fakeCallMgr) GetPendingCallsCount() int  { return f.count }
+func (f *fakeCallMgr) RemoveDeviceSource(string)    {}
+func (f *fakeCallMgr) SuspendDevice(string, string) {}
+func (f *fakeCallMgr) ResumeDevice(string)          {}
+func (f *fakeCallMgr) ForgetDevice(string, string)  {}
+func (f *fakeCallMgr) GetPendingCallsCount() int    { return f.count }
 
 func TestDashboardStats_Success(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -1590,6 +1804,10 @@ func TestUnregisterDevice_WithCallManager(t *testing.T) {
 		DeviceID:     deviceID,
 		B2buaSipUser: "user_abcdefgh",
 	}, nil)
+	mockDB.On("SetDeviceDisabled", mock.Anything, db.SetDeviceDisabledParams{
+		DeviceID: deviceID,
+		Disabled: true,
+	}).Return(nil)
 	mockReg.On("Unregister", mock.Anything, deviceID).Return(nil)
 	mockDB.On("DeleteDeviceByID", mock.Anything, deviceID).Return(nil)
 
@@ -1604,6 +1822,7 @@ func TestUnregisterDevice_WithCallManager(t *testing.T) {
 	var resp map[string]interface{}
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	assert.Equal(t, "unregistered", resp["status"])
+	assert.Equal(t, [][2]string{{deviceID, "user_abcdefgh"}}, callMgr.forgotten)
 }
 
 func TestEnableDevice_DecryptError(t *testing.T) {
@@ -1615,13 +1834,14 @@ func TestEnableDevice_DecryptError(t *testing.T) {
 
 	deviceID := "550e8400-e29b-41d4-a716-446655440000"
 	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
-		DeviceID:         deviceID,
-		UpstreamUser:     "user1",
-		UpstreamHost:     "pbx.example.com",
-		UpstreamPort:     5060,
+		DeviceID:          deviceID,
+		Disabled:          true,
+		UpstreamUser:      "user1",
+		UpstreamHost:      "pbx.example.com",
+		UpstreamPort:      5060,
 		UpstreamTransport: "udp",
 		UpstreamPassword:  []byte("not-encrypted-data"),
-		UpstreamRealm:    pgtype.Text{String: "realm", Valid: true},
+		UpstreamRealm:     pgtype.Text{String: "realm", Valid: true},
 	}, nil)
 
 	r := gin.Default()
@@ -1654,6 +1874,7 @@ func TestEnableDevice_RegisterError(t *testing.T) {
 		UpstreamPassword:  encPassword,
 		UpstreamRealm:     pgtype.Text{String: "realm", Valid: true},
 	}, nil)
+	mockReg.On("IsRegistered", deviceID).Return(false)
 	mockReg.On("Register", mock.Anything, mock.Anything).Return(assert.AnError)
 
 	r := gin.Default()
@@ -1679,6 +1900,7 @@ func TestEnableDevice_SetDisabledError(t *testing.T) {
 	deviceID := "550e8400-e29b-41d4-a716-446655440000"
 	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
 		DeviceID:          deviceID,
+		Disabled:          true,
 		UpstreamUser:      "user1",
 		UpstreamHost:      "pbx.example.com",
 		UpstreamPort:      5060,
@@ -1688,6 +1910,7 @@ func TestEnableDevice_SetDisabledError(t *testing.T) {
 	}, nil)
 	mockReg.On("Register", mock.Anything, mock.Anything).Return(nil)
 	mockDB.On("SetDeviceDisabled", mock.Anything, mock.Anything).Return(assert.AnError)
+	mockReg.On("Unregister", mock.Anything, deviceID).Return(nil)
 
 	r := gin.Default()
 	r.POST("/v1/devices/:device_id/enable", handler.EnableDevice)
@@ -1697,6 +1920,7 @@ func TestEnableDevice_SetDisabledError(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	mockReg.AssertCalled(t, "Unregister", mock.Anything, deviceID)
 }
 
 func TestForceReregister_DecryptError(t *testing.T) {
@@ -1787,6 +2011,7 @@ func TestRegisterDevice_UpsertDeviceError(t *testing.T) {
 	handler := &Handler{dbQueries: mockDB, box: box}
 
 	deviceID := "550e8400-e29b-41d4-a716-446655440000"
+	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{}, pgx.ErrNoRows)
 	mockDB.On("UpsertDevice", mock.Anything, mock.Anything).Return(assert.AnError)
 
 	r := gin.Default()
@@ -1814,9 +2039,10 @@ func TestRegisterDevice_RegisterError(t *testing.T) {
 	box := newTestBox(t)
 	mockDB := new(MockQuerier)
 	mockReg := new(MockRegistrar)
-	handler := &Handler{dbQueries: mockDB, registrar: mockReg, box: box}
+	handler := &Handler{dbQueries: mockDB, registrar: mockReg, box: box, stack: &sipstack.Stack{}}
 
 	deviceID := "550e8400-e29b-41d4-a716-446655440000"
+	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{}, pgx.ErrNoRows)
 	mockDB.On("UpsertDevice", mock.Anything, mock.Anything).Return(nil)
 	mockReg.On("Register", mock.Anything, mock.Anything).Return(assert.AnError)
 
@@ -1917,7 +2143,10 @@ func TestUnregisterDevice_UnregisterError(t *testing.T) {
 		DeviceID:     deviceID,
 		B2buaSipUser: "user_abcdefgh",
 	}, nil)
-	mockDB.On("DeleteDeviceByID", mock.Anything, deviceID).Return(nil)
+	mockDB.On("SetDeviceDisabled", mock.Anything, db.SetDeviceDisabledParams{
+		DeviceID: deviceID,
+		Disabled: true,
+	}).Return(nil)
 
 	r := gin.Default()
 	r.DELETE("/v1/devices/:device_id", handler.UnregisterDevice)
@@ -1926,7 +2155,7 @@ func TestUnregisterDevice_UnregisterError(t *testing.T) {
 	req, _ := http.NewRequest("DELETE", "/v1/devices/"+deviceID, nil)
 	r.ServeHTTP(w, req)
 
-	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, http.StatusBadGateway, w.Code)
 }
 
 func TestForceReregister_RefreshExpiryError(t *testing.T) {
@@ -1962,5 +2191,5 @@ func TestForceReregister_RefreshExpiryError(t *testing.T) {
 	req, _ := http.NewRequest("POST", "/v1/devices/"+deviceID+"/reregister", nil)
 	r.ServeHTTP(w, req)
 
-	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
 }

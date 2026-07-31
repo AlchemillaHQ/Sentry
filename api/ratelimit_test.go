@@ -144,13 +144,13 @@ func TestPurgeStale(t *testing.T) {
 	// Simulate old entries by backdating lastSeen
 	rl.ips.Range(func(key, value any) bool {
 		il := value.(*ipLimiter)
-		il.lastSeen = time.Now().Add(-40 * time.Minute)
+		il.touch(time.Now().Add(-40 * time.Minute))
 		return true
 	})
 	// Make one entry recent
 	if v, ok := rl.ips.Load("10.0.0.2"); ok {
 		il := v.(*ipLimiter)
-		il.lastSeen = time.Now()
+		il.touch(time.Now())
 	}
 
 	rl.purgeStale()
@@ -165,18 +165,14 @@ func TestPurgeStale(t *testing.T) {
 }
 
 func TestCleanupLoop_PurgesStaleEntries(t *testing.T) {
-	oldInterval := rateLimitCleanupInterval
-	rateLimitCleanupInterval = 50 * time.Millisecond
-	defer func() { rateLimitCleanupInterval = oldInterval }()
-
-	rl := NewIPRateLimiter(10, 5)
+	rl := newIPRateLimiter(10, 5, 50*time.Millisecond)
 	defer rl.Stop()
 
 	// Get a limiter and backdate it
 	rl.GetLimiter("10.0.0.1")
 	rl.ips.Range(func(key, value any) bool {
 		il := value.(*ipLimiter)
-		il.lastSeen = time.Now().Add(-40 * time.Minute)
+		il.touch(time.Now().Add(-40 * time.Minute))
 		return true
 	})
 

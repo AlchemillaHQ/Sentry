@@ -90,8 +90,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	pushSender.Start(ctx)
-
 	stack, err := sipstack.New(cfg.SIP)
 	if err != nil {
 		log.Error().Err(err).Msg("SIP stack failed")
@@ -102,6 +100,22 @@ func main() {
 	registrar := sipstack.NewUpstreamRegistrar(stack)
 
 	cm := callmanager.New(database, stack, registrar, pushSender, box)
+	handler := api.NewHandler(database, registrar, box, stack, cfg.API)
+	handler.SetCallManager(cm)
+
+	pushSender.OnDeadToken(func(call push.CallPush) {
+		log.Warn().
+			Str("call_id", call.CallID).
+			Str("device", call.DeviceID).
+			Str("platform", call.Platform).
+			Msg("push token invalid, disabling device")
+		disableCtx, disableCancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer disableCancel()
+		if _, err := handler.DisableDeviceByID(disableCtx, call.DeviceID, "invalid_push_token"); err != nil {
+			log.Error().Err(err).Str("device", call.DeviceID).Str("call_id", call.CallID).Msg("dead-token disable failed")
+		}
+	})
+	pushSender.Start(ctx)
 
 	sipReady := make(chan struct{})
 	log.Info().Msg("starting SIP listeners...")
@@ -123,8 +137,6 @@ func main() {
 		log.Error().Err(err).Msg("bootstrap users failed")
 	}
 
-	handler := api.NewHandler(database, registrar, box, stack, cfg.API)
-	handler.SetCallManager(cm)
 	router := api.SetupRouter(handler, cfg)
 	ServeSPA(router)
 
@@ -147,7 +159,7 @@ func main() {
 		}
 	}()
 
-	go reregisterDevices(ctx, database, registrar, box)
+	go reregisterDevices(ctx, database, handler)
 
 	log.Info().Str("version", Version).Msg("Sentry started")
 	<-ctx.Done()
@@ -165,8 +177,8 @@ func main() {
 	log.Info().Msg("shutdown complete")
 }
 
-func reregisterDevices(ctx context.Context, database *db.Database, registrar *sipstack.UpstreamRegistrar, box *secrets.Box) {
-	rows, err := database.Pool.Query(ctx, "SELECT device_id, upstream_host, upstream_port, upstream_transport, upstream_user, upstream_password, upstream_realm FROM devices WHERE disabled = false")
+func reregisterDevices(ctx context.Context, database *db.Database, handler *api.Handler) {
+	rows, err := database.Pool.Query(ctx, "SELECT device_id FROM devices WHERE disabled = false")
 	if err != nil {
 		log.Error().Err(err).Msg("failed to query devices for re-registration")
 		return
@@ -178,11 +190,8 @@ func reregisterDevices(ctx context.Context, database *db.Database, registrar *si
 
 	var wg sync.WaitGroup
 	for rows.Next() {
-		var dID, host, transport, user string
-		var password []byte
-		var realm []byte
-		var port int32
-		if err := rows.Scan(&dID, &host, &port, &transport, &user, &password, &realm); err != nil {
+		var dID string
+		if err := rows.Scan(&dID); err != nil {
 			log.Error().Err(err).Msg("failed to scan device")
 			continue
 		}
@@ -192,31 +201,15 @@ func reregisterDevices(ctx context.Context, database *db.Database, registrar *si
 			return
 		default:
 		}
-		pwBytes, err := box.Decrypt(password)
-		if err != nil {
-			log.Error().Err(err).Str("device", dID).Msg("decrypt password failed on startup")
-			continue
-		}
-		reg := &sipstack.UpstreamReg{
-			DeviceID:  dID,
-			User:      user,
-			Host:      host,
-			Port:      int(port),
-			Transport: transport,
-			Password:  string(pwBytes),
-			Realm:     string(realm),
-		}
 		wg.Add(1)
 		sem <- struct{}{}
-		go func() {
+		go func(deviceID string) {
 			defer func() { <-sem }()
 			defer wg.Done()
-			regCtx, regCancel := context.WithTimeout(ctx, 15*time.Second)
-			defer regCancel()
-			if err := registrar.Register(regCtx, reg); err != nil {
-				log.Error().Err(err).Str("device", dID).Msg("re-register on startup failed")
+			if _, err := handler.EnsureEnabledRegistration(ctx, deviceID, "startup"); err != nil {
+				log.Error().Err(err).Str("device", deviceID).Msg("re-register on startup failed")
 			}
-		}()
+		}(dID)
 	}
 	wg.Wait()
 	log.Info().Msg("startup re-registration complete")

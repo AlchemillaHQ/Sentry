@@ -93,12 +93,18 @@ func TestIntegration_GetDevicesByUpstreamUser(t *testing.T) {
 	db, cleanup := setupDB(t)
 	defer cleanup()
 
-	createDevice(t, db.Queries, "dev-a-0001", "alice")
+	deviceA := createDevice(t, db.Queries, "dev-a-0001", "alice")
 	createDevice(t, db.Queries, "dev-b-0002", "alice")
+	err := db.Queries.SetDeviceDisabled(context.Background(), SetDeviceDisabledParams{
+		DeviceID: deviceA.DeviceID,
+		Disabled: true,
+	})
+	require.NoError(t, err)
 
 	devices, err := db.Queries.GetDevicesByUpstreamUser(context.Background(), "alice")
 	require.NoError(t, err)
-	assert.Len(t, devices, 2)
+	require.Len(t, devices, 1)
+	assert.Equal(t, "dev-b-0002", devices[0].DeviceID)
 }
 
 func TestIntegration_UpsertDevice_Update(t *testing.T) {
@@ -106,7 +112,14 @@ func TestIntegration_UpsertDevice_Update(t *testing.T) {
 	defer cleanup()
 
 	d := createDevice(t, db.Queries, "dev-update-01", "user1")
-	err := db.Queries.UpsertDevice(context.Background(), UpsertDeviceParams{
+	err := db.Queries.UpdateDeviceContact(context.Background(), UpdateDeviceContactParams{
+		B2buaSipUser:  d.B2buaSipUser,
+		DeviceContact: pgtype.Text{String: "sip:shadow@10.0.0.2", Valid: true},
+		UserAgent:     pgtype.Text{String: "Linphone/1.0", Valid: true},
+	})
+	require.NoError(t, err)
+
+	err = db.Queries.UpsertDevice(context.Background(), UpsertDeviceParams{
 		DeviceID:          d.DeviceID,
 		Platform:          "ios",
 		PushToken:         []byte("new-token"),
@@ -125,6 +138,8 @@ func TestIntegration_UpsertDevice_Update(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "ios", updated.Platform)
 	assert.Equal(t, []byte("new-token"), updated.PushToken)
+	assert.Equal(t, "sip:shadow@10.0.0.2", updated.DeviceContact.String)
+	assert.Equal(t, "Linphone/1.0", updated.UserAgent.String)
 }
 
 func TestIntegration_SetDeviceDisabled(t *testing.T) {

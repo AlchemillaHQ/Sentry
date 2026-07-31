@@ -52,13 +52,14 @@ var fcmIsTokenInvalid = func(err error) bool {
 	return messaging.IsUnregistered(err) || messaging.IsInvalidArgument(err) || messaging.IsSenderIDMismatch(err)
 }
 
-func (f *FCMSender) SendCallPush(ctx context.Context, token, callID, callerURI, callerName string) error {
+func (f *FCMSender) SendCallPush(ctx context.Context, call CallPush) error {
 	msg := &messaging.Message{
-		Token: token,
+		Token: call.Token,
 		Data: map[string]string{
-			"call-id":      callID,
-			"caller-uri":   callerURI,
-			"caller-name":  callerName,
+			"call-id":      call.CallID,
+			"device-id":    call.DeviceID,
+			"caller-uri":   call.CallerURI,
+			"caller-name":  call.CallerName,
 			"content-type": "application/call-info",
 		},
 		Android: &messaging.AndroidConfig{
@@ -72,6 +73,6 @@ func (f *FCMSender) SendCallPush(ctx context.Context, token, callID, callerURI, 
 		}
 		return fmt.Errorf("fcm send: %w", err)
 	}
-	log.Debug().Str("response", resp).Str("call_id", callID).Msg("fcm push sent")
+	log.Debug().Str("response", resp).Str("call_id", call.CallID).Str("device", call.DeviceID).Msg("fcm push sent")
 	return nil
 }

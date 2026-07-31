@@ -2,6 +2,7 @@ package callmanager
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/netip"
 	"strconv"
@@ -22,6 +23,8 @@ import (
 )
 
 var callTimeout = 30 * time.Second
+var errAmbiguousDevice = errors.New("multiple enabled devices match upstream user")
+
 const maxRejectsBeforeBan = 10
 const banDuration = 24 * time.Hour
 
@@ -129,15 +132,16 @@ func (a *dialogCliAdapter) Invite(ctx context.Context, recipient sip.Uri, body [
 }
 
 type CallManager struct {
-	dbQueries    db.Querier
-	stack        *sipstack.Stack
-	registrar    sipstack.Registrar
-	pushSender   push.Sender
-	box          *secrets.Box
+	dbQueries  db.Querier
+	stack      *sipstack.Stack
+	registrar  sipstack.Registrar
+	pushSender push.Sender
+	box        *secrets.Box
 
 	mu           sync.RWMutex
 	pending      map[string]*pendingCall
 	deviceSource map[string]sip.Uri
+	suspended    map[string]struct{}
 
 	dialogSrv dialogServerReader
 	dialogCli dialogClientFull
@@ -171,25 +175,13 @@ func New(database *db.Database, stack *sipstack.Stack, registrar sipstack.Regist
 		box:            box,
 		pending:        make(map[string]*pendingCall),
 		deviceSource:   make(map[string]sip.Uri),
+		suspended:      make(map[string]struct{}),
 		rejectThrottle: make(map[string]time.Time),
 		banlist:        make(map[string]time.Time),
 		failCounts:     make(map[string]int),
 		dialogSrv:      newDialogSrv(stack.Client(), contactHdr),
 		dialogCli:      newDialogCli(stack.Client(), contactHdr),
 	}
-
-	pushSender.OnDeadToken(func(platform, token, callID string) {
-		log.Warn().Str("call_id", callID).Str("platform", platform).Msg("push token invalid, disabling device")
-		pc, err := database.Queries.GetPendingCall(context.Background(), callID)
-		if err != nil {
-			log.Error().Err(err).Str("call_id", callID).Msg("failed to get pending call for dead token cleanup")
-			return
-		}
-		_ = database.Queries.SetDeviceDisabled(context.Background(), db.SetDeviceDisabledParams{
-			DeviceID: pc.DeviceID,
-			Disabled: true,
-		})
-	})
 
 	stack.SetOnRegister(cm.handleRegister)
 	stack.SetOnInvite(cm.handleInvite)
@@ -207,35 +199,17 @@ func (cm *CallManager) matchDevice(ctx context.Context, sipUser string) (*db.Dev
 	if err == nil {
 		return &device, nil
 	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err
+	}
 
 	devices, err := cm.dbQueries.GetDevicesByUpstreamUser(ctx, sipUser)
 	if err != nil || len(devices) == 0 {
 		return nil, pgx.ErrNoRows
 	}
-
-	cm.mu.RLock()
-	var foundID string
-	for _, pc := range cm.pending {
-		for i := range devices {
-			if devices[i].DeviceID == pc.deviceID {
-				foundID = devices[i].DeviceID
-				break
-			}
-		}
-		if foundID != "" {
-			break
-		}
+	if len(devices) > 1 {
+		return nil, errAmbiguousDevice
 	}
-	cm.mu.RUnlock()
-
-	if foundID != "" {
-		for i := range devices {
-			if devices[i].DeviceID == foundID {
-				return &devices[i], nil
-			}
-		}
-	}
-
 	return &devices[0], nil
 }
 
@@ -268,6 +242,14 @@ func (cm *CallManager) handleRegister(req *sip.Request, tx sip.ServerTransaction
 	}
 
 	deviceKey := device.B2buaSipUser
+	cm.mu.RLock()
+	_, suspended := cm.suspended[device.DeviceID]
+	cm.mu.RUnlock()
+	if suspended {
+		log.Info().Str("device", device.DeviceID).Msg("REGISTER rejected: device is suspended")
+		tx.Respond(sip.NewResponseFromRequest(req, 403, "Forbidden", nil))
+		return
+	}
 	log.Info().Str("sip_user", sipUser).Str("device_id", device.DeviceID).Msg("REGISTER received")
 
 	res := sip.NewResponseFromRequest(req, 200, "OK", nil)
@@ -280,21 +262,21 @@ func (cm *CallManager) handleRegister(req *sip.Request, tx sip.ServerTransaction
 	}
 
 	transport := req.Transport()
+	var sourceURI sip.Uri
+	hasSource := false
 	if source != "" {
 		host, portStr, err := net.SplitHostPort(source)
 		if err == nil {
 			port, _ := strconv.Atoi(portStr)
-			uri := sip.Uri{
+			sourceURI = sip.Uri{
 				Host: host,
 				Port: port,
 			}
 			if transport != "" {
-				uri.UriParams = sip.NewParams()
-				uri.UriParams.Add("transport", transport)
+				sourceURI.UriParams = sip.NewParams()
+				sourceURI.UriParams.Add("transport", transport)
 			}
-			cm.mu.Lock()
-			cm.deviceSource[deviceKey] = uri
-			cm.mu.Unlock()
+			hasSource = true
 		}
 	}
 
@@ -307,9 +289,15 @@ func (cm *CallManager) handleRegister(req *sip.Request, tx sip.ServerTransaction
 		cm.updateDeviceFromContact(ctx, device.B2buaSipUser, contact, userAgent)
 	}
 
-	cm.mu.RLock()
-	defer cm.mu.RUnlock()
-
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if _, suspended := cm.suspended[device.DeviceID]; suspended {
+		log.Info().Str("device", device.DeviceID).Msg("REGISTER ignored after concurrent device suspension")
+		return
+	}
+	if hasSource {
+		cm.deviceSource[deviceKey] = sourceURI
+	}
 	for _, pc := range cm.pending {
 		if pc.sipUser == deviceKey {
 			pc.readyOnce.Do(func() {
@@ -403,7 +391,7 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 	ctx := context.Background()
 	device, err := cm.matchDevice(ctx, sipUser)
 	if err != nil {
-		log.Warn().Str("user", sipUser).Str("source", req.Source()).Msg("INVITE rejected: unknown user")
+		log.Warn().Err(err).Str("user", sipUser).Str("source", req.Source()).Msg("INVITE rejected: device match failed")
 		tx.Respond(sip.NewResponseFromRequest(req, 404, "Not Found", nil))
 		return
 	}
@@ -450,6 +438,12 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 	}
 
 	cm.mu.Lock()
+	if _, suspended := cm.suspended[device.DeviceID]; suspended {
+		cm.mu.Unlock()
+		log.Info().Str("device", device.DeviceID).Msg("INVITE rejected: device became suspended")
+		dlg.Respond(sip.StatusTemporarilyUnavailable, "Temporarily Unavailable", nil)
+		return
+	}
 	cm.pending[callID] = pc
 	cm.mu.Unlock()
 
@@ -529,9 +523,20 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 		dlg.Respond(sip.StatusTemporarilyUnavailable, "Temporarily Unavailable", nil)
 		return
 	}
+	if callCtx.Err() != nil {
+		log.Info().Str("call_id", callID).Str("device", device.DeviceID).Msg("call cancelled before push enqueue")
+		return
+	}
 
 	log.Info().Str("call_id", callID).Str("device", device.DeviceID).Msg("sending push notification")
-	if err := cm.pushSender.Send(context.Background(), device.Platform, string(pushTokenBytes), callID, callerURI, callerName); err != nil {
+	if err := cm.pushSender.Send(context.Background(), push.CallPush{
+		Platform:   device.Platform,
+		Token:      string(pushTokenBytes),
+		CallID:     callID,
+		DeviceID:   device.DeviceID,
+		CallerURI:  callerURI,
+		CallerName: callerName,
+	}); err != nil {
 		log.Error().Err(err).Str("device", device.DeviceID).Msg("push notification failed")
 		dlg.Respond(sip.StatusTemporarilyUnavailable, "Temporarily Unavailable", nil)
 		return
@@ -763,6 +768,13 @@ func (cm *CallManager) handleCancel(req *sip.Request, tx sip.ServerTransaction) 
 
 	log.Info().Str("call_id", found.id).Str("sip_call_id", callIDVal).Msg("call cancelled by PBX")
 	cm.pushSender.CancelPush(found.id)
+	if found.cancel != nil {
+		found.cancel()
+	}
+	_ = cm.dbQueries.UpdatePendingCallState(context.Background(), db.UpdatePendingCallStateParams{
+		CallID: found.id,
+		State:  "CANCELLED",
+	})
 	tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
 }
 
@@ -783,6 +795,62 @@ func (cm *CallManager) RemoveDeviceSource(sipUser string) {
 	cm.mu.Lock()
 	delete(cm.deviceSource, sipUser)
 	cm.mu.Unlock()
+}
+
+func (cm *CallManager) SuspendDevice(deviceID, sipUser string) {
+	cm.mu.Lock()
+	if cm.suspended == nil {
+		cm.suspended = make(map[string]struct{})
+	}
+	cm.suspended[deviceID] = struct{}{}
+	delete(cm.deviceSource, sipUser)
+	pending := make([]*pendingCall, 0)
+	for _, pc := range cm.pending {
+		if pc.deviceID != deviceID {
+			continue
+		}
+		pc.clientDlgMu.Lock()
+		relaying := pc.clientDlg != nil
+		pc.clientDlgMu.Unlock()
+		if !relaying {
+			pending = append(pending, pc)
+		}
+	}
+	cm.mu.Unlock()
+
+	for _, pc := range pending {
+		cm.pushSender.CancelPush(pc.id)
+		if pc.serverDlg != nil {
+			_ = pc.serverDlg.Respond(sip.StatusTemporarilyUnavailable, "Temporarily Unavailable", nil)
+		}
+		if pc.cancel != nil {
+			pc.cancel()
+		}
+		_ = cm.dbQueries.UpdatePendingCallState(context.Background(), db.UpdatePendingCallStateParams{
+			CallID: pc.id,
+			State:  "DEVICE_DISABLED",
+		})
+	}
+
+	log.Info().
+		Str("device", deviceID).
+		Int("pending_calls_cancelled", len(pending)).
+		Msg("device suspended in call manager")
+}
+
+func (cm *CallManager) ResumeDevice(deviceID string) {
+	cm.mu.Lock()
+	delete(cm.suspended, deviceID)
+	cm.mu.Unlock()
+	log.Info().Str("device", deviceID).Msg("device resumed in call manager")
+}
+
+func (cm *CallManager) ForgetDevice(deviceID, sipUser string) {
+	cm.mu.Lock()
+	delete(cm.suspended, deviceID)
+	delete(cm.deviceSource, sipUser)
+	cm.mu.Unlock()
+	log.Info().Str("device", deviceID).Msg("device removed from call manager")
 }
 
 func (cm *CallManager) SendByeToAllBridgedCalls(ctx context.Context) {

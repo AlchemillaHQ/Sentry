@@ -2,10 +2,12 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AlchemillaHQ/Sentry/auth"
@@ -16,6 +18,7 @@ import (
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/rs/zerolog/log"
 )
@@ -23,16 +26,19 @@ import (
 const deviceExpiryDuration = 7 * 24 * time.Hour
 
 type Handler struct {
-	dbQueries  db.Querier
-	dbPool     db.DBTX
-	registrar  sipstack.Registrar
-	box        *secrets.Box
-	stack      *sipstack.Stack
-	jwtSecret  string
-	callMgr    interface {
-		RemoveDeviceSource(string)
+	dbQueries db.Querier
+	dbPool    db.DBTX
+	registrar sipstack.Registrar
+	box       *secrets.Box
+	stack     *sipstack.Stack
+	jwtSecret string
+	callMgr   interface {
+		SuspendDevice(string, string)
+		ResumeDevice(string)
+		ForgetDevice(string, string)
 		GetPendingCallsCount() int
 	}
+	transitionLocks [64]sync.Mutex
 }
 
 func NewHandler(database *db.Database, registrar sipstack.Registrar, box *secrets.Box, stack *sipstack.Stack, apiCfg config.APIConfig) *Handler {
@@ -47,10 +53,64 @@ func NewHandler(database *db.Database, registrar sipstack.Registrar, box *secret
 }
 
 func (h *Handler) SetCallManager(cm interface {
-	RemoveDeviceSource(string)
+	SuspendDevice(string, string)
+	ResumeDevice(string)
+	ForgetDevice(string, string)
 	GetPendingCallsCount() int
 }) {
 	h.callMgr = cm
+}
+
+func (h *Handler) lockDevice(deviceID string) func() {
+	var hash uint32 = 2166136261
+	for i := 0; i < len(deviceID); i++ {
+		hash ^= uint32(deviceID[i])
+		hash *= 16777619
+	}
+	mu := &h.transitionLocks[hash%uint32(len(h.transitionLocks))]
+	mu.Lock()
+	return mu.Unlock
+}
+
+func (h *Handler) upstreamRegistration(device db.Device, password string) *sipstack.UpstreamReg {
+	return &sipstack.UpstreamReg{
+		DeviceID:  device.DeviceID,
+		User:      device.UpstreamUser,
+		Host:      device.UpstreamHost,
+		Port:      int(device.UpstreamPort),
+		Transport: device.UpstreamTransport,
+		Password:  password,
+		Realm:     device.UpstreamRealm.String,
+	}
+}
+
+func (h *Handler) EnsureEnabledRegistration(ctx context.Context, deviceID, reason string) (bool, error) {
+	unlock := h.lockDevice(deviceID)
+	defer unlock()
+
+	device, err := h.dbQueries.GetDeviceByID(ctx, deviceID)
+	if err != nil {
+		return false, err
+	}
+	if device.Disabled {
+		log.Info().Str("device", deviceID).Str("reason", reason).Msg("automatic registration suppressed for disabled device")
+		return false, nil
+	}
+	if h.registrar.IsRegistered(deviceID) {
+		return true, nil
+	}
+
+	password, err := h.box.Decrypt(device.UpstreamPassword)
+	if err != nil {
+		return false, fmt.Errorf("decrypt password: %w", err)
+	}
+
+	registerCtx, registerCancel := context.WithTimeout(ctx, 15*time.Second)
+	defer registerCancel()
+	if err := h.registrar.Register(registerCtx, h.upstreamRegistration(device, string(password))); err != nil {
+		return false, fmt.Errorf("register upstream: %w", err)
+	}
+	return true, nil
 }
 
 func (h *Handler) AuthMiddleware() gin.HandlerFunc {
@@ -327,6 +387,16 @@ func (h *Handler) RegisterDevice(c *gin.Context) {
 		req.UpstreamTransport = "udp"
 	}
 
+	unlock := h.lockDevice(req.DeviceID)
+	defer unlock()
+
+	existing, existingErr := h.dbQueries.GetDeviceByID(c.Request.Context(), req.DeviceID)
+	if existingErr != nil && !errors.Is(existingErr, pgx.ErrNoRows) {
+		log.Error().Err(existingErr).Str("device", req.DeviceID).Msg("lookup device before register failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "database error"})
+		return
+	}
+
 	var encToken []byte
 	if req.PushToken != "" {
 		encToken, _ = h.box.Encrypt([]byte(req.PushToken))
@@ -349,17 +419,35 @@ func (h *Handler) RegisterDevice(c *gin.Context) {
 		UpstreamRealm:     pgtype.Text{String: req.UpstreamRealm, Valid: req.UpstreamRealm != ""},
 		DisplayName:       pgtype.Text{String: req.DisplayName, Valid: req.DisplayName != ""},
 		B2buaSipUser:      b2buaSIPUser,
-		DeviceContact:     pgtype.Text{Valid: false},
-		UserAgent:         pgtype.Text{Valid: false},
-		PushProvider:      pgtype.Text{Valid: false},
-		PushParam:         pgtype.Text{Valid: false},
-		PushPrid:          pgtype.Text{Valid: false},
+		DeviceContact:     existing.DeviceContact,
+		UserAgent:         existing.UserAgent,
+		PushProvider:      existing.PushProvider,
+		PushParam:         existing.PushParam,
+		PushPrid:          existing.PushPrid,
 		ExpiresAt:         pgtype.Timestamptz{Time: expiresAt, Valid: true},
 		LastSeen:          pgtype.Timestamptz{Time: lastSeen, Valid: true},
 	})
 	if err != nil {
 		log.Error().Err(err).Msg("upsert device failed")
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "database error"})
+		return
+	}
+
+	externalIP := h.stack.ExternalIP()
+	sipPort := h.stack.ExternalSIPPort()
+	sipTransport := h.stack.ExternalSIPTransport()
+
+	b2buaURI := fmt.Sprintf("sip:%s@%s:%d;transport=%s", b2buaSIPUser, externalIP, sipPort, sipTransport)
+
+	if existingErr == nil && existing.Disabled {
+		log.Info().Str("device", req.DeviceID).Msg("device metadata refreshed while disabled; upstream registration suppressed")
+		c.JSON(http.StatusOK, gin.H{
+			"status":        "disabled",
+			"disabled":      true,
+			"device_id":     req.DeviceID,
+			"b2bua_sip_uri": b2buaURI,
+			"expires":       3600,
+		})
 		return
 	}
 
@@ -381,14 +469,10 @@ func (h *Handler) RegisterDevice(c *gin.Context) {
 		return
 	}
 
-	externalIP := h.stack.ExternalIP()
-	sipPort := h.stack.ExternalSIPPort()
-	sipTransport := h.stack.ExternalSIPTransport()
-
-	b2buaURI := fmt.Sprintf("sip:%s@%s:%d;transport=%s", b2buaSIPUser, externalIP, sipPort, sipTransport)
-
 	c.JSON(http.StatusOK, gin.H{
 		"status":        "registered",
+		"disabled":      false,
+		"device_id":     req.DeviceID,
 		"b2bua_sip_uri": b2buaURI,
 		"expires":       3600,
 	})
@@ -404,6 +488,9 @@ func (h *Handler) RefreshDevice(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "invalid device_id"})
 		return
 	}
+
+	unlock := h.lockDevice(deviceID)
+	defer unlock()
 
 	device, err := h.dbQueries.GetDeviceByID(c.Request.Context(), deviceID)
 	if err != nil {
@@ -443,7 +530,12 @@ func (h *Handler) RefreshDevice(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "database error"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "expires": 3600})
+	c.JSON(http.StatusOK, gin.H{
+		"status":    "ok",
+		"device_id": deviceID,
+		"disabled":  device.Disabled,
+		"expires":   3600,
+	})
 }
 
 func (h *Handler) UnregisterDevice(c *gin.Context) {
@@ -453,15 +545,55 @@ func (h *Handler) UnregisterDevice(c *gin.Context) {
 		return
 	}
 
-	if err := h.registrar.Unregister(c.Request.Context(), deviceID); err != nil {
-		log.Error().Err(err).Str("device", deviceID).Msg("upstream unregistration failed")
-	}
+	unlock := h.lockDevice(deviceID)
+	defer unlock()
 
 	device, err := h.dbQueries.GetDeviceByID(c.Request.Context(), deviceID)
-	if err == nil {
-		if h.callMgr != nil {
-			h.callMgr.RemoveDeviceSource(device.B2buaSipUser)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			log.Error().Err(err).Str("device", deviceID).Msg("lookup device before delete failed")
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "database error"})
+			return
 		}
+		if err := h.registrar.Unregister(c.Request.Context(), deviceID); err != nil {
+			log.Error().Err(err).Str("device", deviceID).Msg("cleanup of already deleted device failed")
+			c.JSON(http.StatusBadGateway, gin.H{
+				"status":          "error",
+				"message":         "upstream unregistration failed",
+				"device_id":       deviceID,
+				"cleanup_pending": true,
+			})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "unregistered", "device_id": deviceID})
+		return
+	}
+
+	if !device.Disabled {
+		if err := h.dbQueries.SetDeviceDisabled(c.Request.Context(), db.SetDeviceDisabledParams{
+			DeviceID: deviceID,
+			Disabled: true,
+		}); err != nil {
+			log.Error().Err(err).Str("device", deviceID).Msg("failed to disable device before delete")
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "database error"})
+			return
+		}
+	}
+
+	if h.callMgr != nil {
+		h.callMgr.SuspendDevice(deviceID, device.B2buaSipUser)
+	}
+
+	if err := h.registrar.Unregister(c.Request.Context(), deviceID); err != nil {
+		log.Error().Err(err).Str("device", deviceID).Msg("upstream unregistration before delete failed")
+		c.JSON(http.StatusBadGateway, gin.H{
+			"status":          "error",
+			"message":         "upstream unregistration failed",
+			"device_id":       deviceID,
+			"disabled":        true,
+			"cleanup_pending": true,
+		})
+		return
 	}
 
 	if err := h.dbQueries.DeleteDeviceByID(c.Request.Context(), deviceID); err != nil {
@@ -469,8 +601,11 @@ func (h *Handler) UnregisterDevice(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "database error"})
 		return
 	}
+	if h.callMgr != nil {
+		h.callMgr.ForgetDevice(deviceID, device.B2buaSipUser)
+	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "unregistered"})
+	c.JSON(http.StatusOK, gin.H{"status": "unregistered", "device_id": deviceID})
 }
 
 func (h *Handler) DeviceStatus(c *gin.Context) {
@@ -480,31 +615,85 @@ func (h *Handler) DeviceStatus(c *gin.Context) {
 		return
 	}
 
+	unlock := h.lockDevice(deviceID)
+	defer unlock()
+
 	device, err := h.dbQueries.GetDeviceByID(c.Request.Context(), deviceID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"status": "error", "message": "device not found"})
 		return
 	}
 
+	heartbeatAt := time.Now()
+	refreshedExpiry := heartbeatAt.Add(deviceExpiryDuration)
+	wasExpired := !device.ExpiresAt.Valid || !device.ExpiresAt.Time.After(heartbeatAt)
+
 	if err := h.dbQueries.RefreshDeviceExpiry(c.Request.Context(), db.RefreshDeviceExpiryParams{
 		DeviceID:  deviceID,
-		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(deviceExpiryDuration), Valid: true},
+		ExpiresAt: pgtype.Timestamptz{Time: refreshedExpiry, Valid: true},
 	}); err != nil {
 		log.Error().Err(err).Str("device", deviceID).Msg("failed to refresh device expiry")
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "database error"})
+		return
 	}
 
 	registered := h.registrar.IsRegistered(deviceID)
-	expired := time.Now().After(device.ExpiresAt.Time)
 
 	c.JSON(http.StatusOK, gin.H{
 		"status":              "ok",
 		"device_id":           deviceID,
 		"upstream_registered": registered,
-		"db_expired":          expired,
-		"expires_at":          device.ExpiresAt.Time,
-		"last_seen":           device.LastSeen.Time,
+		"db_expired":          wasExpired,
+		"was_db_expired":      wasExpired,
+		"expires_at":          refreshedExpiry,
+		"last_seen":           heartbeatAt,
 		"disabled":            device.Disabled,
 	})
+}
+
+type DisableResult struct {
+	Device         db.Device
+	CleanupPending bool
+}
+
+func (h *Handler) DisableDeviceByID(ctx context.Context, deviceID, reason string) (DisableResult, error) {
+	unlock := h.lockDevice(deviceID)
+	defer unlock()
+
+	device, err := h.dbQueries.GetDeviceByID(ctx, deviceID)
+	if err != nil {
+		return DisableResult{}, err
+	}
+
+	if !device.Disabled {
+		if err := h.dbQueries.SetDeviceDisabled(ctx, db.SetDeviceDisabledParams{
+			DeviceID: deviceID,
+			Disabled: true,
+		}); err != nil {
+			return DisableResult{}, fmt.Errorf("persist disabled state: %w", err)
+		}
+		device.Disabled = true
+	}
+
+	if h.callMgr != nil {
+		h.callMgr.SuspendDevice(deviceID, device.B2buaSipUser)
+	}
+
+	cleanupPending := false
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cleanupCancel()
+	if err := h.registrar.Unregister(cleanupCtx, deviceID); err != nil {
+		cleanupPending = true
+		log.Error().Err(err).Str("device", deviceID).Str("reason", reason).Msg("upstream unregistration on disable failed")
+	}
+
+	log.Info().
+		Str("device", deviceID).
+		Str("reason", reason).
+		Bool("cleanup_pending", cleanupPending).
+		Msg("device disabled")
+
+	return DisableResult{Device: device, CleanupPending: cleanupPending}, nil
 }
 
 func (h *Handler) DisableDevice(c *gin.Context) {
@@ -514,28 +703,23 @@ func (h *Handler) DisableDevice(c *gin.Context) {
 		return
 	}
 
-	_, err := h.dbQueries.GetDeviceByID(c.Request.Context(), deviceID)
+	result, err := h.DisableDeviceByID(c.Request.Context(), deviceID, "user")
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"status": "error", "message": "device not found"})
-		return
-	}
-
-	if err := h.registrar.Unregister(c.Request.Context(), deviceID); err != nil {
-		log.Error().Err(err).Str("device", deviceID).Msg("upstream unregistration on disable failed")
-	}
-
-	err = h.dbQueries.SetDeviceDisabled(c.Request.Context(), db.SetDeviceDisabledParams{
-		DeviceID: deviceID,
-		Disabled: true,
-	})
-	if err != nil {
-		log.Error().Err(err).Str("device", deviceID).Msg("set disabled flag failed")
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"status": "error", "message": "device not found"})
+			return
+		}
+		log.Error().Err(err).Str("device", deviceID).Msg("disable device failed")
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "database error"})
 		return
 	}
 
-	log.Info().Str("device", deviceID).Msg("device disabled")
-	c.JSON(http.StatusOK, gin.H{"status": "disabled"})
+	c.JSON(http.StatusOK, gin.H{
+		"status":          "disabled",
+		"device_id":       deviceID,
+		"disabled":        true,
+		"cleanup_pending": result.CleanupPending,
+	})
 }
 
 func (h *Handler) EnableDevice(c *gin.Context) {
@@ -545,9 +729,25 @@ func (h *Handler) EnableDevice(c *gin.Context) {
 		return
 	}
 
+	unlock := h.lockDevice(deviceID)
+	defer unlock()
+
 	device, err := h.dbQueries.GetDeviceByID(c.Request.Context(), deviceID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"status": "error", "message": "device not found"})
+		return
+	}
+
+	if !device.Disabled && h.registrar.IsRegistered(deviceID) {
+		if h.callMgr != nil {
+			h.callMgr.ResumeDevice(deviceID)
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"status":              "enabled",
+			"device_id":           deviceID,
+			"disabled":            false,
+			"upstream_registered": true,
+		})
 		return
 	}
 
@@ -558,36 +758,41 @@ func (h *Handler) EnableDevice(c *gin.Context) {
 		return
 	}
 
-	reg := &sipstack.UpstreamReg{
-		DeviceID:  device.DeviceID,
-		User:      device.UpstreamUser,
-		Host:      device.UpstreamHost,
-		Port:      int(device.UpstreamPort),
-		Transport: device.UpstreamTransport,
-		Password:  string(password),
-		Realm:     device.UpstreamRealm.String,
-	}
-
 	regCtx, regCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer regCancel()
-	if err := h.registrar.Register(regCtx, reg); err != nil {
+	if err := h.registrar.Register(regCtx, h.upstreamRegistration(device, string(password))); err != nil {
 		log.Error().Err(err).Str("device", deviceID).Msg("upstream re-registration on enable failed")
 		c.JSON(http.StatusBadGateway, gin.H{"status": "error", "message": "upstream registration failed"})
 		return
 	}
 
-	err = h.dbQueries.SetDeviceDisabled(c.Request.Context(), db.SetDeviceDisabledParams{
-		DeviceID: deviceID,
-		Disabled: false,
-	})
-	if err != nil {
-		log.Error().Err(err).Str("device", deviceID).Msg("clear disabled flag failed")
-		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "database error"})
-		return
+	if device.Disabled {
+		err = h.dbQueries.SetDeviceDisabled(c.Request.Context(), db.SetDeviceDisabledParams{
+			DeviceID: deviceID,
+			Disabled: false,
+		})
+		if err != nil {
+			log.Error().Err(err).Str("device", deviceID).Msg("clear disabled flag failed; compensating upstream registration")
+			compensateCtx, compensateCancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer compensateCancel()
+			if compensateErr := h.registrar.Unregister(compensateCtx, deviceID); compensateErr != nil {
+				log.Error().Err(compensateErr).Str("device", deviceID).Msg("enable compensation unregister failed")
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "database error"})
+			return
+		}
+	}
+	if h.callMgr != nil {
+		h.callMgr.ResumeDevice(deviceID)
 	}
 
 	log.Info().Str("device", deviceID).Msg("device enabled")
-	c.JSON(http.StatusOK, gin.H{"status": "enabled"})
+	c.JSON(http.StatusOK, gin.H{
+		"status":              "enabled",
+		"device_id":           deviceID,
+		"disabled":            false,
+		"upstream_registered": true,
+	})
 }
 
 func (h *Handler) ForceReregister(c *gin.Context) {
@@ -597,9 +802,23 @@ func (h *Handler) ForceReregister(c *gin.Context) {
 		return
 	}
 
+	unlock := h.lockDevice(deviceID)
+	defer unlock()
+
 	device, err := h.dbQueries.GetDeviceByID(c.Request.Context(), deviceID)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"status": "error", "message": "device not found"})
+		return
+	}
+
+	if device.Disabled {
+		c.JSON(http.StatusConflict, gin.H{
+			"status":    "error",
+			"code":      "device_disabled",
+			"message":   "device is disabled",
+			"device_id": deviceID,
+			"disabled":  true,
+		})
 		return
 	}
 
@@ -610,19 +829,9 @@ func (h *Handler) ForceReregister(c *gin.Context) {
 		return
 	}
 
-	reg := &sipstack.UpstreamReg{
-		DeviceID:  device.DeviceID,
-		User:      device.UpstreamUser,
-		Host:      device.UpstreamHost,
-		Port:      int(device.UpstreamPort),
-		Transport: device.UpstreamTransport,
-		Password:  string(password),
-		Realm:     device.UpstreamRealm.String,
-	}
-
 	regCtx, regCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer regCancel()
-	if err := h.registrar.Register(regCtx, reg); err != nil {
+	if err := h.registrar.Register(regCtx, h.upstreamRegistration(device, string(password))); err != nil {
 		log.Error().Err(err).Str("device", deviceID).Msg("force re-register failed")
 		c.JSON(http.StatusBadGateway, gin.H{"status": "error", "message": "upstream registration failed"})
 		return
@@ -633,9 +842,19 @@ func (h *Handler) ForceReregister(c *gin.Context) {
 		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(deviceExpiryDuration), Valid: true},
 	}); err != nil {
 		log.Error().Err(err).Str("device", deviceID).Msg("failed to refresh device expiry")
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "database error"})
+		return
+	}
+	if h.callMgr != nil {
+		h.callMgr.ResumeDevice(deviceID)
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "registered", "device_id": deviceID})
+	c.JSON(http.StatusOK, gin.H{
+		"status":              "registered",
+		"device_id":           deviceID,
+		"disabled":            false,
+		"upstream_registered": true,
+	})
 }
 
 func SetupRouter(handler *Handler, cfg *config.Config) *gin.Engine {

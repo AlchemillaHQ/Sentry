@@ -23,17 +23,28 @@ type mockPlatformSender struct {
 	sendFunc func(ctx context.Context, token, callID, callerURI, callerName string) error
 }
 
-func (m *mockPlatformSender) SendCallPush(ctx context.Context, token, callID, callerURI, callerName string) error {
+func (m *mockPlatformSender) SendCallPush(ctx context.Context, call CallPush) error {
 	if m.sendFunc != nil {
-		return m.sendFunc(ctx, token, callID, callerURI, callerName)
+		return m.sendFunc(ctx, call.Token, call.CallID, call.CallerURI, call.CallerName)
 	}
 	return nil
+}
+
+func testCallPush(platform, token, callID, callerURI, callerName string) CallPush {
+	return CallPush{
+		Platform:   platform,
+		Token:      token,
+		CallID:     callID,
+		DeviceID:   "550e8400-e29b-41d4-a716-446655440000",
+		CallerURI:  callerURI,
+		CallerName: callerName,
+	}
 }
 
 func newTestDispatcher() *Dispatcher {
 	return &Dispatcher{
 		senders:     make(map[string]platformSender),
-		queue:       make(chan pushRequest, 10),
+		queue:       make(chan CallPush, 10),
 		cancelFuncs: make(map[string]context.CancelFunc),
 	}
 }
@@ -42,13 +53,28 @@ func TestDispatcher_SendAsync(t *testing.T) {
 	d := newTestDispatcher()
 
 	ctx := context.Background()
-	err := d.Send(ctx, "android", "token", "call-1", "sip:caller", "Name")
+	err := d.Send(ctx, testCallPush("android", "token", "call-1", "sip:caller", "Name"))
 	assert.NoError(t, err)
 
 	assert.Equal(t, 1, len(d.queue))
 	req := <-d.queue
-	assert.Equal(t, "call-1", req.callID)
-	assert.Equal(t, "android", req.platform)
+	assert.Equal(t, "call-1", req.CallID)
+	assert.Equal(t, "android", req.Platform)
+	assert.Equal(t, "550e8400-e29b-41d4-a716-446655440000", req.DeviceID)
+}
+
+func TestDispatcher_SendRejectsMissingIdentity(t *testing.T) {
+	d := newTestDispatcher()
+
+	missingDevice := testCallPush("android", "token", "call-1", "sip:caller", "Name")
+	missingDevice.DeviceID = ""
+	assert.ErrorContains(t, d.Send(context.Background(), missingDevice), "device ID")
+
+	missingCall := testCallPush("android", "token", "call-1", "sip:caller", "Name")
+	missingCall.CallID = ""
+	assert.ErrorContains(t, d.Send(context.Background(), missingCall), "call ID")
+
+	assert.Empty(t, d.queue)
 }
 
 func TestDispatcher_CancelPush(t *testing.T) {
@@ -79,22 +105,51 @@ func TestDispatcher_CancelPush_NotFound(t *testing.T) {
 	d.CancelPush("nonexistent")
 }
 
+func TestDispatcher_CancelPush_BeforeQueueRejectsLaterSend(t *testing.T) {
+	d := newTestDispatcher()
+	call := testCallPush("android", "token", "call-before-queue", "sip:caller", "Name")
+
+	d.CancelPush(call.CallID)
+	err := d.Send(context.Background(), call)
+
+	assert.ErrorContains(t, err, "cancelled")
+	assert.Empty(t, d.queue)
+}
+
+func TestDispatcher_CancelPush_DiscardsQueuedPush(t *testing.T) {
+	d := newTestDispatcher()
+	sends := 0
+	d.senders["android"] = &mockPlatformSender{
+		sendFunc: func(context.Context, string, string, string, string) error {
+			sends++
+			return nil
+		},
+	}
+	call := testCallPush("android", "token", "call-queued", "sip:caller", "Name")
+	assert.NoError(t, d.Send(context.Background(), call))
+
+	d.CancelPush(call.CallID)
+	d.sendWithRetry(<-d.queue)
+
+	assert.Zero(t, sends)
+}
+
 func TestDispatcher_OnDeadToken(t *testing.T) {
 	d := newTestDispatcher()
 
 	var mu sync.Mutex
 	var calls [][3]string
 
-	d.OnDeadToken(func(platform, token, callID string) {
+	d.OnDeadToken(func(call CallPush) {
 		mu.Lock()
 		defer mu.Unlock()
-		calls = append(calls, [3]string{platform, token, callID})
+		calls = append(calls, [3]string{call.Platform, call.Token, call.CallID})
 	})
 
 	assert.NotNil(t, d.deadTokenHandler)
 
-	d.deadTokenHandler("android", "dead-token", "call-1")
-	d.deadTokenHandler("ios", "bad-token", "call-2")
+	d.deadTokenHandler(testCallPush("android", "dead-token", "call-1", "", ""))
+	d.deadTokenHandler(testCallPush("ios", "bad-token", "call-2", "", ""))
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -106,16 +161,16 @@ func TestDispatcher_OnDeadToken(t *testing.T) {
 func TestDispatcher_SendQueueFull(t *testing.T) {
 	d := &Dispatcher{
 		senders:     make(map[string]platformSender),
-		queue:       make(chan pushRequest, 1),
+		queue:       make(chan CallPush, 1),
 		cancelFuncs: make(map[string]context.CancelFunc),
 	}
 
 	ctx := context.Background()
 
-	err := d.Send(ctx, "android", "token", "call-1", "sip:caller", "Name")
+	err := d.Send(ctx, testCallPush("android", "token", "call-1", "sip:caller", "Name"))
 	assert.NoError(t, err)
 
-	err = d.Send(ctx, "android", "token", "call-2", "sip:caller", "Name")
+	err = d.Send(ctx, testCallPush("android", "token", "call-2", "sip:caller", "Name"))
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "queue full")
 }
@@ -129,11 +184,12 @@ func TestDispatcher_CancelPush_StopsRetryLoop(t *testing.T) {
 	start := time.Now()
 	go func() {
 		defer wg.Done()
-		d.sendWithRetry(pushRequest{
-			platform:  "android",
-			token:     "token",
-			callID:    "call-cancel",
-			callerURI: "sip:caller",
+		d.sendWithRetry(CallPush{
+			Platform:  "android",
+			Token:     "token",
+			CallID:    "call-cancel",
+			DeviceID:  "device-1",
+			CallerURI: "sip:caller",
 		})
 	}()
 
@@ -174,14 +230,14 @@ func TestSendImmediate_Success(t *testing.T) {
 		},
 	}
 
-	err := d.sendImmediate(context.Background(), "android", "token123", "call-1", "sip:alice", "Alice")
+	err := d.sendImmediate(context.Background(), testCallPush("android", "token123", "call-1", "sip:alice", "Alice"))
 	assert.NoError(t, err)
 }
 
 func TestSendImmediate_PlatformNotConfigured(t *testing.T) {
 	d := newTestDispatcher()
 
-	err := d.sendImmediate(context.Background(), "android", "token", "call-1", "uri", "n")
+	err := d.sendImmediate(context.Background(), testCallPush("android", "token", "call-1", "uri", "n"))
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "not configured")
 }
@@ -194,7 +250,7 @@ func TestSendImmediate_SenderError(t *testing.T) {
 		},
 	}
 
-	err := d.sendImmediate(context.Background(), "ios", "token", "call-1", "uri", "n")
+	err := d.sendImmediate(context.Background(), testCallPush("ios", "token", "call-1", "uri", "n"))
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "network error")
 }
@@ -203,11 +259,12 @@ func TestSendWithRetry_SuccessOnFirstAttempt(t *testing.T) {
 	d := newTestDispatcher()
 	d.senders["android"] = &mockPlatformSender{}
 
-	d.sendWithRetry(pushRequest{
-		platform:  "android",
-		token:     "token",
-		callID:    "call-1",
-		callerURI: "sip:caller",
+	d.sendWithRetry(CallPush{
+		Platform:  "android",
+		Token:     "token",
+		CallID:    "call-1",
+		DeviceID:  "device-1",
+		CallerURI: "sip:caller",
 	})
 
 	d.cancelMu.Lock()
@@ -229,11 +286,12 @@ func TestSendWithRetry_RetriesOnTransientError(t *testing.T) {
 		},
 	}
 
-	d.sendWithRetry(pushRequest{
-		platform:  "android",
-		token:     "token",
-		callID:    "call-retry",
-		callerURI: "sip:caller",
+	d.sendWithRetry(CallPush{
+		Platform:  "android",
+		Token:     "token",
+		CallID:    "call-retry",
+		DeviceID:  "device-1",
+		CallerURI: "sip:caller",
 	})
 
 	assert.Equal(t, 3, attempts, "should succeed on 3rd attempt")
@@ -249,11 +307,12 @@ func TestSendWithRetry_ExhaustsAllAttempts(t *testing.T) {
 		},
 	}
 
-	d.sendWithRetry(pushRequest{
-		platform:  "android",
-		token:     "token",
-		callID:    "call-exhaust",
-		callerURI: "sip:caller",
+	d.sendWithRetry(CallPush{
+		Platform:  "android",
+		Token:     "token",
+		CallID:    "call-exhaust",
+		DeviceID:  "device-1",
+		CallerURI: "sip:caller",
 	})
 
 	assert.Equal(t, maxAttempts, attempts, "should exhaust all retry attempts")
@@ -268,15 +327,16 @@ func TestSendWithRetry_DeadToken(t *testing.T) {
 	}
 
 	var handlerCalls [][3]string
-	d.OnDeadToken(func(platform, token, callID string) {
-		handlerCalls = append(handlerCalls, [3]string{platform, token, callID})
+	d.OnDeadToken(func(call CallPush) {
+		handlerCalls = append(handlerCalls, [3]string{call.Platform, call.Token, call.CallID})
 	})
 
-	d.sendWithRetry(pushRequest{
-		platform:  "ios",
-		token:     "dead-ios-token",
-		callID:    "call-dead",
-		callerURI: "sip:caller",
+	d.sendWithRetry(CallPush{
+		Platform:  "ios",
+		Token:     "dead-ios-token",
+		CallID:    "call-dead",
+		DeviceID:  "device-1",
+		CallerURI: "sip:caller",
 	})
 
 	assert.Len(t, handlerCalls, 1)
@@ -297,7 +357,7 @@ func TestSendImmediate_IOS(t *testing.T) {
 		},
 	}
 
-	err := d.sendImmediate(context.Background(), "ios", "ios-token", "call-1", "sip:bob", "Bob")
+	err := d.sendImmediate(context.Background(), testCallPush("ios", "ios-token", "call-1", "sip:bob", "Bob"))
 	assert.NoError(t, err)
 }
 
@@ -310,11 +370,12 @@ func TestSendWithRetry_NilDeadTokenHandler(t *testing.T) {
 	}
 
 	assert.NotPanics(t, func() {
-		d.sendWithRetry(pushRequest{
-			platform:  "android",
-			token:     "dead-token",
-			callID:    "call-nil-handler",
-			callerURI: "sip:caller",
+		d.sendWithRetry(CallPush{
+			Platform:  "android",
+			Token:     "dead-token",
+			CallID:    "call-nil-handler",
+			DeviceID:  "device-1",
+			CallerURI: "sip:caller",
 		})
 	})
 }
@@ -368,6 +429,7 @@ func TestFCMSender_SendCallPush_Success(t *testing.T) {
 		sendFunc: func(ctx context.Context, msg *messaging.Message) (string, error) {
 			assert.Equal(t, "android-token", msg.Token)
 			assert.Equal(t, "call-1", msg.Data["call-id"])
+			assert.Equal(t, "550e8400-e29b-41d4-a716-446655440000", msg.Data["device-id"])
 			assert.Equal(t, "sip:alice", msg.Data["caller-uri"])
 			assert.Equal(t, "Alice", msg.Data["caller-name"])
 			assert.Equal(t, "application/call-info", msg.Data["content-type"])
@@ -376,7 +438,7 @@ func TestFCMSender_SendCallPush_Success(t *testing.T) {
 		},
 	})
 
-	err := sender.SendCallPush(context.Background(), "android-token", "call-1", "sip:alice", "Alice")
+	err := sender.SendCallPush(context.Background(), testCallPush("android", "android-token", "call-1", "sip:alice", "Alice"))
 	assert.NoError(t, err)
 }
 
@@ -391,7 +453,7 @@ func TestFCMSender_SendCallPush_UnregisteredToken(t *testing.T) {
 		},
 	})
 
-	err := sender.SendCallPush(context.Background(), "dead-token", "call-1", "sip:alice", "Alice")
+	err := sender.SendCallPush(context.Background(), testCallPush("android", "dead-token", "call-1", "sip:alice", "Alice"))
 	assert.Error(t, err)
 	assert.True(t, errors.Is(err, ErrTokenInvalid))
 }
@@ -403,7 +465,7 @@ func TestFCMSender_SendCallPush_OtherError(t *testing.T) {
 		},
 	})
 
-	err := sender.SendCallPush(context.Background(), "token", "call-1", "sip:alice", "Alice")
+	err := sender.SendCallPush(context.Background(), testCallPush("android", "token", "call-1", "sip:alice", "Alice"))
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "fcm send")
 }
@@ -425,11 +487,18 @@ func TestAPNsSender_SendCallPush_Success(t *testing.T) {
 			assert.Equal(t, "ios-token", n.DeviceToken)
 			assert.Equal(t, "com.test.voip", n.Topic)
 			assert.Equal(t, apns2.PushTypeVOIP, n.PushType)
+			payloadJSON, err := json.Marshal(n.Payload)
+			assert.NoError(t, err)
+			var data map[string]interface{}
+			assert.NoError(t, json.Unmarshal(payloadJSON, &data))
+			assert.Equal(t, "call-1", data["call-id"])
+			assert.Equal(t, "550e8400-e29b-41d4-a716-446655440000", data["device-id"])
+			assert.Equal(t, "application/call-info", data["content-type"])
 			return &apns2.Response{StatusCode: 200, Reason: "OK", ApnsID: "apns-id-1"}, nil
 		},
 	}, "com.test")
 
-	err := sender.SendCallPush(context.Background(), "ios-token", "call-1", "sip:bob", "Bob")
+	err := sender.SendCallPush(context.Background(), testCallPush("ios", "ios-token", "call-1", "sip:bob", "Bob"))
 	assert.NoError(t, err)
 }
 
@@ -440,7 +509,7 @@ func TestAPNsSender_SendCallPush_TokenInvalid(t *testing.T) {
 		},
 	}, "com.test")
 
-	err := sender.SendCallPush(context.Background(), "dead-token", "call-1", "sip:bob", "Bob")
+	err := sender.SendCallPush(context.Background(), testCallPush("ios", "dead-token", "call-1", "sip:bob", "Bob"))
 	assert.Error(t, err)
 	assert.True(t, errors.Is(err, ErrTokenInvalid))
 }
@@ -452,7 +521,7 @@ func TestAPNsSender_SendCallPush_Rejected(t *testing.T) {
 		},
 	}, "com.test")
 
-	err := sender.SendCallPush(context.Background(), "token", "call-1", "sip:bob", "Bob")
+	err := sender.SendCallPush(context.Background(), testCallPush("ios", "token", "call-1", "sip:bob", "Bob"))
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "apns rejected")
 }
@@ -464,7 +533,7 @@ func TestAPNsSender_SendCallPush_NetworkError(t *testing.T) {
 		},
 	}, "com.test")
 
-	err := sender.SendCallPush(context.Background(), "token", "call-1", "sip:bob", "Bob")
+	err := sender.SendCallPush(context.Background(), testCallPush("ios", "token", "call-1", "sip:bob", "Bob"))
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "apns send")
 }
@@ -493,7 +562,7 @@ func TestNewDispatcher_APNsFileNotFound(t *testing.T) {
 func TestStartAndWorker(t *testing.T) {
 	d := &Dispatcher{
 		senders:     map[string]platformSender{"android": &mockPlatformSender{}},
-		queue:       make(chan pushRequest, 10),
+		queue:       make(chan CallPush, 10),
 		workers:     5,
 		cancelFuncs: make(map[string]context.CancelFunc),
 	}
@@ -501,7 +570,7 @@ func TestStartAndWorker(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	d.Start(ctx)
 
-	err := d.Send(context.Background(), "android", "token", "call-worker", "sip:caller", "Name")
+	err := d.Send(context.Background(), testCallPush("android", "token", "call-worker", "sip:caller", "Name"))
 	assert.NoError(t, err)
 
 	time.Sleep(100 * time.Millisecond)
@@ -513,7 +582,7 @@ func TestStartAndWorker(t *testing.T) {
 func TestStart_MultipleWorkers(t *testing.T) {
 	d := &Dispatcher{
 		senders:     map[string]platformSender{"android": &mockPlatformSender{}},
-		queue:       make(chan pushRequest, 100),
+		queue:       make(chan CallPush, 100),
 		workers:     10,
 		cancelFuncs: make(map[string]context.CancelFunc),
 	}
@@ -522,7 +591,7 @@ func TestStart_MultipleWorkers(t *testing.T) {
 	d.Start(ctx)
 
 	for i := 0; i < 20; i++ {
-		d.Send(context.Background(), "android", "token", "call-"+string(rune('a'+i)), "sip:caller", "Name")
+		d.Send(context.Background(), testCallPush("android", "token", "call-"+string(rune('a'+i)), "sip:caller", "Name"))
 	}
 
 	time.Sleep(300 * time.Millisecond)
@@ -555,22 +624,20 @@ func TestNewDispatcher_WithFCMAndAPNs(t *testing.T) {
 }
 
 func TestSendWithRetry_ContextExpiredBeforeSend(t *testing.T) {
-	oldTimeout := retryTimeout
-	retryTimeout = 1 * time.Nanosecond
-	defer func() { retryTimeout = oldTimeout }()
-
 	d := newTestDispatcher()
+	d.timeout = time.Nanosecond
 	d.senders["android"] = &mockPlatformSender{
 		sendFunc: func(ctx context.Context, token, callID, callerURI, callerName string) error {
 			return errors.New("transient")
 		},
 	}
 
-	d.sendWithRetry(pushRequest{
-		platform:  "android",
-		token:     "token",
-		callID:    "call-expired",
-		callerURI: "sip:caller",
+	d.sendWithRetry(CallPush{
+		Platform:  "android",
+		Token:     "token",
+		CallID:    "call-expired",
+		DeviceID:  "device-1",
+		CallerURI: "sip:caller",
 	})
 }
 
@@ -622,12 +689,12 @@ func TestInitFCM_RealFile(t *testing.T) {
 	})
 
 	creds := map[string]string{
-		"type":          "service_account",
-		"project_id":    "test-project",
+		"type":           "service_account",
+		"project_id":     "test-project",
 		"private_key_id": "test-key-id",
-		"private_key":   string(keyPEM),
-		"client_email":  "test@test-project.iam.gserviceaccount.com",
-		"client_id":     "12345",
+		"private_key":    string(keyPEM),
+		"client_email":   "test@test-project.iam.gserviceaccount.com",
+		"client_id":      "12345",
 	}
 	data, _ := json.Marshal(creds)
 	tmpfile, _ := os.CreateTemp("", "fcm-*.json")

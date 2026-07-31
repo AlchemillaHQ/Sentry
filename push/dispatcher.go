@@ -11,35 +11,39 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-type DeadTokenHandler func(platform, token, callID string)
+type CallPush struct {
+	Platform   string
+	Token      string
+	CallID     string
+	DeviceID   string
+	CallerURI  string
+	CallerName string
+}
+
+type DeadTokenHandler func(call CallPush)
 
 type Sender interface {
-	Send(ctx context.Context, platform, token, callID, callerURI, callerName string) error
+	Send(ctx context.Context, call CallPush) error
 	Start(ctx context.Context)
 	CancelPush(callID string)
 	OnDeadToken(handler DeadTokenHandler)
 }
 
-type pushRequest struct {
-	platform   string
-	token      string
-	callID     string
-	callerURI  string
-	callerName string
-}
-
 type platformSender interface {
-	SendCallPush(ctx context.Context, token, callID, callerURI, callerName string) error
+	SendCallPush(ctx context.Context, call CallPush) error
 }
 
 type Dispatcher struct {
 	senders map[string]platformSender
 
-	queue   chan pushRequest
+	queue   chan CallPush
 	workers int
+	timeout time.Duration
 
 	cancelMu    sync.Mutex
 	cancelFuncs map[string]context.CancelFunc
+	queued      map[string]struct{}
+	cancelled   map[string]time.Time
 
 	deadTokenHandler DeadTokenHandler
 }
@@ -59,14 +63,20 @@ var (
 	newAPNs = NewAPNsSender
 )
 
-var retryTimeout = 35 * time.Second
+const (
+	defaultRetryTimeout    = 35 * time.Second
+	cancelledCallRetention = time.Minute
+)
 
 func NewDispatcher(cfg config.PushConfig) (*Dispatcher, error) {
 	d := &Dispatcher{
 		senders:     make(map[string]platformSender),
-		queue:       make(chan pushRequest, workerQueueSize),
+		queue:       make(chan CallPush, workerQueueSize),
 		workers:     workerCount,
+		timeout:     defaultRetryTimeout,
 		cancelFuncs: make(map[string]context.CancelFunc),
+		queued:      make(map[string]struct{}),
+		cancelled:   make(map[string]time.Time),
 	}
 
 	fcm, err := newFCM(cfg.FCMServiceAccount)
@@ -95,6 +105,7 @@ func (d *Dispatcher) Start(ctx context.Context) {
 	for i := 0; i < d.workers; i++ {
 		go d.worker(ctx)
 	}
+	go d.cleanupCancelledCalls(ctx)
 	log.Info().Int("workers", d.workers).Msg("push dispatcher started")
 }
 
@@ -109,23 +120,37 @@ func (d *Dispatcher) worker(ctx context.Context) {
 	}
 }
 
-func (d *Dispatcher) sendWithRetry(req pushRequest) {
-	retryCtx, cancel := context.WithTimeout(context.Background(), retryTimeout)
+func (d *Dispatcher) sendWithRetry(req CallPush) {
+	timeout := d.timeout
+	if timeout <= 0 {
+		timeout = defaultRetryTimeout
+	}
+	retryCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	d.cancelMu.Lock()
-	d.cancelFuncs[req.callID] = cancel
+	d.ensureStateLocked()
+	if _, cancelled := d.cancelled[req.CallID]; cancelled {
+		delete(d.queued, req.CallID)
+		delete(d.cancelled, req.CallID)
+		d.cancelMu.Unlock()
+		log.Debug().Str("call_id", req.CallID).Str("device", req.DeviceID).Msg("queued push discarded after cancellation")
+		return
+	}
+	d.cancelFuncs[req.CallID] = cancel
 	d.cancelMu.Unlock()
 
 	defer func() {
 		d.cancelMu.Lock()
-		delete(d.cancelFuncs, req.callID)
+		delete(d.cancelFuncs, req.CallID)
+		delete(d.queued, req.CallID)
+		delete(d.cancelled, req.CallID)
 		d.cancelMu.Unlock()
 	}()
 
 	for i, delay := range backoffSchedule {
 		if retryCtx.Err() != nil {
-			log.Debug().Str("call_id", req.callID).Msg("push retry cancelled before send")
+			log.Debug().Str("call_id", req.CallID).Str("device", req.DeviceID).Msg("push retry cancelled before send")
 			return
 		}
 
@@ -134,45 +159,66 @@ func (d *Dispatcher) sendWithRetry(req pushRequest) {
 			select {
 			case <-retryCtx.Done():
 				timer.Stop()
-				log.Debug().Str("call_id", req.callID).Msg("push retry cancelled during backoff")
+				log.Debug().Str("call_id", req.CallID).Str("device", req.DeviceID).Msg("push retry cancelled during backoff")
 				return
 			case <-timer.C:
 			}
 		}
 
-		err := d.sendImmediate(retryCtx, req.platform, req.token, req.callID, req.callerURI, req.callerName)
+		err := d.sendImmediate(retryCtx, req)
 		if err == nil {
-			log.Debug().Str("call_id", req.callID).Int("attempt", i+1).Msg("push sent successfully")
+			log.Debug().Str("call_id", req.CallID).Str("device", req.DeviceID).Int("attempt", i+1).Msg("push sent successfully")
 			return
 		}
 
 		if errors.Is(err, ErrTokenInvalid) {
-			log.Warn().Str("call_id", req.callID).Str("token", req.token).Msg("push token is invalid, stopping retries")
+			log.Warn().Str("call_id", req.CallID).Str("device", req.DeviceID).Msg("push token is invalid, stopping retries")
 			if d.deadTokenHandler != nil {
-				d.deadTokenHandler(req.platform, req.token, req.callID)
+				d.deadTokenHandler(req)
 			}
 			return
 		}
 
-		log.Warn().Err(err).Str("call_id", req.callID).Int("attempt", i+1).Msg("push attempt failed, will retry")
+		log.Warn().Err(err).Str("call_id", req.CallID).Str("device", req.DeviceID).Int("attempt", i+1).Msg("push attempt failed, will retry")
 	}
 
-	log.Error().Str("call_id", req.callID).Int("attempts", maxAttempts).Msg("all push retries exhausted")
+	log.Error().Str("call_id", req.CallID).Str("device", req.DeviceID).Int("attempts", maxAttempts).Msg("all push retries exhausted")
 }
 
-func (d *Dispatcher) Send(ctx context.Context, platform, token, callID, callerURI, callerName string) error {
+func (d *Dispatcher) Send(ctx context.Context, call CallPush) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if call.CallID == "" {
+		return fmt.Errorf("call ID is required")
+	}
+	if call.DeviceID == "" {
+		return fmt.Errorf("device ID is required")
+	}
+
+	d.cancelMu.Lock()
+	d.ensureStateLocked()
+	d.pruneCancelledLocked(time.Now())
+	if _, cancelled := d.cancelled[call.CallID]; cancelled {
+		delete(d.cancelled, call.CallID)
+		d.cancelMu.Unlock()
+		return fmt.Errorf("call %s was cancelled", call.CallID)
+	}
+	if _, exists := d.queued[call.CallID]; exists {
+		d.cancelMu.Unlock()
+		return fmt.Errorf("call %s is already queued", call.CallID)
+	}
+	d.queued[call.CallID] = struct{}{}
+
 	select {
-	case d.queue <- pushRequest{
-		platform:   platform,
-		token:      token,
-		callID:     callID,
-		callerURI:  callerURI,
-		callerName: callerName,
-	}:
-		log.Debug().Str("call_id", callID).Str("platform", platform).Msg("push request enqueued")
+	case d.queue <- call:
+		d.cancelMu.Unlock()
+		log.Debug().Str("call_id", call.CallID).Str("device", call.DeviceID).Str("platform", call.Platform).Msg("push request enqueued")
 		return nil
 	default:
-		log.Warn().Str("call_id", callID).Msg("push queue full, dropping notification")
+		delete(d.queued, call.CallID)
+		d.cancelMu.Unlock()
+		log.Warn().Str("call_id", call.CallID).Str("device", call.DeviceID).Msg("push queue full, dropping notification")
 		return fmt.Errorf("push queue full")
 	}
 }
@@ -180,6 +226,10 @@ func (d *Dispatcher) Send(ctx context.Context, platform, token, callID, callerUR
 func (d *Dispatcher) CancelPush(callID string) {
 	d.cancelMu.Lock()
 	defer d.cancelMu.Unlock()
+	d.ensureStateLocked()
+	now := time.Now()
+	d.pruneCancelledLocked(now)
+	d.cancelled[callID] = now
 	if cancel, ok := d.cancelFuncs[callID]; ok {
 		cancel()
 		delete(d.cancelFuncs, callID)
@@ -187,10 +237,50 @@ func (d *Dispatcher) CancelPush(callID string) {
 	}
 }
 
-func (d *Dispatcher) sendImmediate(ctx context.Context, platform, token, callID, callerURI, callerName string) error {
-	sender, ok := d.senders[platform]
-	if !ok {
-		return fmt.Errorf("%s push not configured", platform)
+func (d *Dispatcher) ensureStateLocked() {
+	if d.cancelFuncs == nil {
+		d.cancelFuncs = make(map[string]context.CancelFunc)
 	}
-	return sender.SendCallPush(ctx, token, callID, callerURI, callerName)
+	if d.queued == nil {
+		d.queued = make(map[string]struct{})
+	}
+	if d.cancelled == nil {
+		d.cancelled = make(map[string]time.Time)
+	}
+}
+
+func (d *Dispatcher) pruneCancelledLocked(now time.Time) {
+	for callID, cancelledAt := range d.cancelled {
+		if now.Sub(cancelledAt) > cancelledCallRetention {
+			delete(d.cancelled, callID)
+		}
+	}
+}
+
+func (d *Dispatcher) cleanupCancelledCalls(ctx context.Context) {
+	interval := cancelledCallRetention / 2
+	if interval <= 0 {
+		interval = time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case now := <-ticker.C:
+			d.cancelMu.Lock()
+			d.ensureStateLocked()
+			d.pruneCancelledLocked(now)
+			d.cancelMu.Unlock()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (d *Dispatcher) sendImmediate(ctx context.Context, call CallPush) error {
+	sender, ok := d.senders[call.Platform]
+	if !ok {
+		return fmt.Errorf("%s push not configured", call.Platform)
+	}
+	return sender.SendCallPush(ctx, call)
 }

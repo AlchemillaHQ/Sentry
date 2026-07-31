@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -10,22 +11,36 @@ import (
 )
 
 type ipLimiter struct {
-	limiter  *rate.Limiter
-	lastSeen time.Time
+	limiter          *rate.Limiter
+	lastSeenUnixNano atomic.Int64
+}
+
+func (il *ipLimiter) touch(now time.Time) {
+	il.lastSeenUnixNano.Store(now.UnixNano())
+}
+
+func (il *ipLimiter) lastSeen() time.Time {
+	return time.Unix(0, il.lastSeenUnixNano.Load())
 }
 
 type IPRateLimiter struct {
-	ips    sync.Map
-	rate   rate.Limit
-	burst  int
-	stopCh chan struct{}
+	ips             sync.Map
+	rate            rate.Limit
+	burst           int
+	stopCh          chan struct{}
+	cleanupInterval time.Duration
 }
 
 func NewIPRateLimiter(r float64, burst int) *IPRateLimiter {
+	return newIPRateLimiter(r, burst, rateLimitCleanupInterval)
+}
+
+func newIPRateLimiter(r float64, burst int, cleanupInterval time.Duration) *IPRateLimiter {
 	rl := &IPRateLimiter{
-		rate:   rate.Limit(r),
-		burst:  burst,
-		stopCh: make(chan struct{}),
+		rate:            rate.Limit(r),
+		burst:           burst,
+		stopCh:          make(chan struct{}),
+		cleanupInterval: cleanupInterval,
 	}
 	go rl.cleanupLoop()
 	return rl
@@ -34,20 +49,25 @@ func NewIPRateLimiter(r float64, burst int) *IPRateLimiter {
 func (rl *IPRateLimiter) GetLimiter(ip string) *rate.Limiter {
 	if v, ok := rl.ips.Load(ip); ok {
 		il := v.(*ipLimiter)
-		il.lastSeen = time.Now()
+		il.touch(time.Now())
 		return il.limiter
 	}
 
 	limiter := rate.NewLimiter(rl.rate, rl.burst)
-	il := &ipLimiter{limiter: limiter, lastSeen: time.Now()}
-	actual, _ := rl.ips.LoadOrStore(ip, il)
-	return actual.(*ipLimiter).limiter
+	il := &ipLimiter{limiter: limiter}
+	il.touch(time.Now())
+	actual, loaded := rl.ips.LoadOrStore(ip, il)
+	actualLimiter := actual.(*ipLimiter)
+	if loaded {
+		actualLimiter.touch(time.Now())
+	}
+	return actualLimiter.limiter
 }
 
-var rateLimitCleanupInterval = 10 * time.Minute
+const rateLimitCleanupInterval = 10 * time.Minute
 
 func (rl *IPRateLimiter) cleanupLoop() {
-	ticker := time.NewTicker(rateLimitCleanupInterval)
+	ticker := time.NewTicker(rl.cleanupInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -63,7 +83,7 @@ func (rl *IPRateLimiter) purgeStale() {
 	now := time.Now()
 	rl.ips.Range(func(key, value any) bool {
 		il := value.(*ipLimiter)
-		if now.Sub(il.lastSeen) > 30*time.Minute {
+		if now.Sub(il.lastSeen()) > 30*time.Minute {
 			rl.ips.Delete(key)
 		}
 		return true

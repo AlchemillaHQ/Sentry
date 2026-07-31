@@ -13,7 +13,7 @@ SELECT * FROM devices WHERE b2bua_sip_user = $1 AND disabled = false LIMIT 1;
 SELECT * FROM devices WHERE device_id = $1 LIMIT 1;
 
 -- name: GetDevicesByUpstreamUser :many
-SELECT * FROM devices WHERE upstream_user = $1;
+SELECT * FROM devices WHERE upstream_user = $1 AND disabled = false;
 
 -- name: UpsertDevice :exec
 INSERT INTO devices (
@@ -35,11 +35,11 @@ ON CONFLICT (device_id) DO UPDATE SET
     upstream_realm = EXCLUDED.upstream_realm,
     display_name = EXCLUDED.display_name,
     b2bua_sip_user = EXCLUDED.b2bua_sip_user,
-    device_contact = EXCLUDED.device_contact,
-    user_agent = EXCLUDED.user_agent,
-    push_provider = EXCLUDED.push_provider,
-    push_param = EXCLUDED.push_param,
-    push_prid = EXCLUDED.push_prid,
+    device_contact = COALESCE(EXCLUDED.device_contact, devices.device_contact),
+    user_agent = COALESCE(EXCLUDED.user_agent, devices.user_agent),
+    push_provider = COALESCE(EXCLUDED.push_provider, devices.push_provider),
+    push_param = COALESCE(EXCLUDED.push_param, devices.push_param),
+    push_prid = COALESCE(EXCLUDED.push_prid, devices.push_prid),
     expires_at = EXCLUDED.expires_at,
     last_seen = EXCLUDED.last_seen;
 
