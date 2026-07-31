@@ -117,14 +117,17 @@ func (m *MockQuerier) GetSetting(ctx context.Context, key string) ([]byte, error
 	args := m.Called(ctx, key)
 	return args.Get(0).([]byte), args.Error(1)
 }
-func (m *MockQuerier) PruneDevices(ctx context.Context, expiresAt pgtype.Timestamptz) error {
-	return m.Called(ctx, expiresAt).Error(0)
+func (m *MockQuerier) PruneDevices(ctx context.Context, expiresAt pgtype.Timestamptz) ([]db.PruneDevicesRow, error) {
+	args := m.Called(ctx, expiresAt)
+	rows, _ := args.Get(0).([]db.PruneDevicesRow)
+	return rows, args.Error(1)
 }
 func (m *MockQuerier) PrunePendingCalls(ctx context.Context, expiresAt pgtype.Timestamptz) error {
 	return m.Called(ctx, expiresAt).Error(0)
 }
-func (m *MockQuerier) RefreshDeviceExpiry(ctx context.Context, arg db.RefreshDeviceExpiryParams) error {
-	return m.Called(ctx, arg).Error(0)
+func (m *MockQuerier) RefreshDeviceExpiry(ctx context.Context, arg db.RefreshDeviceExpiryParams) (int64, error) {
+	args := m.Called(ctx, arg)
+	return args.Get(0).(int64), args.Error(1)
 }
 func (m *MockQuerier) UpdateDeviceContact(ctx context.Context, arg db.UpdateDeviceContactParams) error {
 	return m.Called(ctx, arg).Error(0)
@@ -315,7 +318,7 @@ func TestDeviceStatus_Success(t *testing.T) {
 	mockReg.On("IsRegistered", deviceID).Return(true)
 	mockDB.On("RefreshDeviceExpiry", mock.Anything, mock.MatchedBy(func(p db.RefreshDeviceExpiryParams) bool {
 		return p.DeviceID == deviceID
-	})).Return(nil)
+	})).Return(int64(1), nil)
 
 	r := gin.Default()
 	r.GET("/v1/devices/:device_id/status", handler.DeviceStatus)
@@ -344,7 +347,7 @@ func TestDeviceStatus_ReportsPreRefreshExpiry(t *testing.T) {
 		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true},
 		LastSeen:  pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true},
 	}, nil)
-	mockDB.On("RefreshDeviceExpiry", mock.Anything, mock.Anything).Return(nil)
+	mockDB.On("RefreshDeviceExpiry", mock.Anything, mock.Anything).Return(int64(1), nil)
 	mockReg.On("IsRegistered", deviceID).Return(false)
 
 	r := gin.Default()
@@ -371,7 +374,7 @@ func TestDeviceStatus_RefreshFailureIsReported(t *testing.T) {
 		DeviceID:  deviceID,
 		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
 	}, nil)
-	mockDB.On("RefreshDeviceExpiry", mock.Anything, mock.Anything).Return(assert.AnError)
+	mockDB.On("RefreshDeviceExpiry", mock.Anything, mock.Anything).Return(int64(0), assert.AnError)
 
 	r := gin.Default()
 	r.GET("/v1/devices/:device_id/status", handler.DeviceStatus)
@@ -381,6 +384,30 @@ func TestDeviceStatus_RefreshFailureIsReported(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+func TestDeviceStatus_ExpiredDuringRefreshIsNotReportedOnline(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	mockDB := new(MockQuerier)
+	mockReg := new(MockRegistrar)
+	handler := &Handler{dbQueries: mockDB, registrar: mockReg}
+
+	deviceID := "550e8400-e29b-41d4-a716-446655440000"
+	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
+		DeviceID:  deviceID,
+		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true},
+	}, nil)
+	mockDB.On("RefreshDeviceExpiry", mock.Anything, mock.Anything).Return(int64(0), nil)
+
+	r := gin.Default()
+	r.GET("/v1/devices/:device_id/status", handler.DeviceStatus)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/v1/devices/"+deviceID+"/status", nil)
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	mockReg.AssertNotCalled(t, "IsRegistered", mock.Anything)
 }
 
 func TestRegisterDevice_DefaultPortAndTransport(t *testing.T) {
@@ -435,6 +462,47 @@ func TestNewHandler(t *testing.T) {
 	assert.Equal(t, "test", handler.jwtSecret)
 	assert.Equal(t, db.Queries, handler.dbQueries)
 	assert.Equal(t, db.Pool, handler.dbPool)
+}
+
+func TestRetirePrunedDevices_RemovesRuntimeState(t *testing.T) {
+	mockDB := new(MockQuerier)
+	mockReg := new(MockRegistrar)
+	callMgr := new(mockCallManager)
+	device := db.PruneDevicesRow{
+		DeviceID:     "expired-device",
+		B2buaSipUser: "1001_expired",
+	}
+	mockDB.On("GetDeviceByID", mock.Anything, device.DeviceID).Return(db.Device{}, pgx.ErrNoRows)
+	// Upstream failure must not prevent local call-manager state from being retired.
+	mockReg.On("Unregister", mock.Anything, device.DeviceID).Return(assert.AnError)
+
+	handler := &Handler{dbQueries: mockDB, registrar: mockReg, callMgr: callMgr}
+	handler.RetirePrunedDevices(context.Background(), []db.PruneDevicesRow{device})
+
+	assert.Equal(t, [][2]string{{device.DeviceID, device.B2buaSipUser}}, callMgr.suspended)
+	assert.Equal(t, [][2]string{{device.DeviceID, device.B2buaSipUser}}, callMgr.forgotten)
+	mockDB.AssertExpectations(t)
+	mockReg.AssertExpectations(t)
+}
+
+func TestRetirePrunedDevices_PreservesConcurrentlyRefreshedDevice(t *testing.T) {
+	mockDB := new(MockQuerier)
+	mockReg := new(MockRegistrar)
+	callMgr := new(mockCallManager)
+	device := db.PruneDevicesRow{
+		DeviceID:     "refreshed-device",
+		B2buaSipUser: "1002_refreshed",
+	}
+	mockDB.On("GetDeviceByID", mock.Anything, device.DeviceID).
+		Return(db.Device{DeviceID: device.DeviceID}, nil)
+
+	handler := &Handler{dbQueries: mockDB, registrar: mockReg, callMgr: callMgr}
+	handler.RetirePrunedDevices(context.Background(), []db.PruneDevicesRow{device})
+
+	assert.Empty(t, callMgr.suspended)
+	assert.Empty(t, callMgr.forgotten)
+	mockReg.AssertNotCalled(t, "Unregister", mock.Anything, mock.Anything)
+	mockDB.AssertExpectations(t)
 }
 
 func TestSetupRouter_Routes(t *testing.T) {
@@ -933,6 +1001,7 @@ func TestEnableDevice_Success(t *testing.T) {
 		UpstreamRealm:     pgtype.Text{String: "realm", Valid: true},
 	}, nil)
 	mockReg.On("Register", mock.Anything, mock.Anything).Return(nil)
+	mockDB.On("RefreshDeviceExpiry", mock.Anything, mock.Anything).Return(int64(1), nil)
 	mockDB.On("SetDeviceDisabled", mock.Anything, db.SetDeviceDisabledParams{
 		DeviceID: deviceID,
 		Disabled: false,
@@ -964,6 +1033,7 @@ func TestEnableDevice_AlreadyEnabledAndRegisteredIsIdempotent(t *testing.T) {
 		Disabled: false,
 	}, nil)
 	mockReg.On("IsRegistered", deviceID).Return(true)
+	mockDB.On("RefreshDeviceExpiry", mock.Anything, mock.Anything).Return(int64(1), nil)
 
 	r := gin.Default()
 	r.POST("/v1/devices/:device_id/enable", handler.EnableDevice)
@@ -975,6 +1045,32 @@ func TestEnableDevice_AlreadyEnabledAndRegisteredIsIdempotent(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 	mockReg.AssertNotCalled(t, "Register", mock.Anything, mock.Anything)
 	mockDB.AssertNotCalled(t, "SetDeviceDisabled", mock.Anything, mock.Anything)
+}
+
+func TestEnableDevice_ExpiredDuringIdempotentEnableIsNotReportedEnabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	mockDB := new(MockQuerier)
+	mockReg := new(MockRegistrar)
+	callMgr := new(mockCallManager)
+	handler := &Handler{dbQueries: mockDB, registrar: mockReg, callMgr: callMgr}
+
+	deviceID := "550e8400-e29b-41d4-a716-446655440000"
+	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
+		DeviceID: deviceID,
+		Disabled: false,
+	}, nil)
+	mockReg.On("IsRegistered", deviceID).Return(true)
+	mockDB.On("RefreshDeviceExpiry", mock.Anything, mock.Anything).Return(int64(0), nil)
+
+	r := gin.Default()
+	r.POST("/v1/devices/:device_id/enable", handler.EnableDevice)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/devices/"+deviceID+"/enable", nil)
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.Empty(t, callMgr.resumed)
 }
 
 func TestEnsureEnabledRegistration_SuppressesDisabledDevice(t *testing.T) {
@@ -1085,7 +1181,7 @@ func TestForceReregister_Success(t *testing.T) {
 	mockReg.On("Register", mock.Anything, mock.Anything).Return(nil)
 	mockDB.On("RefreshDeviceExpiry", mock.Anything, mock.MatchedBy(func(p db.RefreshDeviceExpiryParams) bool {
 		return p.DeviceID == deviceID
-	})).Return(nil)
+	})).Return(int64(1), nil)
 
 	r := gin.Default()
 	r.POST("/v1/devices/:device_id/reregister", handler.ForceReregister)
@@ -1629,10 +1725,19 @@ func TestListDevices_ScanError(t *testing.T) {
 func TestCleanupJunkDevices_Success(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	mockPool := new(MockDBTX)
-	handler := &Handler{dbPool: mockPool}
+	mockDB := new(MockQuerier)
+	mockReg := new(MockRegistrar)
+	handler := &Handler{dbPool: mockPool, dbQueries: mockDB, registrar: mockReg}
 
-	mockPool.On("Exec", mock.Anything, mock.AnythingOfType("string")).
-		Return(pgconn.NewCommandTag("DELETE 5"), nil)
+	rows := NewMockRows(nil, [][]interface{}{
+		{"junk-device-1", "1001_junk"},
+		{"junk-device-2", "1002_junk"},
+	})
+	mockPool.On("Query", mock.Anything, mock.AnythingOfType("string")).Return(rows, nil)
+	for _, deviceID := range []string{"junk-device-1", "junk-device-2"} {
+		mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{}, pgx.ErrNoRows)
+		mockReg.On("Unregister", mock.Anything, deviceID).Return(nil)
+	}
 
 	r := gin.Default()
 	r.POST("/v1/admin/devices/cleanup-junk", handler.CleanupJunkDevices)
@@ -1645,7 +1750,9 @@ func TestCleanupJunkDevices_Success(t *testing.T) {
 	var resp map[string]interface{}
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	assert.Equal(t, "ok", resp["status"])
-	assert.Equal(t, float64(5), resp["deleted"])
+	assert.Equal(t, float64(2), resp["deleted"])
+	mockDB.AssertExpectations(t)
+	mockReg.AssertExpectations(t)
 }
 
 func TestCleanupJunkDevices_DBError(t *testing.T) {
@@ -1653,8 +1760,8 @@ func TestCleanupJunkDevices_DBError(t *testing.T) {
 	mockPool := new(MockDBTX)
 	handler := &Handler{dbPool: mockPool}
 
-	mockPool.On("Exec", mock.Anything, mock.AnythingOfType("string")).
-		Return(pgconn.CommandTag{}, assert.AnError)
+	mockPool.On("Query", mock.Anything, mock.AnythingOfType("string")).
+		Return((*MockRows)(nil), assert.AnError)
 
 	r := gin.Default()
 	r.POST("/v1/admin/devices/cleanup-junk", handler.CleanupJunkDevices)
@@ -1945,6 +2052,7 @@ func TestEnableDevice_RegisterError(t *testing.T) {
 		UpstreamRealm:     pgtype.Text{String: "realm", Valid: true},
 	}, nil)
 	mockReg.On("IsRegistered", deviceID).Return(false)
+	mockDB.On("RefreshDeviceExpiry", mock.Anything, mock.Anything).Return(int64(1), nil)
 	mockReg.On("Register", mock.Anything, mock.Anything).Return(assert.AnError)
 
 	r := gin.Default()
@@ -1978,6 +2086,7 @@ func TestEnableDevice_DisabledRegisterErrorCancelsManagedState(t *testing.T) {
 		UpstreamTransport: "udp",
 		UpstreamPassword:  encPassword,
 	}, nil)
+	mockDB.On("RefreshDeviceExpiry", mock.Anything, mock.Anything).Return(int64(1), nil)
 	mockReg.On("Register", mock.Anything, mock.Anything).Return(assert.AnError)
 	mockReg.On("Unregister", mock.Anything, deviceID).Return(nil)
 
@@ -2013,6 +2122,7 @@ func TestEnableDevice_SetDisabledError(t *testing.T) {
 		UpstreamPassword:  encPassword,
 		UpstreamRealm:     pgtype.Text{String: "realm", Valid: true},
 	}, nil)
+	mockDB.On("RefreshDeviceExpiry", mock.Anything, mock.Anything).Return(int64(1), nil)
 	mockReg.On("Register", mock.Anything, mock.Anything).Return(nil)
 	mockDB.On("SetDeviceDisabled", mock.Anything, mock.Anything).Return(assert.AnError)
 	mockReg.On("Unregister", mock.Anything, deviceID).Return(nil)
@@ -2078,6 +2188,7 @@ func TestForceReregister_RegisterError(t *testing.T) {
 		UpstreamPassword:  encPassword,
 		UpstreamRealm:     pgtype.Text{String: "realm", Valid: true},
 	}, nil)
+	mockDB.On("RefreshDeviceExpiry", mock.Anything, mock.Anything).Return(int64(1), nil)
 	mockReg.On("Register", mock.Anything, mock.Anything).Return(assert.AnError)
 
 	r := gin.Default()
@@ -2284,10 +2395,9 @@ func TestForceReregister_RefreshExpiryError(t *testing.T) {
 		UpstreamPassword:  encPassword,
 		UpstreamRealm:     pgtype.Text{String: "realm", Valid: true},
 	}, nil)
-	mockReg.On("Register", mock.Anything, mock.Anything).Return(nil)
 	mockDB.On("RefreshDeviceExpiry", mock.Anything, mock.MatchedBy(func(p db.RefreshDeviceExpiryParams) bool {
 		return p.DeviceID == deviceID
-	})).Return(assert.AnError)
+	})).Return(int64(0), assert.AnError)
 
 	r := gin.Default()
 	r.POST("/v1/devices/:device_id/reregister", handler.ForceReregister)
@@ -2297,4 +2407,37 @@ func TestForceReregister_RefreshExpiryError(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusInternalServerError, w.Code)
+	mockReg.AssertNotCalled(t, "Register", mock.Anything, mock.Anything)
+}
+
+func TestForceReregister_ExpiredDuringRefreshDoesNotRegister(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	box := newTestBox(t)
+	encPassword, err := box.Encrypt([]byte("secret"))
+	assert.NoError(t, err)
+
+	mockDB := new(MockQuerier)
+	mockReg := new(MockRegistrar)
+	handler := &Handler{dbQueries: mockDB, registrar: mockReg, box: box}
+
+	deviceID := "550e8400-e29b-41d4-a716-446655440000"
+	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
+		DeviceID:          deviceID,
+		UpstreamPassword:  encPassword,
+		UpstreamUser:      "user1",
+		UpstreamHost:      "pbx.example.com",
+		UpstreamPort:      5060,
+		UpstreamTransport: "udp",
+	}, nil)
+	mockDB.On("RefreshDeviceExpiry", mock.Anything, mock.Anything).Return(int64(0), nil)
+
+	r := gin.Default()
+	r.POST("/v1/devices/:device_id/reregister", handler.ForceReregister)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/devices/"+deviceID+"/reregister", nil)
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	mockReg.AssertNotCalled(t, "Register", mock.Anything, mock.Anything)
 }

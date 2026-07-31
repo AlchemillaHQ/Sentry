@@ -75,14 +75,17 @@ func (m *MockQuerier) GetSetting(ctx context.Context, key string) ([]byte, error
 	args := m.Called(ctx, key)
 	return args.Get(0).([]byte), args.Error(1)
 }
-func (m *MockQuerier) PruneDevices(ctx context.Context, expiresAt pgtype.Timestamptz) error {
-	return m.Called(ctx, expiresAt).Error(0)
+func (m *MockQuerier) PruneDevices(ctx context.Context, expiresAt pgtype.Timestamptz) ([]db.PruneDevicesRow, error) {
+	args := m.Called(ctx, expiresAt)
+	rows, _ := args.Get(0).([]db.PruneDevicesRow)
+	return rows, args.Error(1)
 }
 func (m *MockQuerier) PrunePendingCalls(ctx context.Context, expiresAt pgtype.Timestamptz) error {
 	return m.Called(ctx, expiresAt).Error(0)
 }
-func (m *MockQuerier) RefreshDeviceExpiry(ctx context.Context, arg db.RefreshDeviceExpiryParams) error {
-	return m.Called(ctx, arg).Error(0)
+func (m *MockQuerier) RefreshDeviceExpiry(ctx context.Context, arg db.RefreshDeviceExpiryParams) (int64, error) {
+	args := m.Called(ctx, arg)
+	return args.Get(0).(int64), args.Error(1)
 }
 func (m *MockQuerier) UpdateDeviceContact(ctx context.Context, arg db.UpdateDeviceContactParams) error {
 	return m.Called(ctx, arg).Error(0)

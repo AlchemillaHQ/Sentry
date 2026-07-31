@@ -47,14 +47,17 @@ func (m *MockQuerier) GetSetting(ctx context.Context, key string) ([]byte, error
 	args := m.Called(ctx, key)
 	return args.Get(0).([]byte), args.Error(1)
 }
-func (m *MockQuerier) PruneDevices(ctx context.Context, expiresAt pgtype.Timestamptz) error {
-	return m.Called(ctx, expiresAt).Error(0)
+func (m *MockQuerier) PruneDevices(ctx context.Context, expiresAt pgtype.Timestamptz) ([]PruneDevicesRow, error) {
+	args := m.Called(ctx, expiresAt)
+	rows, _ := args.Get(0).([]PruneDevicesRow)
+	return rows, args.Error(1)
 }
 func (m *MockQuerier) PrunePendingCalls(ctx context.Context, expiresAt pgtype.Timestamptz) error {
 	return m.Called(ctx, expiresAt).Error(0)
 }
-func (m *MockQuerier) RefreshDeviceExpiry(ctx context.Context, arg RefreshDeviceExpiryParams) error {
-	return m.Called(ctx, arg).Error(0)
+func (m *MockQuerier) RefreshDeviceExpiry(ctx context.Context, arg RefreshDeviceExpiryParams) (int64, error) {
+	args := m.Called(ctx, arg)
+	return args.Get(0).(int64), args.Error(1)
 }
 func (m *MockQuerier) UpdateDeviceContact(ctx context.Context, arg UpdateDeviceContactParams) error {
 	return m.Called(ctx, arg).Error(0)
@@ -128,11 +131,13 @@ func TestCleanupStaleState_Success(t *testing.T) {
 	db := &Database{Queries: mockQ}
 
 	ctx := context.Background()
-	mockQ.On("PruneDevices", ctx, mock.Anything).Return(nil)
+	pruned := []PruneDevicesRow{{DeviceID: "expired-device", B2buaSipUser: "1001_expired"}}
+	mockQ.On("PruneDevices", ctx, mock.Anything).Return(pruned, nil)
 	mockQ.On("PrunePendingCalls", ctx, mock.Anything).Return(nil)
 
-	db.CleanupStaleState(ctx)
+	result := db.CleanupStaleState(ctx)
 
+	assert.Equal(t, pruned, result)
 	mockQ.AssertExpectations(t)
 	mockQ.AssertCalled(t, "PruneDevices", ctx, mock.Anything)
 	mockQ.AssertCalled(t, "PrunePendingCalls", ctx, mock.Anything)
@@ -143,12 +148,13 @@ func TestCleanupStaleState_PrunDevicesError(t *testing.T) {
 	db := &Database{Queries: mockQ}
 
 	ctx := context.Background()
-	mockQ.On("PruneDevices", ctx, mock.Anything).Return(assert.AnError)
+	mockQ.On("PruneDevices", ctx, mock.Anything).Return(nil, assert.AnError)
 	mockQ.On("PrunePendingCalls", ctx, mock.Anything).Return(nil)
 
 	// Should not panic even on error
-	db.CleanupStaleState(ctx)
+	result := db.CleanupStaleState(ctx)
 
+	assert.Empty(t, result)
 	mockQ.AssertCalled(t, "PruneDevices", ctx, mock.Anything)
 	mockQ.AssertCalled(t, "PrunePendingCalls", ctx, mock.Anything)
 }
@@ -158,12 +164,14 @@ func TestCleanupStaleState_PrunPendingCallsError(t *testing.T) {
 	db := &Database{Queries: mockQ}
 
 	ctx := context.Background()
-	mockQ.On("PruneDevices", ctx, mock.Anything).Return(nil)
+	pruned := []PruneDevicesRow{{DeviceID: "expired-device", B2buaSipUser: "1001_expired"}}
+	mockQ.On("PruneDevices", ctx, mock.Anything).Return(pruned, nil)
 	mockQ.On("PrunePendingCalls", ctx, mock.Anything).Return(assert.AnError)
 
 	// Should not panic even on error
-	db.CleanupStaleState(ctx)
+	result := db.CleanupStaleState(ctx)
 
+	assert.Equal(t, pruned, result)
 	mockQ.AssertExpectations(t)
 }
 
@@ -367,13 +375,22 @@ func TestStartCleanupWorker(t *testing.T) {
 	defer func() { cleanupWorkerInterval = oldInterval }()
 
 	mockQ := new(MockQuerier)
-	mockQ.On("PruneDevices", mock.Anything, mock.Anything).Return(nil)
+	pruned := []PruneDevicesRow{{DeviceID: "expired-device", B2buaSipUser: "1001_expired"}}
+	mockQ.On("PruneDevices", mock.Anything, mock.Anything).Return(pruned, nil)
 	mockQ.On("PrunePendingCalls", mock.Anything, mock.Anything).Return(nil)
 
 	db := &Database{Queries: mockQ}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	db.StartCleanupWorker(ctx)
+	callback := make(chan []PruneDevicesRow, 1)
+	db.StartCleanupWorker(ctx, func(_ context.Context, devices []PruneDevicesRow) {
+		callback <- devices
+	})
+	select {
+	case result := <-callback:
+		assert.Equal(t, pruned, result)
+	case <-time.After(time.Second):
+		t.Fatal("cleanup worker did not report pruned devices")
+	}
 	cancel()
-	time.Sleep(10 * time.Millisecond)
 }

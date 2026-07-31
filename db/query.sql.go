@@ -282,13 +282,35 @@ func (q *Queries) ListUsers(ctx context.Context) ([]ListUsersRow, error) {
 	return items, nil
 }
 
-const pruneDevices = `-- name: PruneDevices :exec
-DELETE FROM devices WHERE expires_at < $1
+const pruneDevices = `-- name: PruneDevices :many
+DELETE FROM devices
+WHERE expires_at < $1
+RETURNING device_id, b2bua_sip_user
 `
 
-func (q *Queries) PruneDevices(ctx context.Context, expiresAt pgtype.Timestamptz) error {
-	_, err := q.db.Exec(ctx, pruneDevices, expiresAt)
-	return err
+type PruneDevicesRow struct {
+	DeviceID     string `json:"device_id"`
+	B2buaSipUser string `json:"b2bua_sip_user"`
+}
+
+func (q *Queries) PruneDevices(ctx context.Context, expiresAt pgtype.Timestamptz) ([]PruneDevicesRow, error) {
+	rows, err := q.db.Query(ctx, pruneDevices, expiresAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []PruneDevicesRow
+	for rows.Next() {
+		var i PruneDevicesRow
+		if err := rows.Scan(&i.DeviceID, &i.B2buaSipUser); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const prunePendingCalls = `-- name: PrunePendingCalls :exec
@@ -300,7 +322,7 @@ func (q *Queries) PrunePendingCalls(ctx context.Context, expiresAt pgtype.Timest
 	return err
 }
 
-const refreshDeviceExpiry = `-- name: RefreshDeviceExpiry :exec
+const refreshDeviceExpiry = `-- name: RefreshDeviceExpiry :execrows
 UPDATE devices SET expires_at = $2, last_seen = NOW() WHERE device_id = $1
 `
 
@@ -309,9 +331,12 @@ type RefreshDeviceExpiryParams struct {
 	ExpiresAt pgtype.Timestamptz `json:"expires_at"`
 }
 
-func (q *Queries) RefreshDeviceExpiry(ctx context.Context, arg RefreshDeviceExpiryParams) error {
-	_, err := q.db.Exec(ctx, refreshDeviceExpiry, arg.DeviceID, arg.ExpiresAt)
-	return err
+func (q *Queries) RefreshDeviceExpiry(ctx context.Context, arg RefreshDeviceExpiryParams) (int64, error) {
+	result, err := q.db.Exec(ctx, refreshDeviceExpiry, arg.DeviceID, arg.ExpiresAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const setDeviceDisabled = `-- name: SetDeviceDisabled :exec

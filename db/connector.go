@@ -112,17 +112,19 @@ func (db *Database) Reset(ctx context.Context) error {
 	return nil
 }
 
-func (db *Database) CleanupStaleState(ctx context.Context) {
+func (db *Database) CleanupStaleState(ctx context.Context) []PruneDevicesRow {
 	now := pgtype.Timestamptz{Time: time.Now(), Valid: true}
-	err := db.Queries.PruneDevices(ctx, now)
+	prunedDevices, err := db.Queries.PruneDevices(ctx, now)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to prune devices")
+		prunedDevices = nil
 	}
 
 	err = db.Queries.PrunePendingCalls(ctx, now)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to prune pending calls")
 	}
+	return prunedDevices
 }
 
 func (db *Database) CleanupJunkDevices(ctx context.Context) int64 {
@@ -144,14 +146,20 @@ func (db *Database) CleanupJunkDevices(ctx context.Context) int64 {
 
 var cleanupWorkerInterval = 1 * time.Hour
 
-func (db *Database) StartCleanupWorker(ctx context.Context) {
+func (db *Database) StartCleanupWorker(
+	ctx context.Context,
+	onDevicesPruned func(context.Context, []PruneDevicesRow),
+) {
 	ticker := time.NewTicker(cleanupWorkerInterval)
 	go func() {
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				db.CleanupStaleState(ctx)
+				prunedDevices := db.CleanupStaleState(ctx)
+				if len(prunedDevices) > 0 && onDevicesPruned != nil {
+					onDevicesPruned(ctx, prunedDevices)
+				}
 			case <-ctx.Done():
 				return
 			}

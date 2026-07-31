@@ -131,7 +131,7 @@ func main() {
 
 	database.CleanupStaleState(ctx)
 	database.CleanupJunkDevices(ctx)
-	database.StartCleanupWorker(ctx)
+	database.StartCleanupWorker(ctx, handler.RetirePrunedDevices)
 
 	if err := database.BootstrapUsers(ctx, cfg.Admin.BootstrapUsers); err != nil {
 		log.Error().Err(err).Msg("bootstrap users failed")

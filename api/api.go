@@ -25,6 +25,8 @@ import (
 
 const deviceExpiryDuration = 7 * 24 * time.Hour
 
+const expiredDeviceCleanupConcurrency = 16
+
 type Handler struct {
 	dbQueries db.Querier
 	dbPool    db.DBTX
@@ -82,6 +84,76 @@ func (h *Handler) upstreamRegistration(device db.Device, password string) *sipst
 		Password:  password,
 		Realm:     device.UpstreamRealm.String,
 	}
+}
+
+// RetirePrunedDevices tears down runtime state for device leases that the
+// database cleanup worker deleted. The database row is checked again under the
+// normal per-device transition lock so a concurrent refresh or registration
+// can safely recreate the device without being unregistered by stale cleanup.
+func (h *Handler) RetirePrunedDevices(ctx context.Context, devices []db.PruneDevicesRow) {
+	h.retireRemovedDevices(ctx, devices, "expired")
+}
+
+func (h *Handler) retireRemovedDevices(ctx context.Context, devices []db.PruneDevicesRow, reason string) {
+	sem := make(chan struct{}, expiredDeviceCleanupConcurrency)
+	var wg sync.WaitGroup
+	for _, device := range devices {
+		device := device
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait()
+			return
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			cleanupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			defer cancel()
+			h.retireRemovedDevice(cleanupCtx, device, reason)
+		}()
+	}
+	wg.Wait()
+}
+
+func (h *Handler) retireRemovedDevice(ctx context.Context, device db.PruneDevicesRow, reason string) {
+	unlock := h.lockDevice(device.DeviceID)
+	defer unlock()
+
+	if _, err := h.dbQueries.GetDeviceByID(ctx, device.DeviceID); err == nil {
+		log.Info().
+			Str("device", device.DeviceID).
+			Str("reason", reason).
+			Msg("removed device was recreated during cleanup; preserving runtime registration")
+		return
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		log.Error().
+			Err(err).
+			Str("device", device.DeviceID).
+			Str("reason", reason).
+			Msg("failed to confirm device removal; preserving runtime registration")
+		return
+	}
+
+	if h.callMgr != nil {
+		h.callMgr.SuspendDevice(device.DeviceID, device.B2buaSipUser)
+	}
+	if h.registrar != nil {
+		if err := h.registrar.Unregister(ctx, device.DeviceID); err != nil {
+			// Unregister removes local registrar state before making the best-effort
+			// upstream request, so an unreachable gateway cannot keep refreshing it.
+			log.Warn().
+				Err(err).
+				Str("device", device.DeviceID).
+				Str("reason", reason).
+				Msg("removed device upstream unregistration failed")
+		}
+	}
+	if h.callMgr != nil {
+		h.callMgr.ForgetDevice(device.DeviceID, device.B2buaSipUser)
+	}
+	log.Info().Str("device", device.DeviceID).Str("reason", reason).Msg("removed device runtime state retired")
 }
 
 func (h *Handler) EnsureEnabledRegistration(ctx context.Context, deviceID, reason string) (bool, error) {
@@ -330,18 +402,41 @@ func (h *Handler) CreateUser(c *gin.Context) {
 }
 
 func (h *Handler) CleanupJunkDevices(c *gin.Context) {
-	tag, err := h.dbPool.Exec(c.Request.Context(), `
+	rows, err := h.dbPool.Query(c.Request.Context(), `
 		DELETE FROM devices
 		WHERE upstream_host !~ '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
 		  AND upstream_host !~ '^([a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
+		RETURNING device_id, b2bua_sip_user
 	`)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to cleanup junk devices")
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "cleanup failed"})
 		return
 	}
+	defer rows.Close()
 
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "deleted": tag.RowsAffected()})
+	removed := make([]db.PruneDevicesRow, 0)
+	for rows.Next() {
+		var device db.PruneDevicesRow
+		if err := rows.Scan(&device.DeviceID, &device.B2buaSipUser); err != nil {
+			log.Error().Err(err).Msg("failed to scan junk device cleanup result")
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "cleanup failed"})
+			return
+		}
+		removed = append(removed, device)
+	}
+	if err := rows.Err(); err != nil {
+		log.Error().Err(err).Msg("failed to read junk device cleanup result")
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "cleanup failed"})
+		return
+	}
+	rows.Close()
+
+	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cleanupCancel()
+	h.retireRemovedDevices(cleanupCtx, removed, "invalid_hostname")
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "deleted": len(removed)})
 }
 
 func (h *Handler) DeleteUser(c *gin.Context) {
@@ -690,12 +785,17 @@ func (h *Handler) DeviceStatus(c *gin.Context) {
 	refreshedExpiry := heartbeatAt.Add(deviceExpiryDuration)
 	wasExpired := !device.ExpiresAt.Valid || !device.ExpiresAt.Time.After(heartbeatAt)
 
-	if err := h.dbQueries.RefreshDeviceExpiry(c.Request.Context(), db.RefreshDeviceExpiryParams{
+	updated, err := h.dbQueries.RefreshDeviceExpiry(c.Request.Context(), db.RefreshDeviceExpiryParams{
 		DeviceID:  deviceID,
 		ExpiresAt: pgtype.Timestamptz{Time: refreshedExpiry, Valid: true},
-	}); err != nil {
+	})
+	if err != nil {
 		log.Error().Err(err).Str("device", deviceID).Msg("failed to refresh device expiry")
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "database error"})
+		return
+	}
+	if updated == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "message": "device expired during status refresh"})
 		return
 	}
 
@@ -801,6 +901,19 @@ func (h *Handler) EnableDevice(c *gin.Context) {
 	}
 
 	if !device.Disabled && h.registrar.IsRegistered(deviceID) {
+		updated, err := h.dbQueries.RefreshDeviceExpiry(c.Request.Context(), db.RefreshDeviceExpiryParams{
+			DeviceID:  device.DeviceID,
+			ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(deviceExpiryDuration), Valid: true},
+		})
+		if err != nil {
+			log.Error().Err(err).Str("device", deviceID).Msg("failed to refresh device expiry")
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "database error"})
+			return
+		}
+		if updated == 0 {
+			c.JSON(http.StatusNotFound, gin.H{"status": "error", "message": "device expired during enable"})
+			return
+		}
 		if h.callMgr != nil {
 			h.callMgr.ResumeDevice(deviceID)
 		}
@@ -817,6 +930,20 @@ func (h *Handler) EnableDevice(c *gin.Context) {
 	if err != nil {
 		log.Error().Err(err).Msg("decrypt password failed")
 		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "decryption failed"})
+		return
+	}
+
+	updated, err := h.dbQueries.RefreshDeviceExpiry(c.Request.Context(), db.RefreshDeviceExpiryParams{
+		DeviceID:  device.DeviceID,
+		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(deviceExpiryDuration), Valid: true},
+	})
+	if err != nil {
+		log.Error().Err(err).Str("device", deviceID).Msg("failed to refresh device expiry")
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "database error"})
+		return
+	}
+	if updated == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "message": "device expired during re-registration"})
 		return
 	}
 
@@ -901,6 +1028,20 @@ func (h *Handler) ForceReregister(c *gin.Context) {
 		return
 	}
 
+	updated, err := h.dbQueries.RefreshDeviceExpiry(c.Request.Context(), db.RefreshDeviceExpiryParams{
+		DeviceID:  device.DeviceID,
+		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(deviceExpiryDuration), Valid: true},
+	})
+	if err != nil {
+		log.Error().Err(err).Str("device", deviceID).Msg("failed to refresh device expiry")
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "database error"})
+		return
+	}
+	if updated == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "message": "device expired during re-registration"})
+		return
+	}
+
 	regCtx, regCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer regCancel()
 	if err := h.registrar.Register(regCtx, h.upstreamRegistration(device, string(password))); err != nil {
@@ -909,14 +1050,6 @@ func (h *Handler) ForceReregister(c *gin.Context) {
 		return
 	}
 
-	if err := h.dbQueries.RefreshDeviceExpiry(c.Request.Context(), db.RefreshDeviceExpiryParams{
-		DeviceID:  device.DeviceID,
-		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(deviceExpiryDuration), Valid: true},
-	}); err != nil {
-		log.Error().Err(err).Str("device", deviceID).Msg("failed to refresh device expiry")
-		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "database error"})
-		return
-	}
 	if h.callMgr != nil {
 		h.callMgr.ResumeDevice(deviceID)
 	}

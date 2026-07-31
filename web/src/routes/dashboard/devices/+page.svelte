@@ -214,9 +214,9 @@
 	function statusLabel(device: Device) {
 		const labels: Record<string, string> = {
 			disabled: 'Disabled',
-			registered: 'Registered',
-			refreshing: 'Refreshing',
-			registering: 'Registering',
+			registered: 'Upstream registered',
+			refreshing: 'Upstream refreshing',
+			registering: 'Upstream registering',
 			queued: 'Queued',
 			retrying: 'Retrying',
 			pending: 'Pending',
@@ -387,13 +387,13 @@
 							>Account</th
 						>
 						<th class="px-5 py-3.5 text-xs font-semibold tracking-wider text-zinc-400 uppercase"
-							>Registration</th
+							>Upstream SIP</th
 						>
 						<th class="px-5 py-3.5 text-xs font-semibold tracking-wider text-zinc-400 uppercase"
 							>Gateway</th
 						>
 						<th class="px-5 py-3.5 text-xs font-semibold tracking-wider text-zinc-400 uppercase"
-							>Activity</th
+							>App check-in</th
 						>
 						<th
 							class="px-5 py-3.5 text-right text-xs font-semibold tracking-wider text-zinc-400 uppercase"
@@ -466,8 +466,15 @@
 												title={device.registration.last_error}
 												>{device.registration.last_error}</span
 											>
+										{/if}
+										{#if device.registration?.last_success}
+											<span
+												class="text-[11px] text-zinc-500"
+												title={formatTimestamp(device.registration.last_success)}
+												>SIP refreshed {relativeTime(device.registration.last_success)}</span
+											>
 										{:else if device.registration?.managed}
-											<span class="text-[11px] text-zinc-500">Managed by Sentry</span>
+											<span class="text-[11px] text-zinc-500">Awaiting first SIP success</span>
 										{:else}
 											<span class="text-[11px] text-zinc-500">No runtime registration</span>
 										{/if}
@@ -652,7 +659,7 @@
 													</div>
 													<div>
 														<dt class="text-[11px] tracking-wide text-zinc-600 uppercase">
-															Last registration success
+															Last upstream registration success
 														</dt>
 														<dd class="mt-0.5 text-zinc-300">
 															{formatTimestamp(device.registration?.last_success)}
@@ -778,7 +785,7 @@
 											class="mt-4 flex flex-wrap items-center gap-x-5 gap-y-2 text-[11px] text-zinc-600"
 										>
 											<span class="flex items-center"
-												><CalendarDays class="mr-1.5 h-3.5 w-3.5" />Last seen {formatTimestamp(
+												><CalendarDays class="mr-1.5 h-3.5 w-3.5" />App last check-in {formatTimestamp(
 													device.last_seen
 												)}</span
 											>

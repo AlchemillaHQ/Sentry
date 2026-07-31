@@ -46,7 +46,7 @@ ON CONFLICT (device_id) DO UPDATE SET
 -- name: UpdateDeviceContact :exec
 UPDATE devices SET device_contact = $2, user_agent = $3, last_seen = NOW() WHERE b2bua_sip_user = $1;
 
--- name: RefreshDeviceExpiry :exec
+-- name: RefreshDeviceExpiry :execrows
 UPDATE devices SET expires_at = $2, last_seen = NOW() WHERE device_id = $1;
 
 -- name: UpdateDeviceLastSeen :exec
@@ -72,8 +72,10 @@ DELETE FROM pending_calls WHERE call_id = $1;
 -- name: SetDeviceDisabled :exec
 UPDATE devices SET disabled = $2 WHERE device_id = $1;
 
--- name: PruneDevices :exec
-DELETE FROM devices WHERE expires_at < $1;
+-- name: PruneDevices :many
+DELETE FROM devices
+WHERE expires_at < $1
+RETURNING device_id, b2bua_sip_user;
 
 -- name: DeleteDeviceByID :exec
 DELETE FROM devices WHERE device_id = $1;

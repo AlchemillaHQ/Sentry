@@ -23,9 +23,9 @@ type Querier interface {
 	GetSetting(ctx context.Context, key string) ([]byte, error)
 	GetUser(ctx context.Context, username string) (User, error)
 	ListUsers(ctx context.Context) ([]ListUsersRow, error)
-	PruneDevices(ctx context.Context, expiresAt pgtype.Timestamptz) error
+	PruneDevices(ctx context.Context, expiresAt pgtype.Timestamptz) ([]PruneDevicesRow, error)
 	PrunePendingCalls(ctx context.Context, expiresAt pgtype.Timestamptz) error
-	RefreshDeviceExpiry(ctx context.Context, arg RefreshDeviceExpiryParams) error
+	RefreshDeviceExpiry(ctx context.Context, arg RefreshDeviceExpiryParams) (int64, error)
 	SetDeviceDisabled(ctx context.Context, arg SetDeviceDisabledParams) error
 	UpdateDeviceContact(ctx context.Context, arg UpdateDeviceContactParams) error
 	UpdateDeviceLastSeen(ctx context.Context, b2buaSipUser string) error

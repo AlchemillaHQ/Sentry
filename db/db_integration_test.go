@@ -210,8 +210,12 @@ func TestIntegration_PruneDevices(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	err = db.Queries.PruneDevices(context.Background(), pgtype.Timestamptz{Time: now, Valid: true})
+	pruned, err := db.Queries.PruneDevices(context.Background(), pgtype.Timestamptz{Time: now, Valid: true})
 	require.NoError(t, err)
+	require.Equal(t, []PruneDevicesRow{{
+		DeviceID:     "prune-me-0001",
+		B2buaSipUser: "user_prune-m",
+	}}, pruned)
 
 	_, err = db.Queries.GetDeviceByID(context.Background(), "prune-me-0001")
 	assert.Error(t, err)
