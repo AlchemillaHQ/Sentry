@@ -29,6 +29,7 @@ type supervisorTestClient struct {
 	mu sync.Mutex
 
 	optionsUp       bool
+	registerUp      bool
 	registerReplies []testSIPReply
 	registerCalls   int
 	optionCalls     int
@@ -51,7 +52,7 @@ func (c *blockingSIPClient) DoDigestAuth(ctx context.Context, req *sip.Request, 
 }
 
 func newSupervisorTestClient() *supervisorTestClient {
-	return &supervisorTestClient{optionsUp: true}
+	return &supervisorTestClient{optionsUp: true, registerUp: true}
 }
 
 func (c *supervisorTestClient) Do(_ context.Context, req *sip.Request, _ ...sipgo.ClientRequestOption) (*sip.Response, error) {
@@ -67,6 +68,9 @@ func (c *supervisorTestClient) Do(_ context.Context, req *sip.Request, _ ...sipg
 	}
 
 	c.registerCalls++
+	if !c.registerUp {
+		return nil, errors.New("registration transport unavailable")
+	}
 	if header := req.GetHeader("Expires"); header != nil {
 		if expires, err := strconv.Atoi(header.Value()); err == nil {
 			c.registerExpires = append(c.registerExpires, expires)
@@ -118,6 +122,12 @@ func (c *supervisorTestClient) setOptionsUp(up bool) {
 	c.mu.Unlock()
 }
 
+func (c *supervisorTestClient) setRegisterUp(up bool) {
+	c.mu.Lock()
+	c.registerUp = up
+	c.mu.Unlock()
+}
+
 func (c *supervisorTestClient) counts() (registers, options int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -137,6 +147,7 @@ func aggressiveTestRegistrarConfig() config.RegistrarConfig {
 	cfg.ProbeTimeoutMilliseconds = 10
 	cfg.ProbeFailureThreshold = 2
 	cfg.DownProbeIntervalMillis = 10
+	cfg.RegisterCanaryIntervalMillis = 20
 	cfg.RecoveryWorkersPerGateway = 4
 	cfg.RecoveryInitialRate = 1000
 	cfg.RecoveryMaxRate = 1000
@@ -202,22 +213,150 @@ func TestManageQueuesWithoutWaitingForUpstream(t *testing.T) {
 	ur.StopAll()
 }
 
-func TestUnvalidatedOptionsCannotStrandHealthyRegistration(t *testing.T) {
+func TestUnvalidatedOptionsUsesOneSharedCanaryWithoutFanout(t *testing.T) {
 	client := newSupervisorTestClient()
 	client.setOptionsUp(false)
-	ur := newUpstreamRegistrarWithClientConfig(testStack(), client, aggressiveTestRegistrarConfig())
+	cfg := aggressiveTestRegistrarConfig()
+	cfg.RegisterCanaryIntervalMillis = 500
+	ur := newUpstreamRegistrarWithClientConfig(testStack(), client, cfg)
+	t.Cleanup(ur.StopAll)
+
+	first := &UpstreamReg{DeviceID: "device-11111111", User: "1001", Host: "pbx.example.com", Port: 5060}
+	second := &UpstreamReg{DeviceID: "device-22222222", User: "1002", Host: "pbx.example.com", Port: 5060}
+	require.NoError(t, ur.Register(context.Background(), first))
+	require.NoError(t, ur.Register(context.Background(), second))
+	require.Eventually(t, func() bool {
+		registers, options := client.counts()
+		health := ur.HealthSummary()
+		ur.mu.RLock()
+		var usingCanary bool
+		for _, gateway := range ur.gateways {
+			usingCanary = gateway.probeUnsupported
+		}
+		ur.mu.RUnlock()
+		return options >= 2 && registers == 3 && usingCanary && health.SuspectGateways == 0
+	}, time.Second, 5*time.Millisecond)
+
+	// Resolving a merely-suspect gateway must not re-register every member.
+	time.Sleep(100 * time.Millisecond)
+	registers, _ := client.counts()
+	assert.Equal(t, 3, registers)
+	assert.True(t, ur.IsRegistered(first.DeviceID))
+	assert.True(t, ur.IsRegistered(second.DeviceID))
+	assert.Equal(t, 1, ur.HealthSummary().CanaryGateways)
+	assert.Equal(t, 0, ur.HealthSummary().UnavailableGateways)
+}
+
+func TestRejectedCanaryStillProvesGatewayReachability(t *testing.T) {
+	client := newSupervisorTestClient()
+	client.setOptionsUp(false)
+	client.registerReplies = []testSIPReply{
+		{status: sip.StatusOK, reason: "OK"},
+		{status: sip.StatusForbidden, reason: "Forbidden"},
+	}
+	cfg := aggressiveTestRegistrarConfig()
+	cfg.RegisterCanaryIntervalMillis = 500
+	ur := newUpstreamRegistrarWithClientConfig(testStack(), client, cfg)
 	t.Cleanup(ur.StopAll)
 
 	reg := &UpstreamReg{DeviceID: "device-11111111", User: "1001", Host: "pbx.example.com", Port: 5060}
 	require.NoError(t, ur.Register(context.Background(), reg))
 	require.Eventually(t, func() bool {
-		_, options := client.counts()
+		registers, options := client.counts()
 		health := ur.HealthSummary()
-		return options >= 2 && health.SuspectGateways == 0
+		return registers == 2 && options >= 2 && health.CanaryGateways == 1 && health.SuspectGateways == 0
 	}, time.Second, 5*time.Millisecond)
 
 	assert.True(t, ur.IsRegistered(reg.DeviceID))
 	assert.Equal(t, 0, ur.HealthSummary().UnavailableGateways)
+}
+
+func TestUnvalidatedGatewayOpensSharedCircuitAndRecoversThroughCanary(t *testing.T) {
+	client := newSupervisorTestClient()
+	client.setOptionsUp(false)
+	client.setRegisterUp(false)
+	cfg := aggressiveTestRegistrarConfig()
+	cfg.RegisterCanaryIntervalMillis = 20
+	ur := newUpstreamRegistrarWithClientConfig(testStack(), client, cfg)
+	t.Cleanup(ur.StopAll)
+
+	const registrations = 20
+	for index := 0; index < registrations; index++ {
+		require.NoError(t, ur.Manage(&UpstreamReg{
+			DeviceID: "device-" + strconv.Itoa(index),
+			User:     "10" + strconv.Itoa(index),
+			Host:     "pbx.example.com",
+			Port:     5060,
+		}))
+	}
+
+	require.Eventually(t, func() bool {
+		ur.mu.RLock()
+		defer ur.mu.RUnlock()
+		down := false
+		for _, gateway := range ur.gateways {
+			down = !gateway.reachable
+		}
+		if !down {
+			return false
+		}
+		for _, state := range ur.regs {
+			if state.inFlight || state.timer != nil {
+				return false
+			}
+		}
+		return true
+	}, 2*time.Second, 5*time.Millisecond)
+	registersAtDown, _ := client.counts()
+	time.Sleep(80 * time.Millisecond)
+	registersStillDown, _ := client.counts()
+
+	// Only the gateway probe loop may send while the circuit is open. The
+	// number of attempts is therefore time-bound, not account-count-bound.
+	assert.Greater(t, registersStillDown, registersAtDown)
+	assert.LessOrEqual(t, registersStillDown-registersAtDown, 12)
+	assert.Equal(t, registrations, ur.HealthSummary().PendingRegistrations)
+
+	client.setRegisterUp(true)
+	require.Eventually(t, func() bool {
+		health := ur.HealthSummary()
+		return health.UnavailableGateways == 0 && health.HealthyRegistrations == registrations
+	}, 2*time.Second, 5*time.Millisecond)
+}
+
+func TestPreviouslyValidatedOptionsFallsBackToCanary(t *testing.T) {
+	client := newSupervisorTestClient()
+	cfg := aggressiveTestRegistrarConfig()
+	cfg.RegisterCanaryIntervalMillis = 500
+	ur := newUpstreamRegistrarWithClientConfig(testStack(), client, cfg)
+	t.Cleanup(ur.StopAll)
+
+	reg := &UpstreamReg{DeviceID: "device-11111111", User: "1001", Host: "pbx.example.com", Port: 5060}
+	require.NoError(t, ur.Register(context.Background(), reg))
+	require.Eventually(t, func() bool {
+		ur.mu.RLock()
+		defer ur.mu.RUnlock()
+		for _, gateway := range ur.gateways {
+			if gateway.probeValidated {
+				return true
+			}
+		}
+		return false
+	}, time.Second, 5*time.Millisecond)
+
+	client.setOptionsUp(false)
+	require.Eventually(t, func() bool {
+		ur.mu.RLock()
+		usingCanary := false
+		for _, gateway := range ur.gateways {
+			if gateway.probeUnsupported && gateway.reachable {
+				usingCanary = true
+			}
+		}
+		ur.mu.RUnlock()
+		return usingCanary && ur.IsRegistered(reg.DeviceID)
+	}, 2*time.Second, 5*time.Millisecond)
+	assert.True(t, ur.IsRegistered(reg.DeviceID))
 }
 
 func TestRegisterUsesNegotiatedContactExpiry(t *testing.T) {

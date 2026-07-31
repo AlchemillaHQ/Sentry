@@ -68,40 +68,42 @@ type RateLimitConfig struct {
 // defaults intentionally favor fast failure detection while bounding the
 // amount of traffic sent to any one gateway and by the process as a whole.
 type RegistrarConfig struct {
-	ExpiresSeconds            int     `yaml:"expires_seconds"`
-	RefreshPercent            int     `yaml:"refresh_percent"`
-	AttemptTimeoutSeconds     int     `yaml:"attempt_timeout_seconds"`
-	ProbeEnabled              bool    `yaml:"probe_enabled"`
-	ProbeIntervalMilliseconds int     `yaml:"probe_interval_milliseconds"`
-	ProbeTimeoutMilliseconds  int     `yaml:"probe_timeout_milliseconds"`
-	ProbeFailureThreshold     int     `yaml:"probe_failure_threshold"`
-	DownProbeIntervalMillis   int     `yaml:"down_probe_interval_milliseconds"`
-	ProbeGlobalWorkers        int     `yaml:"probe_global_workers"`
-	ProbeGlobalMaxRate        float64 `yaml:"probe_global_max_rate"`
-	RecoveryWorkersPerGateway int     `yaml:"recovery_workers_per_gateway"`
-	RecoveryInitialRate       float64 `yaml:"recovery_initial_rate"`
-	RecoveryMaxRate           float64 `yaml:"recovery_max_rate"`
-	RecoveryGlobalWorkers     int     `yaml:"recovery_global_workers"`
-	RecoveryGlobalMaxRate     float64 `yaml:"recovery_global_max_rate"`
+	ExpiresSeconds               int     `yaml:"expires_seconds"`
+	RefreshPercent               int     `yaml:"refresh_percent"`
+	AttemptTimeoutSeconds        int     `yaml:"attempt_timeout_seconds"`
+	ProbeEnabled                 bool    `yaml:"probe_enabled"`
+	ProbeIntervalMilliseconds    int     `yaml:"probe_interval_milliseconds"`
+	ProbeTimeoutMilliseconds     int     `yaml:"probe_timeout_milliseconds"`
+	ProbeFailureThreshold        int     `yaml:"probe_failure_threshold"`
+	DownProbeIntervalMillis      int     `yaml:"down_probe_interval_milliseconds"`
+	RegisterCanaryIntervalMillis int     `yaml:"register_canary_interval_milliseconds"`
+	ProbeGlobalWorkers           int     `yaml:"probe_global_workers"`
+	ProbeGlobalMaxRate           float64 `yaml:"probe_global_max_rate"`
+	RecoveryWorkersPerGateway    int     `yaml:"recovery_workers_per_gateway"`
+	RecoveryInitialRate          float64 `yaml:"recovery_initial_rate"`
+	RecoveryMaxRate              float64 `yaml:"recovery_max_rate"`
+	RecoveryGlobalWorkers        int     `yaml:"recovery_global_workers"`
+	RecoveryGlobalMaxRate        float64 `yaml:"recovery_global_max_rate"`
 }
 
 func DefaultRegistrarConfig() RegistrarConfig {
 	return RegistrarConfig{
-		ExpiresSeconds:            600,
-		RefreshPercent:            70,
-		AttemptTimeoutSeconds:     8,
-		ProbeEnabled:              true,
-		ProbeIntervalMilliseconds: 3000,
-		ProbeTimeoutMilliseconds:  1200,
-		ProbeFailureThreshold:     2,
-		DownProbeIntervalMillis:   1000,
-		ProbeGlobalWorkers:        128,
-		ProbeGlobalMaxRate:        1000,
-		RecoveryWorkersPerGateway: 64,
-		RecoveryInitialRate:       25,
-		RecoveryMaxRate:           500,
-		RecoveryGlobalWorkers:     512,
-		RecoveryGlobalMaxRate:     1000,
+		ExpiresSeconds:               600,
+		RefreshPercent:               70,
+		AttemptTimeoutSeconds:        8,
+		ProbeEnabled:                 true,
+		ProbeIntervalMilliseconds:    3000,
+		ProbeTimeoutMilliseconds:     1200,
+		ProbeFailureThreshold:        2,
+		DownProbeIntervalMillis:      1000,
+		RegisterCanaryIntervalMillis: 10000,
+		ProbeGlobalWorkers:           128,
+		ProbeGlobalMaxRate:           1000,
+		RecoveryWorkersPerGateway:    64,
+		RecoveryInitialRate:          25,
+		RecoveryMaxRate:              500,
+		RecoveryGlobalWorkers:        512,
+		RecoveryGlobalMaxRate:        1000,
 	}
 }
 
@@ -130,6 +132,9 @@ func (c RegistrarConfig) WithDefaults() RegistrarConfig {
 	}
 	if c.DownProbeIntervalMillis <= 0 {
 		c.DownProbeIntervalMillis = d.DownProbeIntervalMillis
+	}
+	if c.RegisterCanaryIntervalMillis <= 0 {
+		c.RegisterCanaryIntervalMillis = d.RegisterCanaryIntervalMillis
 	}
 	if c.ProbeGlobalWorkers <= 0 {
 		c.ProbeGlobalWorkers = d.ProbeGlobalWorkers
@@ -231,6 +236,9 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Registrar.ProbeEnabled && cfg.Registrar.DownProbeIntervalMillis < 250 {
 		return nil, fmt.Errorf("registrar.down_probe_interval_milliseconds must be at least 250")
+	}
+	if cfg.Registrar.ProbeEnabled && cfg.Registrar.RegisterCanaryIntervalMillis < 1000 {
+		return nil, fmt.Errorf("registrar.register_canary_interval_milliseconds must be at least 1000")
 	}
 	if cfg.Registrar.ProbeEnabled && (cfg.Registrar.ProbeGlobalWorkers < 1 || cfg.Registrar.ProbeGlobalMaxRate <= 0) {
 		return nil, fmt.Errorf("registrar global probe limits must be positive")

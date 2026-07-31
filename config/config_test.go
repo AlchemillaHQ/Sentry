@@ -202,6 +202,7 @@ ratelimit:
   register_burst: 10
 registrar:
   probe_interval_milliseconds: 5000
+  register_canary_interval_milliseconds: 12000
   recovery_initial_rate: 40
   recovery_max_rate: 300
 `
@@ -231,6 +232,7 @@ registrar:
 	assert.Equal(t, 0.2, cfg.RateLimit.RegisterRate)
 	assert.Equal(t, 10, cfg.RateLimit.RegisterBurst)
 	assert.Equal(t, 5000, cfg.Registrar.ProbeIntervalMilliseconds)
+	assert.Equal(t, 12000, cfg.Registrar.RegisterCanaryIntervalMillis)
 	assert.Equal(t, float64(40), cfg.Registrar.RecoveryInitialRate)
 	assert.Equal(t, float64(300), cfg.Registrar.RecoveryMaxRate)
 	assert.True(t, cfg.Registrar.ProbeEnabled)
@@ -256,6 +258,11 @@ func TestLoad_RegistrarValidation(t *testing.T) {
 			name:      "probe traffic floor",
 			registrar: "probe_interval_milliseconds: 100",
 			errorText: "probe_interval_milliseconds",
+		},
+		{
+			name:      "registration canary traffic floor",
+			registrar: "register_canary_interval_milliseconds: 500",
+			errorText: "register_canary_interval_milliseconds",
 		},
 		{
 			name:      "rate ordering",

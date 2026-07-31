@@ -103,6 +103,8 @@ func New(cfg config.SIPConfig) (*Stack, error) {
 	server.OnAck(s.handleAck)
 	server.OnBye(s.handleBye)
 	server.OnCancel(s.handleCancel)
+	server.OnOptions(s.handleOptions)
+	server.OnNotify(s.handleNotify)
 
 	return s, nil
 }
@@ -195,6 +197,24 @@ func (s *Stack) handleCancel(req *sip.Request, tx sip.ServerTransaction) {
 	s.mu.RUnlock()
 	if fn != nil {
 		fn(req, tx)
+	}
+}
+
+func (s *Stack) handleOptions(req *sip.Request, tx sip.ServerTransaction) {
+	res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
+	res.AppendHeader(sip.NewHeader("Allow", "INVITE, ACK, CANCEL, OPTIONS, BYE, REGISTER, REFER, NOTIFY, MESSAGE, SUBSCRIBE, INFO, UPDATE"))
+	if err := tx.Respond(res); err != nil {
+		log.Debug().Err(err).Msg("failed to answer SIP OPTIONS keepalive")
+	}
+}
+
+func (s *Stack) handleNotify(req *sip.Request, tx sip.ServerTransaction) {
+	// Sentry does not currently consume upstream event packages, but explicitly
+	// accepting the notification prevents retransmit storms and keeps it from
+	// being mistaken for a transport-health failure by the sender.
+	res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
+	if err := tx.Respond(res); err != nil {
+		log.Debug().Err(err).Msg("failed to acknowledge SIP NOTIFY")
 	}
 }
 

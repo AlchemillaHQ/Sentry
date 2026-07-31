@@ -78,6 +78,7 @@ type RegistrarHealthSummary struct {
 	HealthyRegistrations int `json:"healthy_registrations"`
 	PendingRegistrations int `json:"pending_registrations"`
 	Gateways             int `json:"gateways"`
+	CanaryGateways       int `json:"canary_gateways"`
 	SuspectGateways      int `json:"suspect_gateways"`
 	UnavailableGateways  int `json:"unavailable_gateways"`
 }
@@ -291,6 +292,9 @@ func (ur *UpstreamRegistrar) HealthSummary() RegistrarHealthSummary {
 		}
 	}
 	for _, gateway := range ur.gateways {
+		if gateway.probeUnsupported {
+			summary.CanaryGateways++
+		}
 		if gateway.suspect {
 			summary.SuspectGateways++
 		}

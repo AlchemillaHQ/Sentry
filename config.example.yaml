@@ -52,6 +52,7 @@ registrar:
   probe_timeout_milliseconds: 1200
   probe_failure_threshold: 2
   down_probe_interval_milliseconds: 1000
+  register_canary_interval_milliseconds: 10000
   probe_global_workers: 128
   probe_global_max_rate: 1000
   recovery_workers_per_gateway: 64

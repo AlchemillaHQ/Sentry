@@ -303,6 +303,30 @@ func TestHandleCancel_NoCallback(t *testing.T) {
 	tx.AssertNotCalled(t, "Respond")
 }
 
+func TestHandleOptions_AnswersKeepalive(t *testing.T) {
+	s := testStack()
+	req := sip.NewRequest(sip.OPTIONS, sip.Uri{Host: "test"})
+	tx := new(mockServerTx)
+	tx.On("Respond", mock.MatchedBy(func(res *sip.Response) bool {
+		return res.StatusCode == sip.StatusOK && res.GetHeader("Allow") != nil
+	})).Return(nil).Once()
+
+	s.handleOptions(req, tx)
+	tx.AssertExpectations(t)
+}
+
+func TestHandleNotify_AcknowledgesWithoutRetransmit(t *testing.T) {
+	s := testStack()
+	req := sip.NewRequest(sip.NOTIFY, sip.Uri{Host: "test"})
+	tx := new(mockServerTx)
+	tx.On("Respond", mock.MatchedBy(func(res *sip.Response) bool {
+		return res.StatusCode == sip.StatusOK
+	})).Return(nil).Once()
+
+	s.handleNotify(req, tx)
+	tx.AssertExpectations(t)
+}
+
 func TestStackClose(t *testing.T) {
 	ua, _ := sipgo.NewUA(sipgo.WithUserAgent("test"))
 	s := &Stack{ua: ua}

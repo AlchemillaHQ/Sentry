@@ -15,8 +15,9 @@ import (
 )
 
 const (
-	probeConfirmationDelay = 100 * time.Millisecond
-	permanentRetryDelay    = 5 * time.Minute
+	probeConfirmationDelay      = 100 * time.Millisecond
+	permanentRetryDelay         = 5 * time.Minute
+	validatedOptionsCanaryEvery = 5
 )
 
 var transientRetryDelays = [...]time.Duration{
@@ -64,17 +65,20 @@ type gatewayState struct {
 	pending []registrationTask
 	head    int
 
-	reachable      bool
-	suspect        bool
-	downSince      time.Time
-	pauseUntil     time.Time
-	probeFailures  int
-	probeValidated bool
-	probeWarned    bool
-	lastProbeAt    time.Time
-	lastProbeRTT   time.Duration
-	lastSIPAt      time.Time
-	registerRTT    time.Duration
+	reachable               bool
+	suspect                 bool
+	downSince               time.Time
+	pauseUntil              time.Time
+	probeFailures           int
+	probeValidated          bool
+	probeUnsupported        bool
+	probeWarned             bool
+	registerFailureEvidence bool
+	lastCanaryDeviceID      string
+	lastProbeAt             time.Time
+	lastProbeRTT            time.Duration
+	lastSIPAt               time.Time
+	registerRTT             time.Duration
 
 	workers chan struct{}
 	limiter *rate.Limiter
@@ -335,7 +339,21 @@ func (ur *UpstreamRegistrar) completeRegistration(gateway *gatewayState, state *
 		ur.noteGatewayOverloadLocked(gateway, outcome.retryAfter)
 	}
 	if !outcome.gatewayReachable {
+		gateway.registerFailureEvidence = true
 		ur.markGatewaySuspectLocked(gateway)
+	}
+	if !gateway.reachable {
+		// Once the shared circuit is open, keep failed in-flight accounts in the
+		// gateway queue. A single gateway probe/canary owns recovery; individual
+		// account timers must not create a retry wave behind it.
+		ur.enqueueRegistrationLocked(state)
+		ur.mu.Unlock()
+		log.Debug().
+			Err(outcome.err).
+			Str("device", state.reg.DeviceID).
+			Str("gateway", gateway.key).
+			Msg("registration attempt ended while gateway circuit was open")
+		return
 	}
 
 	delay := transientRetryDelay(state.retryAttempts)
@@ -503,12 +521,20 @@ func (ur *UpstreamRegistrar) markGatewaySuspectLocked(gateway *gatewayState) {
 }
 
 func (ur *UpstreamRegistrar) markGatewayReachableLocked(gateway *gatewayState, skipDeviceID string, now time.Time) {
-	wasImpaired := !gateway.reachable || gateway.suspect
+	wasDown := !gateway.reachable
+	wasSuspect := gateway.suspect
 	gateway.reachable = true
 	gateway.suspect = false
 	gateway.probeFailures = 0
+	gateway.registerFailureEvidence = false
 	gateway.lastSIPAt = now
-	if !wasImpaired {
+	if !wasDown {
+		if wasSuspect {
+			signal(gateway.wake)
+			log.Debug().
+				Str("gateway", gateway.key).
+				Msg("upstream gateway reachability confirmed; registration traffic resumed")
+		}
 		return
 	}
 
@@ -545,6 +571,9 @@ func (ur *UpstreamRegistrar) markGatewayDownLocked(gateway *gatewayState, now ti
 			continue
 		}
 		state.registered = false
+		if state.cancelAttempt != nil {
+			state.cancelAttempt()
+		}
 		if state.timer != nil {
 			state.timer.Stop()
 			state.timer = nil
@@ -586,14 +615,23 @@ func (ur *UpstreamRegistrar) probeGateway(gateway *gatewayState) {
 		}
 		started := time.Now()
 		probeCtx, cancel := context.WithTimeout(gateway.ctx, time.Duration(ur.cfg.ProbeTimeoutMilliseconds)*time.Millisecond)
-		response, err := ur.client.Do(probeCtx, ur.buildOptionsRequest(gateway))
+		if ur.shouldUseRegisterCanary(gateway) {
+			reg, ok := ur.nextGatewayCanary(gateway)
+			if ok {
+				outcome := ur.performRegister(probeCtx, reg, ur.cfg.ExpiresSeconds)
+				outcome.latency = time.Since(started)
+				ur.recordCanaryProbe(gateway, reg.DeviceID, outcome)
+			}
+		} else {
+			response, err := ur.client.Do(probeCtx, ur.buildOptionsRequest(gateway))
+			status := 0
+			if response != nil {
+				status = response.StatusCode
+			}
+			ur.recordOptionsProbe(gateway, response != nil, status, time.Since(started), err)
+		}
 		cancel()
 		<-ur.recovery.probeWorkers
-		status := 0
-		if response != nil {
-			status = response.StatusCode
-		}
-		ur.recordProbe(gateway, response != nil, status, time.Since(started), err)
 
 		delay, ok := ur.nextProbeDelay(gateway)
 		if !ok {
@@ -601,6 +639,56 @@ func (ur *UpstreamRegistrar) probeGateway(gateway *gatewayState) {
 		}
 		timer.Reset(delay)
 	}
+}
+
+func (ur *UpstreamRegistrar) shouldUseRegisterCanary(gateway *gatewayState) bool {
+	ur.mu.RLock()
+	defer ur.mu.RUnlock()
+	current, ok := ur.gateways[gateway.key]
+	if !ok || current != gateway || ur.closed {
+		return false
+	}
+	if gateway.probeUnsupported {
+		return true
+	}
+	// An endpoint can stop answering OPTIONS after previously supporting it.
+	// While down, periodically cross-check with one shared REGISTER canary so a
+	// method-specific policy change cannot strand the whole gateway forever.
+	return !gateway.reachable && gateway.probeFailures > 0 && gateway.probeFailures%validatedOptionsCanaryEvery == 0
+}
+
+func (ur *UpstreamRegistrar) nextGatewayCanary(gateway *gatewayState) (*UpstreamReg, bool) {
+	ur.mu.Lock()
+	defer ur.mu.Unlock()
+	current, ok := ur.gateways[gateway.key]
+	if !ok || current != gateway || ur.closed {
+		return nil, false
+	}
+
+	var selected *registrationState
+	var previous *registrationState
+	for deviceID := range gateway.members {
+		state, exists := ur.regs[deviceID]
+		if !exists || state.gateway != gateway || state.inFlight {
+			continue
+		}
+		if deviceID == gateway.lastCanaryDeviceID {
+			previous = state
+			continue
+		}
+		selected = state
+		break
+	}
+	if selected == nil {
+		selected = previous
+	}
+	if selected == nil {
+		return nil, false
+	}
+
+	gateway.lastCanaryDeviceID = selected.reg.DeviceID
+	reg := *selected.reg
+	return &reg, true
 }
 
 func (ur *UpstreamRegistrar) buildOptionsRequest(gateway *gatewayState) *sip.Request {
@@ -614,7 +702,7 @@ func (ur *UpstreamRegistrar) buildOptionsRequest(gateway *gatewayState) *sip.Req
 	return req
 }
 
-func (ur *UpstreamRegistrar) recordProbe(gateway *gatewayState, success bool, status int, rtt time.Duration, probeErr error) {
+func (ur *UpstreamRegistrar) recordOptionsProbe(gateway *gatewayState, success bool, status int, rtt time.Duration, probeErr error) {
 	now := time.Now()
 	ur.mu.Lock()
 	current, ok := ur.gateways[gateway.key]
@@ -628,6 +716,7 @@ func (ur *UpstreamRegistrar) recordProbe(gateway *gatewayState, success bool, st
 	if success {
 		gateway.probeFailures = 0
 		gateway.probeValidated = true
+		gateway.probeUnsupported = false
 		gateway.probeWarned = false
 		ur.markGatewayReachableLocked(gateway, "", now)
 		ur.mu.Unlock()
@@ -645,11 +734,18 @@ func (ur *UpstreamRegistrar) recordProbe(gateway *gatewayState, success bool, st
 		gateway.suspect = true
 		signal(gateway.wake)
 	} else if !gateway.probeValidated {
-		// Some registrars silently discard OPTIONS. Until this endpoint has
-		// answered at least one probe, keep bounded REGISTER attempts as the
-		// fallback signal instead of opening a circuit that could never recover.
+		// Some registrars silently discard OPTIONS. Switch this entire gateway to
+		// one shared REGISTER canary instead of letting every account retry or
+		// opening a circuit that OPTIONS could never close.
+		gateway.probeUnsupported = true
 		gateway.probeFailures = 0
-		gateway.suspect = false
+		if gateway.registerFailureEvidence {
+			// A real REGISTER already failed before OPTIONS capability was known.
+			// Count it as the first canary failure so one shared confirmation is
+			// enough to open the circuit.
+			gateway.probeFailures = ur.cfg.ProbeFailureThreshold - 1
+		}
+		gateway.suspect = true
 		warn := !gateway.probeWarned
 		gateway.probeWarned = true
 		signal(gateway.wake)
@@ -658,7 +754,7 @@ func (ur *UpstreamRegistrar) recordProbe(gateway *gatewayState, success bool, st
 			log.Warn().
 				Err(probeErr).
 				Str("gateway", gateway.key).
-				Msg("upstream gateway has not answered OPTIONS; using bounded registration health fallback")
+				Msg("upstream gateway has not answered OPTIONS; switching to one shared registration canary")
 		}
 		return
 	} else {
@@ -678,6 +774,68 @@ func (ur *UpstreamRegistrar) recordProbe(gateway *gatewayState, success bool, st
 			Str("gateway", gateway.key).
 			Int("failures", failures).
 			Msg("upstream gateway remains unavailable")
+	}
+}
+
+func (ur *UpstreamRegistrar) recordCanaryProbe(gateway *gatewayState, deviceID string, outcome registrationAttempt) {
+	now := time.Now()
+	ur.mu.Lock()
+	current, ok := ur.gateways[gateway.key]
+	if !ok || current != gateway || ur.closed {
+		ur.mu.Unlock()
+		return
+	}
+	gateway.lastProbeAt = now
+	gateway.lastProbeRTT = outcome.latency
+
+	if outcome.gatewayReachable {
+		wasDownWithOptions := !gateway.reachable && gateway.probeValidated && !gateway.probeUnsupported
+		gateway.probeFailures = 0
+		if wasDownWithOptions {
+			gateway.probeUnsupported = true
+		}
+		if outcome.overloaded {
+			ur.noteGatewayOverloadLocked(gateway, outcome.retryAfter)
+		}
+		ur.markGatewayReachableLocked(gateway, "", now)
+		ur.mu.Unlock()
+		if wasDownWithOptions {
+			log.Warn().
+				Str("gateway", gateway.key).
+				Msg("registration canary reached gateway while OPTIONS failed; keeping shared canary health mode")
+		}
+		log.Debug().
+			Str("gateway", gateway.key).
+			Str("device", deviceID).
+			Int("status", outcome.statusCode).
+			Dur("rtt", outcome.latency).
+			Msg("shared registration canary reached upstream gateway")
+		return
+	}
+
+	gateway.probeFailures++
+	failures := gateway.probeFailures
+	wasReachable := gateway.reachable
+	if failures < ur.cfg.ProbeFailureThreshold {
+		gateway.suspect = true
+		signal(gateway.wake)
+	} else {
+		ur.markGatewayDownLocked(gateway, now)
+	}
+	ur.mu.Unlock()
+
+	if wasReachable && failures < ur.cfg.ProbeFailureThreshold {
+		log.Warn().
+			Err(outcome.err).
+			Str("gateway", gateway.key).
+			Int("failures", failures).
+			Msg("shared registration canary failed; confirming immediately")
+	} else {
+		log.Debug().
+			Err(outcome.err).
+			Str("gateway", gateway.key).
+			Int("failures", failures).
+			Msg("shared registration canary has not reached upstream gateway")
 	}
 }
 
@@ -702,6 +860,9 @@ func (ur *UpstreamRegistrar) nextProbeDelay(gateway *gatewayState) (time.Duratio
 		default:
 			return jitter(5*base, 0.10), true
 		}
+	}
+	if gateway.probeUnsupported {
+		return jitter(time.Duration(ur.cfg.RegisterCanaryIntervalMillis)*time.Millisecond, 0.10), true
 	}
 	return jitter(time.Duration(ur.cfg.ProbeIntervalMilliseconds)*time.Millisecond, 0.10), true
 }

@@ -83,8 +83,10 @@ gateway every three seconds, confirms a failure before opening the circuit,
 and probes an unavailable gateway aggressively for recovery. It never sends a
 probe per extension, and process-wide probe limits prevent large gateway sets
 from creating an outbound traffic spike. A gateway must answer at least one
-probe before probe failures can open its circuit; gateways that silently drop
-OPTIONS retain bounded REGISTER retries as a safe fallback.
+probe before OPTIONS alone can open its circuit. Gateways that silently drop
+OPTIONS switch to one shared REGISTER canary every ten seconds; a confirmed
+outage uses the same single canary at the faster down-probe cadence. Only
+recovery from a confirmed outage fans registration back out to every account.
 
 When a gateway becomes reachable, registrations enter a bounded parallel
 queue. The queue starts at 25 registrations per second, increases toward the
@@ -97,7 +99,8 @@ and refresh around 70 percent of the lifetime negotiated by the upstream
 server.
 
 The `/health` response includes aggregate registrar counts for managed,
-healthy, and pending registrations plus suspect or unavailable gateways.
+healthy, and pending registrations plus canary-mode, suspect, or unavailable
+gateways.
 Every value is configurable under `registrar`; see `config.example.yaml`.
 
 ### Running
