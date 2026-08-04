@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
 )
 
 type MockPushSender struct{ mock.Mock }
@@ -205,6 +206,7 @@ type mockCliSess struct {
 	inviteResp func() *sip.Response
 	inviteReq  func() *sip.Request
 	do         func(ctx context.Context, req *sip.Request) (*sip.Response, error)
+	write      func(req *sip.Request) error
 }
 
 func (m *mockCliSess) WaitAnswer(ctx context.Context, opts sipgo.AnswerOptions) error {
@@ -218,6 +220,12 @@ func (m *mockCliSess) InviteResponse() *sip.Response { return m.inviteResp() }
 func (m *mockCliSess) InviteRequest() *sip.Request   { return m.inviteReq() }
 func (m *mockCliSess) Do(ctx context.Context, req *sip.Request) (*sip.Response, error) {
 	return m.do(ctx, req)
+}
+func (m *mockCliSess) WriteRequest(req *sip.Request) error {
+	if m.write != nil {
+		return m.write(req)
+	}
+	return nil
 }
 
 func TestHandleRegister_SuspendedDeviceIsRejected(t *testing.T) {
@@ -349,6 +357,200 @@ func TestHandleInvite_UnknownDevice(t *testing.T) {
 
 	cm.handleInvite(req, tx)
 	mockSrv.AssertCalled(t, "ReadInvite", mock.Anything, mock.Anything)
+}
+
+func newRefreshRequest(method sip.RequestMethod, callID string, cseq uint32, body []byte) *sip.Request {
+	req := sip.NewRequest(method, sip.Uri{User: "device", Host: "sentry.example.com"})
+	to := &sip.ToHeader{Address: sip.Uri{User: "device", Host: "sentry.example.com"}, Params: sip.NewParams()}
+	to.Params.Add("tag", "sentry-dialog-tag")
+	from := &sip.FromHeader{Address: sip.Uri{User: "caller", Host: "pbx.example.com"}, Params: sip.NewParams()}
+	from.Params.Add("tag", "pbx-dialog-tag")
+	cid := sip.CallIDHeader(callID)
+	req.AppendHeader(to)
+	req.AppendHeader(from)
+	req.AppendHeader(&cid)
+	req.AppendHeader(&sip.CSeqHeader{SeqNo: cseq, MethodName: method})
+	req.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "caller", Host: "pbx.example.com"}})
+	if len(body) > 0 {
+		req.SetBody(body)
+		req.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+	}
+	return req
+}
+
+func newRefreshClient(
+	t *testing.T,
+	downstreamBody []byte,
+	downstreamRequests chan<- *sip.Request,
+	downstreamAcks chan<- *sip.Request,
+) *mockCliSess {
+	t.Helper()
+	initialReq := sip.NewRequest(sip.INVITE, sip.Uri{User: "device", Host: "device.example.com", Port: 5061})
+	initialRes := sip.NewResponse(sip.StatusOK, "OK")
+	initialRes.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "device", Host: "device.example.com", Port: 5061}})
+	ctx := context.Background()
+	return &mockCliSess{
+		ctx:        func() context.Context { return ctx },
+		inviteReq:  func() *sip.Request { return initialReq },
+		inviteResp: func() *sip.Response { return initialRes },
+		do: func(_ context.Context, req *sip.Request) (*sip.Response, error) {
+			downstreamRequests <- req
+			res := sip.NewResponse(sip.StatusOK, "OK")
+			res.SetBody(downstreamBody)
+			res.AppendHeader(sip.NewHeader("Content-Type", "application/sdp"))
+			res.AppendHeader(&sip.ContactHeader{Address: sip.Uri{User: "device", Host: "device.example.com", Port: 5061}})
+			return res, nil
+		},
+		write: func(req *sip.Request) error {
+			downstreamAcks <- req
+			return nil
+		},
+	}
+}
+
+func refreshFinished(pc *pendingCall) bool {
+	pc.refreshMu.Lock()
+	defer pc.refreshMu.Unlock()
+	return pc.refresh == nil
+}
+
+func TestHandleInvite_ReInviteBridgesSDPOfferAndRoutesAck(t *testing.T) {
+	downstreamRequests := make(chan *sip.Request, 1)
+	downstreamAcks := make(chan *sip.Request, 1)
+	client := newRefreshClient(t, []byte("device-answer"), downstreamRequests, downstreamAcks)
+	callCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pc := &pendingCall{
+		callID:         "pbx-call-id",
+		sipUser:        "device_shadow",
+		clientDlg:      client,
+		ctx:            callCtx,
+		cancel:         cancel,
+		sessionExpires: "120;refresher=uac",
+	}
+	mockSrv := new(mockDialogSrv)
+	cm := &CallManager{pending: map[string]*pendingCall{"internal": pc}, dialogSrv: mockSrv}
+
+	req := newRefreshRequest(sip.INVITE, pc.callID, 42, []byte("pbx-offer"))
+	req.AppendHeader(sip.NewHeader("Session-Expires", "120;refresher=uas"))
+	responses := make(chan *sip.Response, 2)
+	tx := new(mockServerTx)
+	tx.On("Respond", mock.Anything).Run(func(args mock.Arguments) {
+		responses <- args.Get(0).(*sip.Response)
+	}).Return(nil)
+
+	cm.handleInvite(req, tx)
+
+	trying := <-responses
+	final := <-responses
+	require.Equal(t, sip.StatusTrying, trying.StatusCode)
+	require.Equal(t, sip.StatusOK, final.StatusCode)
+	require.Equal(t, []byte("device-answer"), final.Body())
+	require.Equal(t, "120;refresher=uac", final.GetHeader("Session-Expires").Value())
+	toTag, ok := final.To().Params.Get("tag")
+	require.True(t, ok)
+	require.Equal(t, "sentry-dialog-tag", toTag)
+
+	downstreamReq := <-downstreamRequests
+	require.Equal(t, sip.INVITE, downstreamReq.Method)
+	require.Equal(t, []byte("pbx-offer"), downstreamReq.Body())
+	downstreamAck := <-downstreamAcks
+	require.Equal(t, sip.ACK, downstreamAck.Method)
+	require.Empty(t, downstreamAck.Body())
+
+	ack := newRefreshRequest(sip.ACK, pc.callID, 42, nil)
+	cm.handleAck(ack, new(mockServerTx))
+	require.Eventually(t, func() bool { return refreshFinished(pc) }, time.Second, 10*time.Millisecond)
+	mockSrv.AssertNotCalled(t, "ReadInvite", mock.Anything, mock.Anything)
+	mockSrv.AssertNotCalled(t, "ReadAck", mock.Anything, mock.Anything)
+}
+
+func TestHandleInvite_OfferlessReInviteForwardsAckAnswer(t *testing.T) {
+	downstreamRequests := make(chan *sip.Request, 1)
+	downstreamAcks := make(chan *sip.Request, 1)
+	client := newRefreshClient(t, []byte("device-offer"), downstreamRequests, downstreamAcks)
+	callCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pc := &pendingCall{callID: "offerless-call", sipUser: "device_shadow", clientDlg: client, ctx: callCtx, cancel: cancel}
+	cm := &CallManager{pending: map[string]*pendingCall{"internal": pc}, dialogSrv: new(mockDialogSrv)}
+
+	req := newRefreshRequest(sip.INVITE, pc.callID, 9, nil)
+	responses := make(chan *sip.Response, 2)
+	tx := new(mockServerTx)
+	tx.On("Respond", mock.Anything).Run(func(args mock.Arguments) {
+		responses <- args.Get(0).(*sip.Response)
+	}).Return(nil)
+
+	cm.handleInvite(req, tx)
+	<-responses // 100 Trying
+	final := <-responses
+	require.Equal(t, sip.StatusOK, final.StatusCode)
+	require.Equal(t, []byte("device-offer"), final.Body())
+	downstreamReq := <-downstreamRequests
+	require.Empty(t, downstreamReq.Body())
+	select {
+	case <-downstreamAcks:
+		t.Fatal("device ACK was sent before the PBX supplied its SDP answer")
+	default:
+	}
+
+	ack := newRefreshRequest(sip.ACK, pc.callID, 9, []byte("pbx-answer"))
+	cm.handleAck(ack, new(mockServerTx))
+	downstreamAck := <-downstreamAcks
+	require.Equal(t, sip.ACK, downstreamAck.Method)
+	require.Equal(t, []byte("pbx-answer"), downstreamAck.Body())
+	require.Eventually(t, func() bool { return refreshFinished(pc) }, time.Second, 10*time.Millisecond)
+}
+
+func TestHandleInvite_ReInviteUnknownDialogReturns481(t *testing.T) {
+	mockSrv := new(mockDialogSrv)
+	cm := &CallManager{pending: make(map[string]*pendingCall), dialogSrv: mockSrv}
+	req := newRefreshRequest(sip.INVITE, "missing-call", 2, []byte("v=0"))
+	responses := make(chan *sip.Response, 1)
+	tx := new(mockServerTx)
+	tx.On("Respond", mock.Anything).Run(func(args mock.Arguments) {
+		responses <- args.Get(0).(*sip.Response)
+	}).Return(nil)
+
+	cm.handleInvite(req, tx)
+
+	res := <-responses
+	require.Equal(t, sip.StatusCallTransactionDoesNotExists, res.StatusCode)
+	mockSrv.AssertNotCalled(t, "ReadInvite", mock.Anything, mock.Anything)
+}
+
+func TestHandleUpdate_SessionRefreshIsTerminatedLocally(t *testing.T) {
+	downstreamRequests := make(chan *sip.Request, 1)
+	downstreamAcks := make(chan *sip.Request, 1)
+	client := newRefreshClient(t, []byte("unused"), downstreamRequests, downstreamAcks)
+	callCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pc := &pendingCall{callID: "update-call", sipUser: "device_shadow", clientDlg: client, ctx: callCtx, cancel: cancel}
+	cm := &CallManager{pending: map[string]*pendingCall{"internal": pc}}
+	req := newRefreshRequest(sip.UPDATE, pc.callID, 5, nil)
+	req.AppendHeader(sip.NewHeader("Session-Expires", "120;refresher=uas"))
+	responses := make(chan *sip.Response, 1)
+	tx := new(mockServerTx)
+	tx.On("Respond", mock.Anything).Run(func(args mock.Arguments) {
+		responses <- args.Get(0).(*sip.Response)
+	}).Return(nil)
+
+	cm.handleUpdate(req, tx)
+
+	res := <-responses
+	require.Equal(t, sip.StatusOK, res.StatusCode)
+	require.Equal(t, "120;refresher=uac", res.GetHeader("Session-Expires").Value())
+	select {
+	case <-downstreamRequests:
+		t.Fatal("timer-only UPDATE should not be forwarded to the independent device dialog")
+	default:
+	}
+}
+
+func TestNormalizedSessionExpiresForcesPBXRefresh(t *testing.T) {
+	req := newRefreshRequest(sip.INVITE, "session-call", 2, nil)
+	req.AppendHeader(sip.NewHeader("Session-Expires", "180;foo=bar;refresher=uas"))
+	require.Equal(t, "180;foo=bar;refresher=uac", normalizedSessionExpires(req))
 }
 
 func TestRelayCall_NoDeviceSource(t *testing.T) {

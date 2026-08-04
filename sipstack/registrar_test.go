@@ -190,6 +190,14 @@ func TestSetOnCancel(t *testing.T) {
 	assert.True(t, called)
 }
 
+func TestSetOnUpdate(t *testing.T) {
+	s := &Stack{cfg: config.SIPConfig{ExternalIP: "10.0.0.1", ExternalSIPPort: 5060}}
+	called := false
+	s.SetOnUpdate(func(req *sip.Request, tx sip.ServerTransaction) { called = true })
+	s.onUpdate(nil, nil)
+	assert.True(t, called)
+}
+
 type mockServerTx struct {
 	mock.Mock
 }
@@ -246,6 +254,27 @@ func TestHandleInvite_NoCallback(t *testing.T) {
 	tx.On("Respond", mock.Anything).Return(nil)
 	s.handleInvite(req, tx)
 	tx.AssertCalled(t, "Respond", mock.Anything)
+}
+
+func TestHandleUpdate_WithCallback(t *testing.T) {
+	s := testStack()
+	var received *sip.Request
+	s.onUpdate = func(req *sip.Request, tx sip.ServerTransaction) { received = req }
+	req := sip.NewRequest(sip.UPDATE, sip.Uri{Host: "test"})
+	tx := new(mockServerTx)
+	s.handleUpdate(req, tx)
+	assert.Same(t, req, received)
+}
+
+func TestHandleUpdate_NoCallback(t *testing.T) {
+	s := testStack()
+	req := sip.NewRequest(sip.UPDATE, sip.Uri{Host: "test"})
+	tx := new(mockServerTx)
+	tx.On("Respond", mock.MatchedBy(func(res *sip.Response) bool {
+		return res.StatusCode == sip.StatusMethodNotAllowed
+	})).Return(nil)
+	s.handleUpdate(req, tx)
+	tx.AssertExpectations(t)
 }
 
 func TestHandleAck_WithCallback(t *testing.T) {

@@ -30,6 +30,7 @@ type Stack struct {
 	onAck      func(req *sip.Request, tx sip.ServerTransaction)
 	onBye      func(req *sip.Request, tx sip.ServerTransaction)
 	onCancel   func(req *sip.Request, tx sip.ServerTransaction)
+	onUpdate   func(req *sip.Request, tx sip.ServerTransaction)
 }
 
 var (
@@ -105,6 +106,7 @@ func New(cfg config.SIPConfig) (*Stack, error) {
 	server.OnCancel(s.handleCancel)
 	server.OnOptions(s.handleOptions)
 	server.OnNotify(s.handleNotify)
+	server.OnUpdate(s.handleUpdate)
 
 	return s, nil
 }
@@ -137,6 +139,12 @@ func (s *Stack) SetOnCancel(fn func(req *sip.Request, tx sip.ServerTransaction))
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.onCancel = fn
+}
+
+func (s *Stack) SetOnUpdate(fn func(req *sip.Request, tx sip.ServerTransaction)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onUpdate = fn
 }
 
 func (s *Stack) Client() *sipgo.Client        { return s.client }
@@ -197,6 +205,18 @@ func (s *Stack) handleCancel(req *sip.Request, tx sip.ServerTransaction) {
 	s.mu.RUnlock()
 	if fn != nil {
 		fn(req, tx)
+	}
+}
+
+func (s *Stack) handleUpdate(req *sip.Request, tx sip.ServerTransaction) {
+	s.mu.RLock()
+	fn := s.onUpdate
+	s.mu.RUnlock()
+	if fn != nil {
+		fn(req, tx)
+	} else {
+		res := sip.NewResponseFromRequest(req, sip.StatusMethodNotAllowed, "Method Not Allowed", nil)
+		tx.Respond(res)
 	}
 }
 

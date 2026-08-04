@@ -23,10 +23,14 @@ import (
 )
 
 var callTimeout = 30 * time.Second
+var reInviteTimeout = 10 * time.Second
+var refreshAckTimeout = 64 * sip.T1
+var refreshRetransmitInterval = sip.T1
 var errAmbiguousDevice = errors.New("multiple enabled devices match upstream user")
 
 const maxRejectsBeforeBan = 10
 const banDuration = 24 * time.Hour
+const dialogAllowMethods = "INVITE, ACK, CANCEL, OPTIONS, BYE, REFER, NOTIFY, MESSAGE, SUBSCRIBE, INFO, UPDATE"
 
 type serverSession interface {
 	Respond(statusCode int, reason string, body []byte, headers ...sip.Header) error
@@ -44,6 +48,7 @@ type clientSession interface {
 	InviteResponse() *sip.Response
 	InviteRequest() *sip.Request
 	Do(ctx context.Context, req *sip.Request) (*sip.Response, error)
+	WriteRequest(req *sip.Request) error
 }
 
 type clientSessionWrapper struct {
@@ -59,22 +64,32 @@ func (w *clientSessionWrapper) InviteRequest() *sip.Request {
 }
 
 type pendingCall struct {
-	id          string
-	deviceID    string
-	sipUser     string
-	callID      string
-	callerURI   string
-	callerName  string
-	callerUser  string
-	callerHost  string
-	sdpOffer    []byte
-	serverDlg   serverSession
-	clientDlg   clientSession
-	clientDlgMu sync.Mutex
-	readyCh     chan struct{}
-	readyOnce   sync.Once
-	ctx         context.Context
-	cancel      context.CancelFunc
+	id             string
+	deviceID       string
+	sipUser        string
+	callID         string
+	callerURI      string
+	callerName     string
+	callerUser     string
+	callerHost     string
+	sdpOffer       []byte
+	serverDlg      serverSession
+	clientDlg      clientSession
+	clientDlgMu    sync.Mutex
+	refresh        *pendingRefresh
+	refreshMu      sync.Mutex
+	readyCh        chan struct{}
+	readyOnce      sync.Once
+	ctx            context.Context
+	cancel         context.CancelFunc
+	sessionExpires string
+}
+
+type pendingRefresh struct {
+	cseq          uint32
+	ackCh         chan struct{}
+	ackOnce       sync.Once
+	downstreamAck func(body []byte, contentType sip.Header) error
 }
 
 type dialogServerReader interface {
@@ -188,6 +203,7 @@ func New(database *db.Database, stack *sipstack.Stack, registrar sipstack.Regist
 	stack.SetOnAck(cm.handleAck)
 	stack.SetOnBye(cm.handleBye)
 	stack.SetOnCancel(cm.handleCancel)
+	stack.SetOnUpdate(cm.handleUpdate)
 
 	go cm.cleanupRejectThrottle()
 
@@ -402,16 +418,20 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 		Str("call_id", req.CallID().Value()).
 		Msg("INVITE received")
 
+	// A tagged INVITE belongs to an existing dialog. Passing it through
+	// DialogServerCache.ReadInvite would create a second dialog with a new To
+	// tag and replace the original cache entry. In addition to producing an
+	// invalid offer/answer response, that leaves the bridged call detached from
+	// its original dialog. Handle the refresh against the active bridge instead.
+	if toHdr.Params.Has("tag") {
+		cm.handleReInvite(req, tx)
+		return
+	}
+
 	dlg, err := cm.dialogSrv.ReadInvite(req, tx)
 	if err != nil {
 		log.Error().Err(err).Msg("failed to read invite into dialog")
 		tx.Respond(sip.NewResponseFromRequest(req, 500, "Server Error", nil))
-		return
-	}
-
-	if toHdr.Params.Has("tag") {
-		log.Info().Str("call_id", req.CallID().Value()).Msg("in-dialog INVITE (re-INVITE) received")
-		dlg.Respond(sip.StatusOK, "OK", nil)
 		return
 	}
 
@@ -457,19 +477,20 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 	defer timeoutCancel()
 
 	pc := &pendingCall{
-		id:         callID,
-		deviceID:   device.DeviceID,
-		sipUser:    device.B2buaSipUser,
-		callID:     req.CallID().Value(),
-		callerURI:  callerURI,
-		callerName: callerName,
-		callerUser: callerUser,
-		callerHost: callerHost,
-		sdpOffer:   req.Body(),
-		serverDlg:  dlg,
-		readyCh:    make(chan struct{}),
-		ctx:        callCtx,
-		cancel:     callCancel,
+		id:             callID,
+		deviceID:       device.DeviceID,
+		sipUser:        device.B2buaSipUser,
+		callID:         req.CallID().Value(),
+		callerURI:      callerURI,
+		callerName:     callerName,
+		callerUser:     callerUser,
+		callerHost:     callerHost,
+		sdpOffer:       req.Body(),
+		serverDlg:      dlg,
+		readyCh:        make(chan struct{}),
+		ctx:            callCtx,
+		cancel:         callCancel,
+		sessionExpires: normalizedSessionExpires(req),
 	}
 
 	cm.mu.Lock()
@@ -608,6 +629,502 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 	}
 }
 
+func (cm *CallManager) handleReInvite(req *sip.Request, tx sip.ServerTransaction) {
+	callID := requestCallID(req)
+	cseq := req.CSeq()
+	if callID == "" || cseq == nil {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil))
+		return
+	}
+
+	pc := cm.pendingBySIPCallID(callID)
+	if pc == nil {
+		log.Warn().Str("call_id", callID).Msg("re-INVITE rejected: active bridge not found")
+		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil))
+		return
+	}
+
+	dlg := activeClientDialog(pc)
+	if dlg == nil {
+		log.Warn().Str("call_id", callID).Msg("re-INVITE deferred: device dialog is not ready")
+		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
+		return
+	}
+
+	refresh, ok := pc.beginRefresh(cseq.SeqNo)
+	if !ok {
+		log.Warn().Str("call_id", callID).Msg("re-INVITE rejected: another dialog refresh is in progress")
+		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
+		return
+	}
+	waitingForAck := false
+	defer func() {
+		if !waitingForAck {
+			pc.finishRefresh(refresh)
+		}
+	}()
+
+	log.Info().
+		Str("call_id", callID).
+		Uint32("cseq", cseq.SeqNo).
+		Int("sdp_len", len(req.Body())).
+		Msg("bridging in-dialog re-INVITE to device")
+
+	if err := tx.Respond(sip.NewResponseFromRequest(req, sip.StatusTrying, "Trying", nil)); err != nil {
+		log.Error().Err(err).Str("call_id", callID).Msg("failed to acknowledge re-INVITE")
+		return
+	}
+
+	ctx := pc.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	refreshCtx, cancel := context.WithTimeout(ctx, reInviteTimeout)
+	defer cancel()
+
+	downstreamReq := newInDialogRequest(sip.INVITE, dlg, req.Body(), requestContentType(req))
+	downstreamRes, err := dlg.Do(refreshCtx, downstreamReq)
+	if err != nil {
+		log.Error().Err(err).Str("call_id", callID).Msg("device re-INVITE failed")
+		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusGatewayTimeout, "Server Time-out", nil))
+		return
+	}
+	if downstreamRes == nil {
+		log.Error().Str("call_id", callID).Msg("device re-INVITE returned no response")
+		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusGatewayTimeout, "Server Time-out", nil))
+		return
+	}
+
+	if !downstreamRes.IsSuccess() {
+		res := cm.newUpstreamDialogResponse(
+			req,
+			downstreamRes.StatusCode,
+			downstreamRes.Reason,
+			downstreamRes.Body(),
+			responseContentType(downstreamRes),
+			pc,
+		)
+		if err := tx.Respond(res); err != nil {
+			log.Error().Err(err).Str("call_id", callID).Msg("failed to relay rejected device re-INVITE")
+		}
+		return
+	}
+
+	if len(downstreamRes.Body()) == 0 {
+		// A successful response to either an SDP offer or an offerless INVITE
+		// must contain SDP. ACK the downstream transaction so it does not linger,
+		// but reject the invalid negotiation on the upstream leg.
+		_ = writeDialogAck(dlg, downstreamRes, nil, nil)
+		log.Error().Str("call_id", callID).Msg("device returned re-INVITE success without SDP")
+		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusNotAcceptableHere, "Not Acceptable Here", nil))
+		return
+	}
+
+	if len(req.Body()) > 0 {
+		// The PBX supplied the offer, so the device response is the answer and
+		// the downstream ACK has no SDP body.
+		if err := writeDialogAck(dlg, downstreamRes, nil, nil); err != nil {
+			log.Error().Err(err).Str("call_id", callID).Msg("failed to ACK device re-INVITE")
+			_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusGatewayTimeout, "Server Time-out", nil))
+			return
+		}
+	} else {
+		// For an offerless re-INVITE the device's 2xx carries the offer. The
+		// PBX answer arrives in its ACK and must be forwarded in the device ACK.
+		pc.setRefreshDownstreamAck(refresh, func(body []byte, contentType sip.Header) error {
+			if len(body) == 0 {
+				_ = writeDialogAck(dlg, downstreamRes, nil, nil)
+				return errors.New("PBX refresh ACK did not contain an SDP answer")
+			}
+			return writeDialogAck(dlg, downstreamRes, body, contentType)
+		})
+	}
+
+	res := cm.newUpstreamDialogResponse(
+		req,
+		downstreamRes.StatusCode,
+		downstreamRes.Reason,
+		downstreamRes.Body(),
+		responseContentType(downstreamRes),
+		pc,
+	)
+	if err := tx.Respond(res); err != nil {
+		log.Error().Err(err).Str("call_id", callID).Msg("failed to answer upstream re-INVITE")
+		return
+	}
+
+	waitingForAck = true
+	go cm.waitForRefreshAck(pc, refresh, tx, res)
+	log.Info().
+		Str("call_id", callID).
+		Uint32("cseq", cseq.SeqNo).
+		Int("sdp_len", len(downstreamRes.Body())).
+		Msg("re-INVITE bridged; waiting for PBX ACK")
+}
+
+func (cm *CallManager) handleUpdate(req *sip.Request, tx sip.ServerTransaction) {
+	callID := requestCallID(req)
+	cseq := req.CSeq()
+	if callID == "" || cseq == nil {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusBadRequest, "Bad Request", nil))
+		return
+	}
+
+	pc := cm.pendingBySIPCallID(callID)
+	if pc == nil {
+		log.Warn().Str("call_id", callID).Msg("UPDATE rejected: active bridge not found")
+		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil))
+		return
+	}
+
+	dlg := activeClientDialog(pc)
+	if dlg == nil {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
+		return
+	}
+
+	// An UPDATE without SDP only refreshes the upstream B2BUA leg. The device
+	// leg has an independent dialog and does not need another transaction.
+	if len(req.Body()) == 0 {
+		res := cm.newUpstreamDialogResponse(req, sip.StatusOK, "OK", nil, nil, pc)
+		if err := tx.Respond(res); err != nil {
+			log.Error().Err(err).Str("call_id", callID).Msg("failed to answer session refresh UPDATE")
+			return
+		}
+		log.Info().Str("call_id", callID).Uint32("cseq", cseq.SeqNo).Msg("session refresh UPDATE accepted")
+		return
+	}
+
+	refresh, ok := pc.beginRefresh(cseq.SeqNo)
+	if !ok {
+		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusRequestPending, "Request Pending", nil))
+		return
+	}
+	defer pc.finishRefresh(refresh)
+
+	ctx := pc.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	updateCtx, cancel := context.WithTimeout(ctx, reInviteTimeout)
+	defer cancel()
+
+	downstreamReq := newInDialogRequest(sip.UPDATE, dlg, req.Body(), requestContentType(req))
+	downstreamRes, err := dlg.Do(updateCtx, downstreamReq)
+	if err != nil {
+		log.Error().Err(err).Str("call_id", callID).Msg("device UPDATE failed")
+		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusGatewayTimeout, "Server Time-out", nil))
+		return
+	}
+	if downstreamRes == nil {
+		log.Error().Str("call_id", callID).Msg("device UPDATE returned no response")
+		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusGatewayTimeout, "Server Time-out", nil))
+		return
+	}
+	if downstreamRes.IsSuccess() && len(downstreamRes.Body()) == 0 {
+		log.Error().Str("call_id", callID).Msg("device returned UPDATE success without an SDP answer")
+		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusNotAcceptableHere, "Not Acceptable Here", nil))
+		return
+	}
+
+	res := cm.newUpstreamDialogResponse(
+		req,
+		downstreamRes.StatusCode,
+		downstreamRes.Reason,
+		downstreamRes.Body(),
+		responseContentType(downstreamRes),
+		pc,
+	)
+	if err := tx.Respond(res); err != nil {
+		log.Error().Err(err).Str("call_id", callID).Msg("failed to relay device UPDATE response")
+		return
+	}
+	log.Info().
+		Str("call_id", callID).
+		Uint32("cseq", cseq.SeqNo).
+		Int("sdp_len", len(downstreamRes.Body())).
+		Msg("UPDATE bridged to device")
+}
+
+func (cm *CallManager) pendingBySIPCallID(callID string) *pendingCall {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	for _, pc := range cm.pending {
+		if pc.callID == callID {
+			return pc
+		}
+	}
+	return nil
+}
+
+func activeClientDialog(pc *pendingCall) clientSession {
+	pc.clientDlgMu.Lock()
+	defer pc.clientDlgMu.Unlock()
+	return pc.clientDlg
+}
+
+func (pc *pendingCall) beginRefresh(cseq uint32) (*pendingRefresh, bool) {
+	pc.refreshMu.Lock()
+	defer pc.refreshMu.Unlock()
+	if pc.refresh != nil {
+		return nil, false
+	}
+	refresh := &pendingRefresh{cseq: cseq, ackCh: make(chan struct{})}
+	pc.refresh = refresh
+	return refresh, true
+}
+
+func (pc *pendingCall) finishRefresh(refresh *pendingRefresh) {
+	pc.refreshMu.Lock()
+	if pc.refresh == refresh {
+		pc.refresh = nil
+	}
+	pc.refreshMu.Unlock()
+}
+
+func (pc *pendingCall) setRefreshDownstreamAck(
+	refresh *pendingRefresh,
+	ack func(body []byte, contentType sip.Header) error,
+) {
+	pc.refreshMu.Lock()
+	if pc.refresh == refresh {
+		refresh.downstreamAck = ack
+	}
+	pc.refreshMu.Unlock()
+}
+
+func (cm *CallManager) waitForRefreshAck(
+	pc *pendingCall,
+	refresh *pendingRefresh,
+	tx sip.ServerTransaction,
+	res *sip.Response,
+) {
+	defer pc.finishRefresh(refresh)
+
+	interval := refreshRetransmitInterval
+	if interval <= 0 {
+		interval = sip.T1
+	}
+	retransmit := time.NewTimer(interval)
+	deadline := time.NewTimer(refreshAckTimeout)
+	defer retransmit.Stop()
+	defer deadline.Stop()
+
+	ctx := pc.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	for {
+		select {
+		case <-refresh.ackCh:
+			log.Info().Str("call_id", pc.callID).Uint32("cseq", refresh.cseq).Msg("re-INVITE ACK received from PBX")
+			return
+		case <-ctx.Done():
+			return
+		case <-tx.Done():
+			log.Warn().Str("call_id", pc.callID).Uint32("cseq", refresh.cseq).Msg("re-INVITE transaction ended before PBX ACK")
+			return
+		case <-deadline.C:
+			log.Warn().Str("call_id", pc.callID).Uint32("cseq", refresh.cseq).Msg("timed out waiting for PBX re-INVITE ACK")
+			return
+		case <-retransmit.C:
+			if err := tx.Respond(res.Clone()); err != nil {
+				log.Warn().Err(err).Str("call_id", pc.callID).Uint32("cseq", refresh.cseq).Msg("failed to retransmit re-INVITE response")
+				return
+			}
+			interval = min(2*interval, sip.T2)
+			retransmit.Reset(interval)
+		}
+	}
+}
+
+func (cm *CallManager) handleRefreshAck(req *sip.Request) bool {
+	callID := requestCallID(req)
+	cseq := req.CSeq()
+	if callID == "" || cseq == nil {
+		return false
+	}
+
+	pc := cm.pendingBySIPCallID(callID)
+	if pc == nil {
+		return false
+	}
+	pc.refreshMu.Lock()
+	refresh := pc.refresh
+	matched := refresh != nil && refresh.cseq == cseq.SeqNo
+	var downstreamAck func(body []byte, contentType sip.Header) error
+	if matched {
+		downstreamAck = refresh.downstreamAck
+	}
+	pc.refreshMu.Unlock()
+	if !matched {
+		return false
+	}
+
+	var ackErr error
+	refresh.ackOnce.Do(func() {
+		if downstreamAck != nil {
+			ackErr = downstreamAck(req.Body(), requestContentType(req))
+		}
+		close(refresh.ackCh)
+	})
+	if ackErr != nil {
+		log.Error().Err(ackErr).Str("call_id", callID).Uint32("cseq", cseq.SeqNo).Msg("failed to complete offerless re-INVITE")
+		if pc.cancel != nil {
+			pc.cancel()
+		}
+	}
+	return true
+}
+
+func newInDialogRequest(method sip.RequestMethod, dlg clientSession, body []byte, contentType sip.Header) *sip.Request {
+	req := sip.NewRequest(method, dialogRemoteTarget(dlg, nil))
+	if len(body) > 0 {
+		req.SetBody(append([]byte(nil), body...))
+		if contentType == nil {
+			contentType = sip.NewHeader("Content-Type", "application/sdp")
+		}
+		req.AppendHeader(sip.NewHeader("Content-Type", contentType.Value()))
+	}
+	return req
+}
+
+func writeDialogAck(dlg clientSession, response *sip.Response, body []byte, contentType sip.Header) error {
+	ack := sip.NewRequest(sip.ACK, dialogRemoteTarget(dlg, response))
+	if len(body) > 0 {
+		ack.SetBody(append([]byte(nil), body...))
+		if contentType == nil {
+			contentType = sip.NewHeader("Content-Type", "application/sdp")
+		}
+		ack.AppendHeader(sip.NewHeader("Content-Type", contentType.Value()))
+	}
+	return dlg.WriteRequest(ack)
+}
+
+func dialogRemoteTarget(dlg clientSession, response *sip.Response) sip.Uri {
+	if response != nil {
+		if contact := response.Contact(); contact != nil {
+			return contact.Address
+		}
+	}
+	if inviteResponse := dlg.InviteResponse(); inviteResponse != nil {
+		if contact := inviteResponse.Contact(); contact != nil {
+			return contact.Address
+		}
+	}
+	if inviteRequest := dlg.InviteRequest(); inviteRequest != nil {
+		return inviteRequest.Recipient
+	}
+	return sip.Uri{}
+}
+
+func requestCallID(req *sip.Request) string {
+	if req == nil || req.CallID() == nil {
+		return ""
+	}
+	return req.CallID().Value()
+}
+
+func requestContentType(req *sip.Request) sip.Header {
+	if req == nil {
+		return nil
+	}
+	if header := req.GetHeader("Content-Type"); header != nil {
+		return sip.NewHeader("Content-Type", header.Value())
+	}
+	return nil
+}
+
+func responseContentType(res *sip.Response) sip.Header {
+	if res == nil {
+		return nil
+	}
+	if header := res.GetHeader("Content-Type"); header != nil {
+		return sip.NewHeader("Content-Type", header.Value())
+	}
+	return nil
+}
+
+func normalizedSessionExpires(req *sip.Request) string {
+	if req == nil {
+		return ""
+	}
+	header := req.GetHeader("Session-Expires")
+	if header == nil {
+		return ""
+	}
+	parts := strings.Split(header.Value(), ";")
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+		return ""
+	}
+
+	normalized := []string{strings.TrimSpace(parts[0])}
+	for _, part := range parts[1:] {
+		part = strings.TrimSpace(part)
+		if part == "" || strings.HasPrefix(strings.ToLower(part), "refresher=") {
+			continue
+		}
+		normalized = append(normalized, part)
+	}
+	// Sentry terminates the upstream timer leg, so keep the PBX (the UAC for
+	// this transaction) responsible for sending refreshes.
+	normalized = append(normalized, "refresher=uac")
+	return strings.Join(normalized, ";")
+}
+
+func (cm *CallManager) newUpstreamDialogResponse(
+	req *sip.Request,
+	statusCode int,
+	reason string,
+	body []byte,
+	contentType sip.Header,
+	pc *pendingCall,
+) *sip.Response {
+	res := sip.NewResponseFromRequest(req, statusCode, reason, body)
+	if len(body) > 0 {
+		if contentType == nil {
+			contentType = sip.NewHeader("Content-Type", "application/sdp")
+		}
+		res.AppendHeader(sip.NewHeader("Content-Type", contentType.Value()))
+	}
+	if statusCode < 200 || statusCode >= 300 {
+		return res
+	}
+
+	if contact := cm.upstreamContactHeader(pc.sipUser); contact != nil {
+		res.AppendHeader(contact)
+	}
+	res.AppendHeader(sip.NewHeader("Allow", dialogAllowMethods))
+	res.AppendHeader(sip.NewHeader("Supported", "timer"))
+	sessionExpires := normalizedSessionExpires(req)
+	if sessionExpires == "" {
+		sessionExpires = pc.sessionExpires
+	}
+	if sessionExpires != "" {
+		res.AppendHeader(sip.NewHeader("Session-Expires", sessionExpires))
+	}
+	return res
+}
+
+func (cm *CallManager) upstreamContactHeader(sipUser string) *sip.ContactHeader {
+	if cm.stack == nil {
+		return nil
+	}
+	contact := &sip.ContactHeader{
+		Address: sip.Uri{
+			User: sipUser,
+			Host: cm.stack.ExternalIP(),
+			Port: cm.stack.ExternalSIPPort(),
+		},
+	}
+	if transport := cm.stack.ExternalSIPTransport(); transport != "" && transport != "udp" {
+		contact.Address.UriParams = sip.NewParams()
+		contact.Address.UriParams.Add("transport", transport)
+	}
+	return contact
+}
+
 func (cm *CallManager) relayCall(ctx context.Context, pc *pendingCall, device *db.Device) {
 	cm.mu.RLock()
 	srcUri, ok := cm.deviceSource[pc.sipUser]
@@ -704,22 +1221,20 @@ func (cm *CallManager) relayCall(ctx context.Context, pc *pendingCall, device *d
 	deviceSDP := inviteResponse.Body()
 	log.Info().Str("call_id", pc.id).Int("sdp_len", len(deviceSDP)).Msg("sending 200 OK to PBX")
 
-	contactHdr := &sip.ContactHeader{
-		Address: sip.Uri{
-			User: device.B2buaSipUser,
-			Host: cm.stack.ExternalIP(),
-			Port: cm.stack.ExternalSIPPort(),
-		},
-	}
-	if cm.stack.ExternalSIPTransport() != "" && cm.stack.ExternalSIPTransport() != "udp" {
-		contactHdr.Address.UriParams = sip.NewParams()
-		contactHdr.Address.UriParams.Add("transport", cm.stack.ExternalSIPTransport())
-	}
-
 	contentTypeHdr := sip.NewHeader("Content-Type", "application/sdp")
-	allowHdr := sip.NewHeader("Allow", "INVITE, ACK, CANCEL, OPTIONS, BYE, REFER, NOTIFY, MESSAGE, SUBSCRIBE, INFO, UPDATE")
+	headers := []sip.Header{
+		contentTypeHdr,
+		sip.NewHeader("Allow", dialogAllowMethods),
+		sip.NewHeader("Supported", "timer"),
+	}
+	if contactHdr := cm.upstreamContactHeader(device.B2buaSipUser); contactHdr != nil {
+		headers = append(headers, contactHdr)
+	}
+	if pc.sessionExpires != "" {
+		headers = append(headers, sip.NewHeader("Session-Expires", pc.sessionExpires))
+	}
 
-	if err := pc.serverDlg.Respond(sip.StatusOK, "OK", deviceSDP, contactHdr, contentTypeHdr, allowHdr); err != nil {
+	if err := pc.serverDlg.Respond(sip.StatusOK, "OK", deviceSDP, headers...); err != nil {
 		log.Error().Err(err).Str("call_id", pc.id).Msg("failed to send 200 OK to PBX")
 		pc.serverDlg.Close()
 		return
@@ -748,6 +1263,9 @@ func (cm *CallManager) relayCall(ctx context.Context, pc *pendingCall, device *d
 }
 
 func (cm *CallManager) handleAck(req *sip.Request, tx sip.ServerTransaction) {
+	if cm.handleRefreshAck(req) {
+		return
+	}
 	err := cm.dialogSrv.ReadAck(req, tx)
 	if err != nil {
 		log.Error().Err(err).Str("call_id", req.CallID().Value()).Msg("failed to read ACK into dialog")
