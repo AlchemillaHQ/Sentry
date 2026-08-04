@@ -31,6 +31,9 @@ type Stack struct {
 	onBye      func(req *sip.Request, tx sip.ServerTransaction)
 	onCancel   func(req *sip.Request, tx sip.ServerTransaction)
 	onUpdate   func(req *sip.Request, tx sip.ServerTransaction)
+	onInfo     func(req *sip.Request, tx sip.ServerTransaction)
+	onRefer    func(req *sip.Request, tx sip.ServerTransaction)
+	onNotify   func(req *sip.Request, tx sip.ServerTransaction)
 }
 
 var (
@@ -107,6 +110,9 @@ func New(cfg config.SIPConfig) (*Stack, error) {
 	server.OnOptions(s.handleOptions)
 	server.OnNotify(s.handleNotify)
 	server.OnUpdate(s.handleUpdate)
+	server.OnInfo(s.handleInfo)
+	server.OnRefer(s.handleRefer)
+	server.OnPrack(s.handlePrack)
 
 	return s, nil
 }
@@ -145,6 +151,24 @@ func (s *Stack) SetOnUpdate(fn func(req *sip.Request, tx sip.ServerTransaction))
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.onUpdate = fn
+}
+
+func (s *Stack) SetOnInfo(fn func(req *sip.Request, tx sip.ServerTransaction)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onInfo = fn
+}
+
+func (s *Stack) SetOnRefer(fn func(req *sip.Request, tx sip.ServerTransaction)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onRefer = fn
+}
+
+func (s *Stack) SetOnNotify(fn func(req *sip.Request, tx sip.ServerTransaction)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.onNotify = fn
 }
 
 func (s *Stack) Client() *sipgo.Client        { return s.client }
@@ -220,21 +244,59 @@ func (s *Stack) handleUpdate(req *sip.Request, tx sip.ServerTransaction) {
 	}
 }
 
+func (s *Stack) handleInfo(req *sip.Request, tx sip.ServerTransaction) {
+	s.mu.RLock()
+	fn := s.onInfo
+	s.mu.RUnlock()
+	if fn != nil {
+		fn(req, tx)
+	} else {
+		tx.Respond(sip.NewResponseFromRequest(req, sip.StatusMethodNotAllowed, "Method Not Allowed", nil))
+	}
+}
+
+func (s *Stack) handleRefer(req *sip.Request, tx sip.ServerTransaction) {
+	s.mu.RLock()
+	fn := s.onRefer
+	s.mu.RUnlock()
+	if fn != nil {
+		fn(req, tx)
+	} else {
+		tx.Respond(sip.NewResponseFromRequest(req, sip.StatusMethodNotAllowed, "Method Not Allowed", nil))
+	}
+}
+
 func (s *Stack) handleOptions(req *sip.Request, tx sip.ServerTransaction) {
 	res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
-	res.AppendHeader(sip.NewHeader("Allow", "INVITE, ACK, CANCEL, OPTIONS, BYE, REGISTER, REFER, NOTIFY, MESSAGE, SUBSCRIBE, INFO, UPDATE"))
+	res.AppendHeader(sip.NewHeader("Allow", "INVITE, ACK, CANCEL, OPTIONS, BYE, REGISTER, REFER, NOTIFY, INFO, UPDATE"))
 	if err := tx.Respond(res); err != nil {
 		log.Debug().Err(err).Msg("failed to answer SIP OPTIONS keepalive")
 	}
 }
 
 func (s *Stack) handleNotify(req *sip.Request, tx sip.ServerTransaction) {
-	// Sentry does not currently consume upstream event packages, but explicitly
-	// accepting the notification prevents retransmit storms and keeps it from
-	// being mistaken for a transport-health failure by the sender.
+	s.mu.RLock()
+	fn := s.onNotify
+	s.mu.RUnlock()
+	if fn != nil {
+		fn(req, tx)
+		return
+	}
+	// Explicitly accepting out-of-dialog gateway event packages prevents
+	// retransmit storms and keeps them from being mistaken for transport-health
+	// failures by the sender.
 	res := sip.NewResponseFromRequest(req, sip.StatusOK, "OK", nil)
 	if err := tx.Respond(res); err != nil {
 		log.Debug().Err(err).Msg("failed to acknowledge SIP NOTIFY")
+	}
+}
+
+func (s *Stack) handlePrack(req *sip.Request, tx sip.ServerTransaction) {
+	// Sentry terminates provisional responses and does not advertise 100rel.
+	// Reject PRACK explicitly instead of leaving the transaction unanswered.
+	res := sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call/Transaction Does Not Exist", nil)
+	if err := tx.Respond(res); err != nil {
+		log.Debug().Err(err).Msg("failed to reject unsupported SIP PRACK")
 	}
 }
 

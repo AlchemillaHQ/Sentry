@@ -198,6 +198,24 @@ func TestSetOnUpdate(t *testing.T) {
 	assert.True(t, called)
 }
 
+func TestSetOnDialogControlMethods(t *testing.T) {
+	s := testStack()
+	infoCalled := false
+	referCalled := false
+	notifyCalled := false
+	s.SetOnInfo(func(req *sip.Request, tx sip.ServerTransaction) { infoCalled = true })
+	s.SetOnRefer(func(req *sip.Request, tx sip.ServerTransaction) { referCalled = true })
+	s.SetOnNotify(func(req *sip.Request, tx sip.ServerTransaction) { notifyCalled = true })
+
+	s.handleInfo(sip.NewRequest(sip.INFO, sip.Uri{Host: "test"}), new(mockServerTx))
+	s.handleRefer(sip.NewRequest(sip.REFER, sip.Uri{Host: "test"}), new(mockServerTx))
+	s.handleNotify(sip.NewRequest(sip.NOTIFY, sip.Uri{Host: "test"}), new(mockServerTx))
+
+	assert.True(t, infoCalled)
+	assert.True(t, referCalled)
+	assert.True(t, notifyCalled)
+}
+
 type mockServerTx struct {
 	mock.Mock
 }
@@ -353,6 +371,18 @@ func TestHandleNotify_AcknowledgesWithoutRetransmit(t *testing.T) {
 	})).Return(nil).Once()
 
 	s.handleNotify(req, tx)
+	tx.AssertExpectations(t)
+}
+
+func TestHandlePrack_RejectsUnsupportedReliableProvisional(t *testing.T) {
+	s := testStack()
+	req := sip.NewRequest(sip.PRACK, sip.Uri{Host: "test"})
+	tx := new(mockServerTx)
+	tx.On("Respond", mock.MatchedBy(func(res *sip.Response) bool {
+		return res.StatusCode == sip.StatusCallTransactionDoesNotExists
+	})).Return(nil).Once()
+
+	s.handlePrack(req, tx)
 	tx.AssertExpectations(t)
 }
 
