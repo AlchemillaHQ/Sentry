@@ -213,6 +213,30 @@ func (cm *CallManager) matchDevice(ctx context.Context, sipUser string) (*db.Dev
 	return &devices[0], nil
 }
 
+func (cm *CallManager) matchInviteDevice(
+	ctx context.Context,
+	requestUser string,
+	toUser string,
+) (*db.Device, string, error) {
+	// A registrar routes an INVITE to the per-device Contact in the Request-URI
+	// while preserving the original extension in the To header. Never collapse a
+	// distinct Contact back to the shared extension, as that can wake the wrong
+	// device or make otherwise deterministic routing ambiguous.
+	if requestUser != "" && requestUser != toUser {
+		device, err := cm.dbQueries.GetDeviceByB2BUASIPUser(ctx, requestUser)
+		if err != nil {
+			return nil, requestUser, err
+		}
+		return &device, requestUser, nil
+	}
+
+	if toUser == "" {
+		return nil, "", pgx.ErrNoRows
+	}
+	device, err := cm.matchDevice(ctx, toUser)
+	return device, toUser, err
+}
+
 func (cm *CallManager) handleRegister(req *sip.Request, tx sip.ServerTransaction) {
 	toHdr := req.To()
 	if toHdr == nil {
@@ -370,8 +394,13 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 		return
 	}
 
-	sipUser := toHdr.Address.User
-	log.Info().Str("to", toHdr.String()).Str("call_id", req.CallID().Value()).Msg("INVITE received")
+	requestUser := req.Recipient.User
+	toUser := toHdr.Address.User
+	log.Info().
+		Str("to", toHdr.String()).
+		Str("request_uri", req.Recipient.String()).
+		Str("call_id", req.CallID().Value()).
+		Msg("INVITE received")
 
 	dlg, err := cm.dialogSrv.ReadInvite(req, tx)
 	if err != nil {
@@ -389,9 +418,15 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 	dlg.Respond(sip.StatusTrying, "Trying", nil)
 
 	ctx := context.Background()
-	device, err := cm.matchDevice(ctx, sipUser)
+	device, sipUser, err := cm.matchInviteDevice(ctx, requestUser, toUser)
 	if err != nil {
-		log.Warn().Err(err).Str("user", sipUser).Str("source", req.Source()).Msg("INVITE rejected: device match failed")
+		log.Warn().
+			Err(err).
+			Str("request_user", requestUser).
+			Str("to_user", toUser).
+			Str("routing_user", sipUser).
+			Str("source", req.Source()).
+			Msg("INVITE rejected: device match failed")
 		tx.Respond(sip.NewResponseFromRequest(req, 404, "Not Found", nil))
 		return
 	}

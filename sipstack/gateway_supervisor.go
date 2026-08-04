@@ -142,7 +142,7 @@ func (ur *UpstreamRegistrar) getOrCreateGatewayLocked(key string, reg *UpstreamR
 	log.Info().
 		Str("gateway", key).
 		Float64("initial_rate", gateway.currentRate).
-		Int("workers", ur.cfg.RecoveryWorkersPerGateway).
+		Int("max_in_flight", ur.cfg.RecoveryWorkersPerGateway).
 		Msg("upstream gateway supervisor started")
 	return gateway
 }

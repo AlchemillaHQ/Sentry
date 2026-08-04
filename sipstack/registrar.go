@@ -238,19 +238,22 @@ func (ur *UpstreamRegistrar) manageRegistration(reg *UpstreamReg, waiter chan er
 
 	generation := uint64(1)
 	var identity *registrationIdentity
+	var gateway *gatewayState
 	if existing, ok := ur.regs[regCopy.DeviceID]; ok {
 		generation = existing.generation + 1
 		if sameRegistrationBinding(existing.reg, &regCopy) {
 			identity = existing.reg.identity
 		}
-		ur.removeRegistrationLocked(existing, errRegistrationReplaced)
+		gateway = ur.replaceRegistrationLocked(existing, key)
 	}
 	if identity == nil {
 		identity = newRegistrationIdentity()
 	}
 	regCopy.identity = identity
 
-	gateway := ur.getOrCreateGatewayLocked(key, &regCopy)
+	if gateway == nil {
+		gateway = ur.getOrCreateGatewayLocked(key, &regCopy)
+	}
 	state := &registrationState{
 		reg:        &regCopy,
 		generation: generation,
@@ -497,6 +500,22 @@ func (ur *UpstreamRegistrar) removeRegistrationLocked(state *registrationState, 
 		delete(ur.gateways, state.gateway.key)
 		state.gateway.cancel()
 	}
+}
+
+// replaceRegistrationLocked retires the device's previous registration state
+// while retaining a gateway supervisor when the replacement uses the same
+// normalized host, port, and transport. Keeping the supervisor preserves its
+// circuit, probe history, and learned recovery rate, so a manual re-register
+// cannot bypass a gateway that is already known to be unavailable.
+func (ur *UpstreamRegistrar) replaceRegistrationLocked(state *registrationState, gatewayKey string) *gatewayState {
+	if state.gateway != nil && state.gateway.key == gatewayKey && ur.gateways[gatewayKey] == state.gateway {
+		ur.stopRegistrationLocked(state, errRegistrationReplaced)
+		delete(ur.regs, state.reg.DeviceID)
+		return state.gateway
+	}
+
+	ur.removeRegistrationLocked(state, errRegistrationReplaced)
+	return nil
 }
 
 func normalizeTransport(transport string) string {

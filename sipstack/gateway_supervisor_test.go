@@ -213,6 +213,118 @@ func TestManageQueuesWithoutWaitingForUpstream(t *testing.T) {
 	ur.StopAll()
 }
 
+func TestSameGatewayReplacementPreservesUnavailableSupervisor(t *testing.T) {
+	client := newSupervisorTestClient()
+	cfg := aggressiveTestRegistrarConfig()
+	cfg.ProbeEnabled = false
+	ur := newUpstreamRegistrarWithClientConfig(testStack(), client, cfg)
+	t.Cleanup(ur.StopAll)
+
+	reg := &UpstreamReg{
+		DeviceID:  "device-11111111",
+		User:      "1001",
+		Host:      "pbx.example.com",
+		Port:      5061,
+		Transport: "tls",
+		Password:  "old-password",
+	}
+	require.NoError(t, ur.Register(context.Background(), reg))
+
+	ur.mu.Lock()
+	previous := ur.regs[reg.DeviceID]
+	gateway := previous.gateway
+	previousIdentity := previous.reg.identity
+	previousGeneration := previous.generation
+	gateway.reachable = false
+	gateway.suspect = true
+	gateway.probeFailures = 3
+	gateway.probeUnsupported = true
+	gateway.currentRate = 73
+	gateway.learnedRate = 91
+	ur.mu.Unlock()
+
+	registersBefore, _ := client.counts()
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := ur.Register(ctx, &UpstreamReg{
+		DeviceID:  reg.DeviceID,
+		User:      reg.User,
+		Host:      "PBX.EXAMPLE.COM.",
+		Port:      reg.Port,
+		Transport: "TLS",
+		Password:  "new-password",
+	})
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	ur.mu.RLock()
+	replacement := ur.regs[reg.DeviceID]
+	managedGateway := ur.gateways[gateway.key]
+	_, remainsMember := gateway.members[reg.DeviceID]
+	ur.mu.RUnlock()
+
+	require.NotNil(t, replacement)
+	assert.Same(t, gateway, replacement.gateway)
+	assert.Same(t, gateway, managedGateway)
+	assert.Same(t, previousIdentity, replacement.reg.identity)
+	assert.Equal(t, previousGeneration+1, replacement.generation)
+	assert.True(t, replacement.queued)
+	assert.False(t, replacement.inFlight)
+	assert.True(t, remainsMember)
+	assert.False(t, gateway.reachable)
+	assert.True(t, gateway.suspect)
+	assert.Equal(t, 3, gateway.probeFailures)
+	assert.True(t, gateway.probeUnsupported)
+	assert.Equal(t, float64(73), gateway.currentRate)
+	assert.Equal(t, float64(91), gateway.learnedRate)
+	assert.NoError(t, gateway.ctx.Err())
+	registersAfter, _ := client.counts()
+	assert.Equal(t, registersBefore, registersAfter)
+}
+
+func TestReplacementOnDifferentGatewayRetiresPreviousSupervisor(t *testing.T) {
+	client := newSupervisorTestClient()
+	cfg := aggressiveTestRegistrarConfig()
+	cfg.ProbeEnabled = false
+	ur := newUpstreamRegistrarWithClientConfig(testStack(), client, cfg)
+	t.Cleanup(ur.StopAll)
+
+	reg := &UpstreamReg{
+		DeviceID:  "device-11111111",
+		User:      "1001",
+		Host:      "pbx.example.com",
+		Port:      5061,
+		Transport: "tls",
+	}
+	require.NoError(t, ur.Register(context.Background(), reg))
+
+	ur.mu.RLock()
+	previous := ur.regs[reg.DeviceID]
+	previousGateway := previous.gateway
+	previousIdentity := previous.reg.identity
+	ur.mu.RUnlock()
+
+	require.NoError(t, ur.Manage(&UpstreamReg{
+		DeviceID:  reg.DeviceID,
+		User:      reg.User,
+		Host:      "other.example.com",
+		Port:      reg.Port,
+		Transport: reg.Transport,
+	}))
+
+	ur.mu.RLock()
+	replacement := ur.regs[reg.DeviceID]
+	_, previousStillManaged := ur.gateways[previousGateway.key]
+	gatewayCount := len(ur.gateways)
+	ur.mu.RUnlock()
+
+	require.NotNil(t, replacement)
+	assert.NotSame(t, previousGateway, replacement.gateway)
+	assert.NotSame(t, previousIdentity, replacement.reg.identity)
+	assert.False(t, previousStillManaged)
+	assert.Equal(t, 1, gatewayCount)
+	assert.ErrorIs(t, previousGateway.ctx.Err(), context.Canceled)
+}
+
 func TestUnvalidatedOptionsUsesOneSharedCanaryWithoutFanout(t *testing.T) {
 	client := newSupervisorTestClient()
 	client.setOptionsUp(false)

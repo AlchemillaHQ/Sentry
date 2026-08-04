@@ -563,6 +563,50 @@ func TestMatchDevice_RejectsAmbiguousFallback(t *testing.T) {
 	assert.ErrorIs(t, err, errAmbiguousDevice)
 }
 
+func TestMatchInviteDevice_PrefersPerDeviceRequestURI(t *testing.T) {
+	ctx := context.Background()
+	mockDB := new(MockQuerier)
+	cm := &CallManager{dbQueries: mockDB}
+	device := db.Device{B2buaSipUser: "104_abcdefgh", DeviceID: "device-a"}
+	mockDB.On("GetDeviceByB2BUASIPUser", ctx, "104_abcdefgh").Return(device, nil)
+
+	matched, routingUser, err := cm.matchInviteDevice(ctx, "104_abcdefgh", "104")
+
+	assert.NoError(t, err)
+	assert.Equal(t, "device-a", matched.DeviceID)
+	assert.Equal(t, "104_abcdefgh", routingUser)
+	mockDB.AssertNotCalled(t, "GetDevicesByUpstreamUser", mock.Anything, mock.Anything)
+}
+
+func TestMatchInviteDevice_UsesLegacyToFallbackForUnchangedRequestURI(t *testing.T) {
+	ctx := context.Background()
+	mockDB := new(MockQuerier)
+	cm := &CallManager{dbQueries: mockDB}
+	device := db.Device{B2buaSipUser: "104_abcdefgh", DeviceID: "device-a"}
+	mockDB.On("GetDeviceByB2BUASIPUser", ctx, "104").Return(db.Device{}, pgx.ErrNoRows)
+	mockDB.On("GetDevicesByUpstreamUser", ctx, "104").Return([]db.Device{device}, nil)
+
+	matched, routingUser, err := cm.matchInviteDevice(ctx, "104", "104")
+
+	assert.NoError(t, err)
+	assert.Equal(t, "device-a", matched.DeviceID)
+	assert.Equal(t, "104", routingUser)
+}
+
+func TestMatchInviteDevice_DoesNotMisrouteUnknownPerDeviceContact(t *testing.T) {
+	ctx := context.Background()
+	mockDB := new(MockQuerier)
+	cm := &CallManager{dbQueries: mockDB}
+	mockDB.On("GetDeviceByB2BUASIPUser", ctx, "104_missing").Return(db.Device{}, pgx.ErrNoRows)
+
+	matched, routingUser, err := cm.matchInviteDevice(ctx, "104_missing", "104")
+
+	assert.Nil(t, matched)
+	assert.Equal(t, "104_missing", routingUser)
+	assert.ErrorIs(t, err, pgx.ErrNoRows)
+	mockDB.AssertNotCalled(t, "GetDevicesByUpstreamUser", mock.Anything, mock.Anything)
+}
+
 func TestIsPrivateIP(t *testing.T) {
 	assert.True(t, isPrivateIP("127.0.0.1"))
 	assert.True(t, isPrivateIP("10.0.0.1"))
