@@ -9,7 +9,6 @@ import (
 	"github.com/AlchemillaHQ/Sentry/config"
 	"github.com/rs/zerolog/log"
 	"github.com/sideshow/apns2"
-	"github.com/sideshow/apns2/certificate"
 	apnstoken "github.com/sideshow/apns2/token"
 )
 
@@ -25,7 +24,7 @@ type APNsSender struct {
 var (
 	initAPNs            = createAPNsClient
 	loadAPNsAuthKey     = apnstoken.AuthKeyFromFile
-	loadAPNsCertificate = certificate.FromP12File
+	loadAPNsCertificate = loadP12Certificate
 )
 
 func createAPNsClient(cfg config.PushConfig) (apnsClient, error) {

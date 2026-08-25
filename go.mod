@@ -21,6 +21,7 @@ require (
 	google.golang.org/api v0.276.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	gopkg.in/yaml.v3 v3.0.1
+	software.sslmate.com/src/go-pkcs12 v0.7.3
 )
 
 require (

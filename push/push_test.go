@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"math/big"
 	"os"
 	"path/filepath"
 	"sync"
@@ -21,6 +22,7 @@ import (
 	"github.com/AlchemillaHQ/Sentry/config"
 	"github.com/sideshow/apns2"
 	"github.com/stretchr/testify/assert"
+	pkcs12 "software.sslmate.com/src/go-pkcs12"
 )
 
 type mockPlatformSender struct {
@@ -814,6 +816,48 @@ func TestInitAPNs_CertificateAuthentication(t *testing.T) {
 	assert.NoError(t, err)
 	assert.NotNil(t, client)
 	assert.Equal(t, apns2.HostDevelopment, client.(*apns2.Client).Host)
+}
+
+func TestInitAPNs_ModernP12Certificate(t *testing.T) {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	assert.NoError(t, err)
+
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+	certificateDER, err := x509.CreateCertificate(
+		rand.Reader,
+		template,
+		template,
+		&privateKey.PublicKey,
+		privateKey,
+	)
+	assert.NoError(t, err)
+	certificate, err := x509.ParseCertificate(certificateDER)
+	assert.NoError(t, err)
+
+	const password = "modern-p12-password"
+	p12Data, err := pkcs12.Modern.Encode(privateKey, certificate, nil, password)
+	assert.NoError(t, err)
+	p12Path := filepath.Join(t.TempDir(), "modern-voip.p12")
+	assert.NoError(t, os.WriteFile(p12Path, p12Data, 0o600))
+
+	client, err := initAPNs(config.PushConfig{
+		APNsCert:         p12Path,
+		APNsCertPassword: password,
+		APNsBundleID:     "com.dsoft.misrai",
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, client)
+	apnsClient := client.(*apns2.Client)
+	assert.Equal(t, apns2.HostDevelopment, apnsClient.Host)
+	assert.NotNil(t, apnsClient.Certificate.Leaf)
+	assert.Equal(t, certificate.SerialNumber, apnsClient.Certificate.Leaf.SerialNumber)
 }
 
 func TestInitAPNs_RejectsExpiredCertificate(t *testing.T) {
