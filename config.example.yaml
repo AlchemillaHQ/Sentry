@@ -28,11 +28,18 @@ database:
 
 push:
   fcm_service_account: "" # Path to Firebase JSON key
-  apns_cert: "" # Path to APNs .p12 or .pem
+
+  # Preferred APNs token authentication. Leave all APNs credentials empty to
+  # deliberately disable iOS push.
+  apns_key: "" # Path to AuthKey_XXXXXXXXXX.p8
   apns_key_id: ""
   apns_team_id: ""
-  apns_bundle_id: ""
+  apns_bundle_id: "" # App bundle ID; the VoIP topic is <bundle-id>.voip
   apns_production: false
+
+  # Certificate fallback. Use this instead of apns_key/key_id/team_id.
+  apns_cert: "" # Path to a VoIP APNs .p12 certificate
+  apns_cert_password: ""
 
 pprof:
   addr: ""

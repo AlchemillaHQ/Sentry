@@ -65,11 +65,15 @@ database:
 
 push:
   fcm_service_account: "service-account.json"
-  apns_cert: "/path/to/apns-cert.pem"
-  apns_key_id: ""
-  apns_team_id: ""
-  apns_bundle_id: "com.example.app"
-  apns_production: false
+  apns_key: "/run/secrets/AuthKey_XXXXXXXXXX.p8"
+  apns_key_id: "XXXXXXXXXX"
+  apns_team_id: "YYYYYYYYYY"
+  apns_bundle_id: "com.example.difuse" # replace with the final Difuse bundle ID
+  apns_production: true
+
+  # Certificate fallback; configure this instead of the three token-auth fields.
+  apns_cert: ""
+  apns_cert_password: ""
 
 log:
   level: "info"
@@ -103,6 +107,21 @@ healthy, and pending registrations plus canary-mode, suspect, or unavailable
 gateways.
 Every value is configurable under `registrar`; see `config.example.yaml`.
 
+#### Apple Push Notification service
+
+APNs token authentication with a `.p8` key is preferred. Certificate
+authentication with a VoIP `.p12` remains available as a fallback. The two
+credential modes are mutually exclusive, and the bundle ID is required when
+either mode is enabled. Sentry fails at startup if APNs credentials are
+partial, conflicting, unreadable, or invalid. Leaving every APNs credential
+field empty deliberately disables iOS push without affecting FCM.
+
+`apns_production: false` selects the sandbox endpoint; `true` selects the
+production endpoint. Run staging and production Sentry deployments with
+separate databases so sandbox and production PushKit tokens are never mixed.
+At startup Sentry logs the selected environment, `<bundle-id>.voip` topic, and
+authentication mode without logging credentials or device tokens.
+
 ### Running
 
 Build and run Sentry:
@@ -125,7 +144,7 @@ make build
 - Disabling a device blocks new routing before Sentry unregisters it from the
   upstream PBX and cancels pending wake-up work.
 
-Incoming-call pushes use these data keys:
+Android incoming-call pushes use these data keys:
 
 ```json
 {
@@ -137,10 +156,58 @@ Incoming-call pushes use these data keys:
 }
 ```
 
+iOS receives the same top-level keys plus the Linphone-native call identifier
+inside `aps`:
+
+```json
+{
+  "aps": {
+    "content-available": 1,
+    "call-id": "sentry-call-uuid"
+  },
+  "call-id": "sentry-call-uuid",
+  "device-id": "sentry-device-uuid",
+  "caller-uri": "sip:caller@example.com",
+  "caller-name": "Caller",
+  "content-type": "application/call-info"
+}
+```
+
+The pending-call UUID, both APNs `call-id` values, and the downstream SIP
+INVITE Call-ID are identical. The upstream PBX Call-ID remains independent, as
+required for the two B2BUA dialog legs.
+
+For `platform: "ios"`, `push_token` may be raw hexadecimal, `TOKEN:voip`, or a
+combined Linphone value such as `TOKEN:voip&REMOTE:remote`. Sentry selects the
+VoIP segment, validates it, lowercases the hexadecimal token, and stores it
+encrypted. A new iOS registration requires a usable token. Re-registering or
+refreshing an existing iOS device without a new token preserves the current
+encrypted token. Android FCM tokens remain opaque and unchanged.
+
+Enabled iOS devices are retained when their seven-day REST heartbeat lease
+expires because iOS cannot guarantee periodic background execution. Expired
+Android devices and expired disabled iOS devices are pruned normally. An APNs
+invalid-token response disables the iOS device, allowing subsequent cleanup;
+explicit account deletion remains immediate.
+
 The mobile client uses `device-id` to select one account pair and temporarily
 registers the hidden account returned as `b2bua_sip_uri`. Sentry relays the
 pending INVITE to that hidden B2BUA account; the visible direct-PBX account is
 not the relay destination.
+
+#### APNs rejection runbook
+
+- `BadDeviceToken` usually means the token is malformed or was sent to the
+  wrong sandbox/production endpoint.
+- `DeviceTokenNotForTopic` means the configured bundle ID or `.voip` topic does
+  not match the application entitlement or credential.
+- `Unregistered` or `ExpiredProviderToken` means APNs no longer accepts the
+  device/provider token. Device-token rejections disable that Sentry device;
+  provider-token errors require checking the `.p8` key, Key ID, Team ID, and
+  server clock.
+- Authentication or certificate failures at startup require checking file
+  permissions, certificate password/expiry, and whether the credential is
+  authorized for the configured VoIP topic.
 
 #### CLI Flags
 

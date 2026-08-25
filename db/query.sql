@@ -75,6 +75,7 @@ UPDATE devices SET disabled = $2 WHERE device_id = $1;
 -- name: PruneDevices :many
 DELETE FROM devices
 WHERE expires_at < $1
+  AND (platform <> 'ios' OR disabled = true)
 RETURNING device_id, b2bua_sip_user;
 
 -- name: DeleteDeviceByID :exec

@@ -285,6 +285,7 @@ func (q *Queries) ListUsers(ctx context.Context) ([]ListUsersRow, error) {
 const pruneDevices = `-- name: PruneDevices :many
 DELETE FROM devices
 WHERE expires_at < $1
+  AND (platform <> 'ios' OR disabled = true)
 RETURNING device_id, b2bua_sip_user
 `
 

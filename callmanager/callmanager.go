@@ -3,6 +3,7 @@ package callmanager
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"strconv"
@@ -103,7 +104,7 @@ type pendingCall struct {
 	id               string
 	deviceID         string
 	sipUser          string
-	callID           string
+	upstreamCallID   string
 	callerURI        string
 	callerName       string
 	callerUser       string
@@ -167,7 +168,7 @@ type dialogServerReader interface {
 
 type dialogClientFull interface {
 	ReadBye(req *sip.Request, tx sip.ServerTransaction) error
-	Invite(ctx context.Context, recipient sip.Uri, body []byte, from *sip.FromHeader, contentType sip.Header) (clientSession, error)
+	Invite(ctx context.Context, recipient sip.Uri, deviceCallID string, body []byte, from *sip.FromHeader, contentType sip.Header) (clientSession, error)
 }
 
 var (
@@ -209,16 +210,28 @@ func (a *dialogCliAdapter) ReadBye(req *sip.Request, tx sip.ServerTransaction) e
 	return a.cache.ReadBye(req, tx)
 }
 
-func (a *dialogCliAdapter) Invite(ctx context.Context, recipient sip.Uri, body []byte, from *sip.FromHeader, contentType sip.Header) (clientSession, error) {
-	headers := []sip.Header{from}
-	if len(body) > 0 && contentType != nil {
-		headers = append(headers, contentType)
+func (a *dialogCliAdapter) Invite(ctx context.Context, recipient sip.Uri, deviceCallID string, body []byte, from *sip.FromHeader, contentType sip.Header) (clientSession, error) {
+	headers, err := downstreamInviteHeaders(deviceCallID, body, from, contentType)
+	if err != nil {
+		return nil, err
 	}
 	s, err := a.cache.Invite(ctx, recipient, body, headers...)
 	if err != nil {
 		return nil, err
 	}
 	return &clientSessionWrapper{s}, nil
+}
+
+func downstreamInviteHeaders(deviceCallID string, body []byte, from *sip.FromHeader, contentType sip.Header) ([]sip.Header, error) {
+	if deviceCallID == "" {
+		return nil, fmt.Errorf("device call ID is required")
+	}
+	callID := sip.CallIDHeader(deviceCallID)
+	headers := []sip.Header{from, &callID}
+	if len(body) > 0 && contentType != nil {
+		headers = append(headers, contentType)
+	}
+	return headers, nil
 }
 
 type CallManager struct {
@@ -514,10 +527,14 @@ func (cm *CallManager) updateDeviceFromContact(ctx context.Context, sipUser stri
 			pushParam = param
 		}
 		if prid, ok := params.Get("pn-prid"); ok && prid != "" {
-			encToken, err := cm.box.Encrypt([]byte(prid))
-			if err == nil {
+			normalizedToken, normalizeErr := push.NormalizeToken(device.Platform, prid)
+			if normalizeErr != nil {
+				log.Warn().Err(normalizeErr).Str("device", device.DeviceID).Msg("ignoring invalid push token from SIP contact")
+			} else if encToken, encryptErr := cm.box.Encrypt([]byte(normalizedToken)); encryptErr == nil {
 				pushToken = encToken
-				pushPrid = prid
+				if !strings.EqualFold(device.Platform, "ios") {
+					pushPrid = prid
+				}
 			}
 		}
 	}
@@ -607,6 +624,27 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 		_ = dlg.Respond(sip.StatusTemporarilyUnavailable, "Temporarily Unavailable", nil)
 		return
 	}
+	cm.mu.RLock()
+	_, suspended := cm.suspended[device.DeviceID]
+	cm.mu.RUnlock()
+	if suspended {
+		log.Info().Str("device", device.DeviceID).Msg("INVITE rejected: device is suspended")
+		_ = dlg.Respond(sip.StatusTemporarilyUnavailable, "Temporarily Unavailable", nil)
+		return
+	}
+
+	pushTokenBytes, err := cm.box.Decrypt(device.PushToken)
+	if err != nil {
+		log.Error().Err(err).Str("device", device.DeviceID).Msg("failed to decrypt push token")
+		_ = dlg.Respond(sip.StatusTemporarilyUnavailable, "Temporarily Unavailable", nil)
+		return
+	}
+	pushToken, err := push.NormalizeToken(device.Platform, string(pushTokenBytes))
+	if err != nil || pushToken == "" {
+		log.Warn().Err(err).Str("device", device.DeviceID).Str("platform", device.Platform).Msg("INVITE rejected: device has no usable push token")
+		_ = dlg.Respond(sip.StatusTemporarilyUnavailable, "Temporarily Unavailable", nil)
+		return
+	}
 
 	fromHdr := req.From()
 	callerURI := ""
@@ -631,7 +669,7 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 		id:               callID,
 		deviceID:         device.DeviceID,
 		sipUser:          device.B2buaSipUser,
-		callID:           req.CallID().Value(),
+		upstreamCallID:   req.CallID().Value(),
 		callerURI:        callerURI,
 		callerName:       callerName,
 		callerUser:       callerUser,
@@ -690,12 +728,6 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 
 	dlg.Respond(110, "Push sent", nil)
 
-	pushTokenBytes, err := cm.box.Decrypt(device.PushToken)
-	if err != nil {
-		log.Error().Err(err).Str("device", device.DeviceID).Msg("failed to decrypt push token")
-		dlg.Respond(sip.StatusTemporarilyUnavailable, "Temporarily Unavailable", nil)
-		return
-	}
 	if callCtx.Err() != nil {
 		log.Info().Str("call_id", callID).Str("device", device.DeviceID).Msg("call cancelled before push enqueue")
 		return
@@ -704,7 +736,7 @@ func (cm *CallManager) handleInvite(req *sip.Request, tx sip.ServerTransaction) 
 	log.Info().Str("call_id", callID).Str("device", device.DeviceID).Msg("sending push notification")
 	if err := cm.pushSender.Send(context.Background(), push.CallPush{
 		Platform:   device.Platform,
-		Token:      string(pushTokenBytes),
+		Token:      pushToken,
 		CallID:     callID,
 		DeviceID:   device.DeviceID,
 		CallerURI:  callerURI,
@@ -1889,7 +1921,7 @@ func (cm *CallManager) relayCall(ctx context.Context, pc *pendingCall, device *d
 		contentType = sip.NewHeader("Content-Type", "application/sdp")
 	}
 
-	dlgClient, err := cm.dialogCli.Invite(ctx, recipient, pc.sdpOffer, fromHdr, contentType)
+	dlgClient, err := cm.dialogCli.Invite(ctx, recipient, pc.id, pc.sdpOffer, fromHdr, contentType)
 	if err != nil {
 		log.Error().Err(err).Str("call_id", pc.id).Msg("failed to send relay INVITE to device")
 		pc.serverDlg.Respond(sip.StatusTemporarilyUnavailable, "Temporarily Unavailable", nil)
@@ -2116,7 +2148,7 @@ func (cm *CallManager) handleCancel(req *sip.Request, tx sip.ServerTransaction) 
 	}
 	if found == nil && cancelKey == "" {
 		for _, pc := range cm.pending {
-			if pc.callID == callIDVal {
+			if pc.upstreamCallID == callIDVal {
 				found = pc
 				break
 			}

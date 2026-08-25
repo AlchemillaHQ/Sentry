@@ -13,6 +13,7 @@ import (
 	"github.com/AlchemillaHQ/Sentry/auth"
 	"github.com/AlchemillaHQ/Sentry/config"
 	"github.com/AlchemillaHQ/Sentry/db"
+	"github.com/AlchemillaHQ/Sentry/push"
 	"github.com/AlchemillaHQ/Sentry/secrets"
 	"github.com/AlchemillaHQ/Sentry/sipstack"
 	"github.com/gin-contrib/cors"
@@ -554,17 +555,36 @@ func (h *Handler) RegisterDevice(c *gin.Context) {
 		return
 	}
 
-	var encToken []byte
+	encToken := existing.PushToken
 	if req.PushToken != "" {
-		encToken, _ = h.box.Encrypt([]byte(req.PushToken))
+		normalizedToken, err := push.NormalizeToken(req.Platform, req.PushToken)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "invalid push_token for platform"})
+			return
+		}
+		encToken, err = h.box.Encrypt([]byte(normalizedToken))
+		if err != nil {
+			log.Error().Err(err).Str("device", req.DeviceID).Msg("push token encryption failed")
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "encryption error"})
+			return
+		}
+	} else if strings.EqualFold(req.Platform, "ios") &&
+		(existingErr != nil || !strings.EqualFold(existing.Platform, "ios") || len(existing.PushToken) == 0) {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "push_token is required for a new iOS device"})
+		return
 	}
-	encPassword, _ := h.box.Encrypt([]byte(req.UpstreamPassword))
+	encPassword, err := h.box.Encrypt([]byte(req.UpstreamPassword))
+	if err != nil {
+		log.Error().Err(err).Str("device", req.DeviceID).Msg("upstream password encryption failed")
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "encryption error"})
+		return
+	}
 
 	b2buaSIPUser := fmt.Sprintf("%s_%s", req.UpstreamUser, req.DeviceID[:8])
 	expiresAt := time.Now().Add(deviceExpiryDuration)
 	lastSeen := time.Now()
 
-	err := h.dbQueries.UpsertDevice(c.Request.Context(), db.UpsertDeviceParams{
+	err = h.dbQueries.UpsertDevice(c.Request.Context(), db.UpsertDeviceParams{
 		DeviceID:          req.DeviceID,
 		Platform:          req.Platform,
 		PushToken:         encToken,
@@ -657,9 +677,24 @@ func (h *Handler) RefreshDevice(c *gin.Context) {
 
 	pushToken := device.PushToken
 	var req RefreshRequest
-	if err := c.ShouldBindJSON(&req); err == nil && req.PushToken != "" {
-		encToken, _ := h.box.Encrypt([]byte(req.PushToken))
+	_ = c.ShouldBindJSON(&req)
+	if req.PushToken != "" {
+		normalizedToken, err := push.NormalizeToken(device.Platform, req.PushToken)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "invalid push_token for platform"})
+			return
+		}
+		encToken, err := h.box.Encrypt([]byte(normalizedToken))
+		if err != nil {
+			log.Error().Err(err).Str("device", deviceID).Msg("push token encryption failed")
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "message": "encryption error"})
+			return
+		}
 		pushToken = encToken
+	}
+	if strings.EqualFold(device.Platform, "ios") && len(pushToken) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "message": "push_token is required for iOS devices"})
+		return
 	}
 
 	err = h.dbQueries.UpsertDevice(c.Request.Context(), db.UpsertDeviceParams{

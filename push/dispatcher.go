@@ -69,6 +69,10 @@ const (
 )
 
 func NewDispatcher(cfg config.PushConfig) (*Dispatcher, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("invalid push config: %w", err)
+	}
+
 	d := &Dispatcher{
 		senders:     make(map[string]platformSender),
 		queue:       make(chan CallPush, workerQueueSize),
@@ -87,10 +91,11 @@ func NewDispatcher(cfg config.PushConfig) (*Dispatcher, error) {
 		d.senders["android"] = fcm
 	}
 
-	apns, err := newAPNs(cfg.APNsCert, cfg.APNsBundleID, cfg.APNsProduction)
+	apns, err := newAPNs(cfg)
 	if err != nil {
-		log.Warn().Err(err).Msg("APNs push disabled")
-	} else if apns != nil {
+		return nil, fmt.Errorf("init apns: %w", err)
+	}
+	if apns != nil {
 		d.senders["ios"] = apns
 	}
 

@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -44,11 +45,67 @@ type DatabaseConfig struct {
 
 type PushConfig struct {
 	FCMServiceAccount string `yaml:"fcm_service_account"`
+	APNsKey           string `yaml:"apns_key"`
 	APNsCert          string `yaml:"apns_cert"`
+	APNsCertPassword  string `yaml:"apns_cert_password"`
 	APNsKeyID         string `yaml:"apns_key_id"`
 	APNsTeamID        string `yaml:"apns_team_id"`
 	APNsBundleID      string `yaml:"apns_bundle_id"`
 	APNsProduction    bool   `yaml:"apns_production"`
+}
+
+func (c PushConfig) APNsEnabled() bool {
+	return strings.TrimSpace(c.APNsKey) != "" || strings.TrimSpace(c.APNsCert) != ""
+}
+
+func (c PushConfig) APNsAuthMode() string {
+	if strings.TrimSpace(c.APNsKey) != "" {
+		return "token"
+	}
+	if strings.TrimSpace(c.APNsCert) != "" {
+		return "certificate"
+	}
+	return "disabled"
+}
+
+// Validate rejects partial or conflicting APNs authentication settings. An
+// entirely absent APNs credential configuration deliberately disables iOS
+// push while leaving Android-only deployments valid.
+func (c PushConfig) Validate() error {
+	keyPath := strings.TrimSpace(c.APNsKey)
+	keyID := strings.TrimSpace(c.APNsKeyID)
+	teamID := strings.TrimSpace(c.APNsTeamID)
+	certPath := strings.TrimSpace(c.APNsCert)
+	bundleID := strings.TrimSpace(c.APNsBundleID)
+
+	keyModeConfigured := keyPath != "" || keyID != "" || teamID != ""
+	certModeConfigured := certPath != "" || c.APNsCertPassword != ""
+
+	if keyModeConfigured && certModeConfigured {
+		return fmt.Errorf("push APNs token and certificate authentication are mutually exclusive")
+	}
+	if !keyModeConfigured && !certModeConfigured {
+		return nil
+	}
+	if bundleID == "" {
+		return fmt.Errorf("push.apns_bundle_id is required when APNs is enabled")
+	}
+	if keyModeConfigured {
+		if keyPath == "" {
+			return fmt.Errorf("push.apns_key is required for APNs token authentication")
+		}
+		if keyID == "" {
+			return fmt.Errorf("push.apns_key_id is required for APNs token authentication")
+		}
+		if teamID == "" {
+			return fmt.Errorf("push.apns_team_id is required for APNs token authentication")
+		}
+		return nil
+	}
+	if certPath == "" {
+		return fmt.Errorf("push.apns_cert is required for APNs certificate authentication")
+	}
+	return nil
 }
 
 type PprofConfig struct {
@@ -254,6 +311,9 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Registrar.RecoveryGlobalWorkers < cfg.Registrar.RecoveryWorkersPerGateway {
 		return nil, fmt.Errorf("registrar.recovery_global_workers must be at least recovery_workers_per_gateway")
+	}
+	if err := cfg.Push.Validate(); err != nil {
+		return nil, err
 	}
 
 	return cfg, nil

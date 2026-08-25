@@ -126,6 +126,10 @@ func (m *MockDBTX) QueryRow(ctx context.Context, sql string, args ...interface{}
 
 // --------------- CleanupStaleState tests ---------------
 
+func TestPruneDevicesQueryRetainsEnabledIOSDevices(t *testing.T) {
+	assert.Contains(t, pruneDevices, "platform <> 'ios' OR disabled = true")
+}
+
 func TestCleanupStaleState_Success(t *testing.T) {
 	mockQ := new(MockQuerier)
 	db := &Database{Queries: mockQ}

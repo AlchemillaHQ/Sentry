@@ -3,11 +3,14 @@ package push
 import (
 	"context"
 	"fmt"
+	"strings"
+	"time"
 
+	"github.com/AlchemillaHQ/Sentry/config"
 	"github.com/rs/zerolog/log"
 	"github.com/sideshow/apns2"
 	"github.com/sideshow/apns2/certificate"
-	"github.com/sideshow/apns2/payload"
+	apnstoken "github.com/sideshow/apns2/token"
 )
 
 type apnsClient interface {
@@ -19,33 +22,83 @@ type APNsSender struct {
 	bundleID string
 }
 
-var initAPNs = createAPNsClient
+var (
+	initAPNs            = createAPNsClient
+	loadAPNsAuthKey     = apnstoken.AuthKeyFromFile
+	loadAPNsCertificate = certificate.FromP12File
+)
 
-func createAPNsClient(certPath, bundleID string, production bool) (apnsClient, error) {
-	if certPath == "" {
+func createAPNsClient(cfg config.PushConfig) (apnsClient, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	if !cfg.APNsEnabled() {
 		return nil, nil
 	}
-	cert, err := certificate.FromP12File(certPath, "")
-	if err != nil {
-		return nil, fmt.Errorf("load apns cert: %w", err)
-	}
-	var client apnsClient
-	if production {
-		client = apns2.NewClient(cert).Production()
+
+	var client *apns2.Client
+	if cfg.APNsAuthMode() == "token" {
+		authKey, err := loadAPNsAuthKey(strings.TrimSpace(cfg.APNsKey))
+		if err != nil {
+			return nil, fmt.Errorf("load apns key: %w", err)
+		}
+		providerToken := &apnstoken.Token{
+			AuthKey: authKey,
+			KeyID:   strings.TrimSpace(cfg.APNsKeyID),
+			TeamID:  strings.TrimSpace(cfg.APNsTeamID),
+		}
+		if _, err := providerToken.Generate(); err != nil {
+			return nil, fmt.Errorf("initialize apns provider token: %w", err)
+		}
+		client = apns2.NewTokenClient(providerToken)
 	} else {
-		client = apns2.NewClient(cert).Development()
+		cert, err := loadAPNsCertificate(strings.TrimSpace(cfg.APNsCert), cfg.APNsCertPassword)
+		if err != nil {
+			return nil, fmt.Errorf("load apns cert: %w", err)
+		}
+		if cert.Leaf == nil {
+			return nil, fmt.Errorf("load apns cert: certificate metadata is missing")
+		}
+		now := time.Now()
+		if now.Before(cert.Leaf.NotBefore) {
+			return nil, fmt.Errorf("load apns cert: certificate is not valid yet")
+		}
+		if now.After(cert.Leaf.NotAfter) {
+			return nil, fmt.Errorf("load apns cert: certificate has expired")
+		}
+		client = apns2.NewClient(cert)
+	}
+
+	if cfg.APNsProduction {
+		client = client.Production()
+	} else {
+		client = client.Development()
 	}
 	return client, nil
 }
 
-func NewAPNsSender(certPath, bundleID string, production bool) (*APNsSender, error) {
-	client, err := initAPNs(certPath, bundleID, production)
+func NewAPNsSender(cfg config.PushConfig) (*APNsSender, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	client, err := initAPNs(cfg)
 	if err != nil {
 		return nil, err
 	}
 	if client == nil {
 		return nil, nil
 	}
+
+	environment := "sandbox"
+	if cfg.APNsProduction {
+		environment = "production"
+	}
+	bundleID := strings.TrimSpace(cfg.APNsBundleID)
+	log.Info().
+		Str("environment", environment).
+		Str("topic", bundleID+".voip").
+		Str("auth_mode", cfg.APNsAuthMode()).
+		Msg("APNs push enabled")
 	return &APNsSender{client: client, bundleID: bundleID}, nil
 }
 
@@ -53,20 +106,40 @@ func newAPNsSenderWithClient(client apnsClient, bundleID string) *APNsSender {
 	return &APNsSender{client: client, bundleID: bundleID}
 }
 
+type apnsCallAPS struct {
+	ContentAvailable int    `json:"content-available"`
+	CallID           string `json:"call-id"`
+}
+
+type apnsCallPayload struct {
+	APS         apnsCallAPS `json:"aps"`
+	CallID      string      `json:"call-id"`
+	DeviceID    string      `json:"device-id"`
+	CallerURI   string      `json:"caller-uri"`
+	CallerName  string      `json:"caller-name"`
+	ContentType string      `json:"content-type"`
+}
+
 func (a *APNsSender) SendCallPush(ctx context.Context, call CallPush) error {
-	p := payload.NewPayload().
-		AlertTitle("Incoming Call").
-		AlertBody(call.CallerName).
-		Sound("default").
-		ContentAvailable().
-		Custom("call-id", call.CallID).
-		Custom("device-id", call.DeviceID).
-		Custom("caller-uri", call.CallerURI).
-		Custom("caller-name", call.CallerName).
-		Custom("content-type", "application/call-info")
+	deviceToken, err := NormalizeToken("ios", call.Token)
+	if err != nil {
+		return fmt.Errorf("apns token: %w", err)
+	}
+
+	p := apnsCallPayload{
+		APS: apnsCallAPS{
+			ContentAvailable: 1,
+			CallID:           call.CallID,
+		},
+		CallID:      call.CallID,
+		DeviceID:    call.DeviceID,
+		CallerURI:   call.CallerURI,
+		CallerName:  call.CallerName,
+		ContentType: "application/call-info",
+	}
 
 	notification := &apns2.Notification{
-		DeviceToken: call.Token,
+		DeviceToken: deviceToken,
 		Topic:       a.bundleID + ".voip",
 		Payload:     p,
 		PushType:    apns2.PushTypeVOIP,
@@ -75,6 +148,9 @@ func (a *APNsSender) SendCallPush(ctx context.Context, call CallPush) error {
 	resp, err := a.client.PushWithContext(ctx, notification)
 	if err != nil {
 		return fmt.Errorf("apns send: %w", err)
+	}
+	if resp == nil {
+		return fmt.Errorf("apns send: empty response")
 	}
 	if !resp.Sent() {
 		if isAPNsTokenInvalid(resp) {

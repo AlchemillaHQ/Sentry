@@ -2,13 +2,17 @@ package push
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -403,6 +407,41 @@ func TestIsAPNsTokenInvalid(t *testing.T) {
 	}
 }
 
+func TestNormalizeToken(t *testing.T) {
+	tests := []struct {
+		name     string
+		platform string
+		input    string
+		want     string
+		wantErr  bool
+	}{
+		{name: "android remains opaque", platform: "android", input: "  opaque:FCM&token  ", want: "  opaque:FCM&token  "},
+		{name: "raw iOS token", platform: "ios", input: "AABBCCDD", want: "aabbccdd"},
+		{name: "Linphone VoIP suffix", platform: "ios", input: " AABBCCDD:voip ", want: "aabbccdd"},
+		{name: "combined VoIP first", platform: "ios", input: "AABBCCDD:voip&11223344:remote", want: "aabbccdd"},
+		{name: "combined VoIP second", platform: "ios", input: "11223344:remote&AABBCCDD:voip", want: "aabbccdd"},
+		{name: "case insensitive suffix", platform: "IOS", input: "AABBCCDD:VoIP", want: "aabbccdd"},
+		{name: "empty", platform: "ios", input: " ", wantErr: true},
+		{name: "odd length", platform: "ios", input: "abc", wantErr: true},
+		{name: "not hexadecimal", platform: "ios", input: "nothex", wantErr: true},
+		{name: "remote only", platform: "ios", input: "11223344:remote", wantErr: true},
+		{name: "combined without VoIP", platform: "ios", input: "11223344&55667788", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := NormalizeToken(tt.platform, tt.input)
+			if tt.wantErr {
+				assert.Error(t, err)
+				assert.Empty(t, got)
+				return
+			}
+			assert.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestNewDispatcher_EmptyConfig(t *testing.T) {
 	cfg := config.PushConfig{}
 	d, err := NewDispatcher(cfg)
@@ -484,21 +523,31 @@ func (m *mockAPNsClient) PushWithContext(ctx apns2.Context, n *apns2.Notificatio
 func TestAPNsSender_SendCallPush_Success(t *testing.T) {
 	sender := newAPNsSenderWithClient(&mockAPNsClient{
 		pushFunc: func(ctx apns2.Context, n *apns2.Notification) (*apns2.Response, error) {
-			assert.Equal(t, "ios-token", n.DeviceToken)
+			assert.Equal(t, "aabbccdd", n.DeviceToken)
 			assert.Equal(t, "com.test.voip", n.Topic)
 			assert.Equal(t, apns2.PushTypeVOIP, n.PushType)
+			assert.Equal(t, apns2.PriorityHigh, n.Priority)
 			payloadJSON, err := json.Marshal(n.Payload)
 			assert.NoError(t, err)
+			assert.NotContains(t, string(payloadJSON), "aabbccdd")
 			var data map[string]interface{}
 			assert.NoError(t, json.Unmarshal(payloadJSON, &data))
 			assert.Equal(t, "call-1", data["call-id"])
 			assert.Equal(t, "550e8400-e29b-41d4-a716-446655440000", data["device-id"])
+			assert.Equal(t, "sip:bob", data["caller-uri"])
+			assert.Equal(t, "Bob", data["caller-name"])
 			assert.Equal(t, "application/call-info", data["content-type"])
+			aps, ok := data["aps"].(map[string]interface{})
+			assert.True(t, ok)
+			assert.Equal(t, float64(1), aps["content-available"])
+			assert.Equal(t, "call-1", aps["call-id"])
+			assert.NotContains(t, aps, "alert")
+			assert.NotContains(t, aps, "sound")
 			return &apns2.Response{StatusCode: 200, Reason: "OK", ApnsID: "apns-id-1"}, nil
 		},
 	}, "com.test")
 
-	err := sender.SendCallPush(context.Background(), testCallPush("ios", "ios-token", "call-1", "sip:bob", "Bob"))
+	err := sender.SendCallPush(context.Background(), testCallPush("ios", " AABBCCDD:voip ", "call-1", "sip:bob", "Bob"))
 	assert.NoError(t, err)
 }
 
@@ -509,7 +558,7 @@ func TestAPNsSender_SendCallPush_TokenInvalid(t *testing.T) {
 		},
 	}, "com.test")
 
-	err := sender.SendCallPush(context.Background(), testCallPush("ios", "dead-token", "call-1", "sip:bob", "Bob"))
+	err := sender.SendCallPush(context.Background(), testCallPush("ios", "deadbeef", "call-1", "sip:bob", "Bob"))
 	assert.Error(t, err)
 	assert.True(t, errors.Is(err, ErrTokenInvalid))
 }
@@ -521,7 +570,7 @@ func TestAPNsSender_SendCallPush_Rejected(t *testing.T) {
 		},
 	}, "com.test")
 
-	err := sender.SendCallPush(context.Background(), testCallPush("ios", "token", "call-1", "sip:bob", "Bob"))
+	err := sender.SendCallPush(context.Background(), testCallPush("ios", "cafebabe", "call-1", "sip:bob", "Bob"))
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "apns rejected")
 }
@@ -533,9 +582,23 @@ func TestAPNsSender_SendCallPush_NetworkError(t *testing.T) {
 		},
 	}, "com.test")
 
-	err := sender.SendCallPush(context.Background(), testCallPush("ios", "token", "call-1", "sip:bob", "Bob"))
+	err := sender.SendCallPush(context.Background(), testCallPush("ios", "feedface", "call-1", "sip:bob", "Bob"))
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "apns send")
+}
+
+func TestAPNsSender_SendCallPush_RejectsMalformedTokenBeforeSend(t *testing.T) {
+	called := false
+	sender := newAPNsSenderWithClient(&mockAPNsClient{
+		pushFunc: func(ctx apns2.Context, n *apns2.Notification) (*apns2.Response, error) {
+			called = true
+			return &apns2.Response{StatusCode: 200}, nil
+		},
+	}, "com.test")
+
+	err := sender.SendCallPush(context.Background(), testCallPush("ios", "not-a-token:remote", "call-1", "sip:bob", "Bob"))
+	assert.ErrorContains(t, err, "apns token")
+	assert.False(t, called)
 }
 
 func TestNewDispatcher_FCMFileNotFound(t *testing.T) {
@@ -554,9 +617,9 @@ func TestNewDispatcher_APNsFileNotFound(t *testing.T) {
 		APNsBundleID: "com.test",
 	}
 	d, err := NewDispatcher(cfg)
-	assert.NoError(t, err)
-	assert.NotNil(t, d)
-	assert.Empty(t, d.senders)
+	assert.Error(t, err)
+	assert.Nil(t, d)
+	assert.ErrorContains(t, err, "init apns")
 }
 
 func TestStartAndWorker(t *testing.T) {
@@ -608,7 +671,7 @@ func TestNewDispatcher_WithFCMAndAPNs(t *testing.T) {
 	mockFCM := newFCMSenderWithClient(&mockFCMClient{})
 	mockAPNs := newAPNsSenderWithClient(&mockAPNsClient{}, "com.test")
 	newFCM = func(string) (*FCMSender, error) { return mockFCM, nil }
-	newAPNs = func(string, string, bool) (*APNsSender, error) { return mockAPNs, nil }
+	newAPNs = func(config.PushConfig) (*APNsSender, error) { return mockAPNs, nil }
 
 	cfg := config.PushConfig{
 		FCMServiceAccount: "/fake/creds.json",
@@ -656,12 +719,12 @@ func TestNewFCMSender_Success(t *testing.T) {
 
 func TestNewAPNsSender_Success(t *testing.T) {
 	oldInit := initAPNs
-	initAPNs = func(certPath, bundleID string, production bool) (apnsClient, error) {
+	initAPNs = func(cfg config.PushConfig) (apnsClient, error) {
 		return &mockAPNsClient{}, nil
 	}
 	defer func() { initAPNs = oldInit }()
 
-	s, err := NewAPNsSender("/fake/cert.p12", "com.test", false)
+	s, err := NewAPNsSender(config.PushConfig{APNsCert: "/fake/cert.p12", APNsBundleID: "com.test"})
 	assert.NoError(t, err)
 	assert.NotNil(t, s)
 	assert.Equal(t, "com.test", s.bundleID)
@@ -669,13 +732,13 @@ func TestNewAPNsSender_Success(t *testing.T) {
 
 func TestNewAPNsSender_Production(t *testing.T) {
 	oldInit := initAPNs
-	initAPNs = func(certPath, bundleID string, production bool) (apnsClient, error) {
-		assert.True(t, production)
+	initAPNs = func(cfg config.PushConfig) (apnsClient, error) {
+		assert.True(t, cfg.APNsProduction)
 		return &mockAPNsClient{}, nil
 	}
 	defer func() { initAPNs = oldInit }()
 
-	s, err := NewAPNsSender("/fake/cert.p12", "com.test", true)
+	s, err := NewAPNsSender(config.PushConfig{APNsCert: "/fake/cert.p12", APNsBundleID: "com.test", APNsProduction: true})
 	assert.NoError(t, err)
 	assert.NotNil(t, s)
 }
@@ -713,22 +776,81 @@ func TestInitAPNs_RealFile(t *testing.T) {
 	}
 
 	t.Run("development", func(t *testing.T) {
-		client, err := initAPNs(p12Path, "com.test", false)
+		client, err := initAPNs(config.PushConfig{APNsCert: p12Path, APNsBundleID: "com.test"})
 		assert.NoError(t, err)
 		assert.NotNil(t, client)
 	})
 
 	t.Run("production", func(t *testing.T) {
-		client, err := initAPNs(p12Path, "com.test", true)
+		client, err := initAPNs(config.PushConfig{APNsCert: p12Path, APNsBundleID: "com.test", APNsProduction: true})
 		assert.NoError(t, err)
 		assert.NotNil(t, client)
 	})
 }
 
 func TestInitAPNs_ErrorPath(t *testing.T) {
-	_, err := initAPNs("/nonexistent/cert.p12", "com.test", false)
+	_, err := initAPNs(config.PushConfig{APNsCert: "/nonexistent/cert.p12", APNsBundleID: "com.test"})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "load apns cert")
+}
+
+func TestInitAPNs_CertificateAuthentication(t *testing.T) {
+	oldLoader := loadAPNsCertificate
+	defer func() { loadAPNsCertificate = oldLoader }()
+	loadAPNsCertificate = func(path, password string) (tls.Certificate, error) {
+		assert.Equal(t, "/run/secrets/voip.p12", path)
+		assert.Equal(t, "certificate-password", password)
+		return tls.Certificate{Leaf: &x509.Certificate{
+			NotBefore: time.Now().Add(-time.Hour),
+			NotAfter:  time.Now().Add(time.Hour),
+		}}, nil
+	}
+
+	client, err := initAPNs(config.PushConfig{
+		APNsCert:         "/run/secrets/voip.p12",
+		APNsCertPassword: "certificate-password",
+		APNsBundleID:     "com.test",
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, client)
+	assert.Equal(t, apns2.HostDevelopment, client.(*apns2.Client).Host)
+}
+
+func TestInitAPNs_RejectsExpiredCertificate(t *testing.T) {
+	oldLoader := loadAPNsCertificate
+	defer func() { loadAPNsCertificate = oldLoader }()
+	loadAPNsCertificate = func(string, string) (tls.Certificate, error) {
+		return tls.Certificate{Leaf: &x509.Certificate{
+			NotBefore: time.Now().Add(-2 * time.Hour),
+			NotAfter:  time.Now().Add(-time.Hour),
+		}}, nil
+	}
+
+	client, err := initAPNs(config.PushConfig{APNsCert: "voip.p12", APNsBundleID: "com.test"})
+	assert.Nil(t, client)
+	assert.ErrorContains(t, err, "expired")
+}
+
+func TestInitAPNs_TokenAuthentication(t *testing.T) {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	assert.NoError(t, err)
+	der, err := x509.MarshalPKCS8PrivateKey(privateKey)
+	assert.NoError(t, err)
+	keyPath := filepath.Join(t.TempDir(), "AuthKey_TEST.p8")
+	assert.NoError(t, os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), 0o600))
+
+	client, err := initAPNs(config.PushConfig{
+		APNsKey:        keyPath,
+		APNsKeyID:      "KEYID12345",
+		APNsTeamID:     "TEAMID1234",
+		APNsBundleID:   "com.test",
+		APNsProduction: true,
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, client)
+	tokenClient := client.(*apns2.Client)
+	assert.Equal(t, apns2.HostProduction, tokenClient.Host)
+	assert.NotEmpty(t, tokenClient.Token.Bearer)
 }
 
 func TestInitFCM_ErrorPath(t *testing.T) {

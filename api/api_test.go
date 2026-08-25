@@ -751,6 +751,119 @@ func TestRegisterDevice_ExistingDisabledStaysDisabled(t *testing.T) {
 	mockReg.AssertNotCalled(t, "Register", mock.Anything, mock.Anything)
 }
 
+func TestRegisterDevice_IOSNormalizesPushKitToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	box := newTestBox(t)
+	mockDB := new(MockQuerier)
+	mockReg := new(MockRegistrar)
+	handler := &Handler{dbQueries: mockDB, registrar: mockReg, box: box, stack: &sipstack.Stack{}}
+	deviceID := "550e8400-e29b-41d4-a716-446655440000"
+
+	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{}, pgx.ErrNoRows)
+	mockDB.On("UpsertDevice", mock.Anything, mock.MatchedBy(func(params db.UpsertDeviceParams) bool {
+		plaintext, err := box.Decrypt(params.PushToken)
+		return err == nil && params.Platform == "ios" && string(plaintext) == "aabbccdd"
+	})).Return(nil)
+	mockReg.On("Register", mock.Anything, mock.Anything).Return(nil)
+
+	r := gin.Default()
+	r.POST("/v1/devices/register", handler.RegisterDevice)
+	body, _ := json.Marshal(map[string]interface{}{
+		"device_id":         deviceID,
+		"platform":          "ios",
+		"push_token":        "11223344:remote&AABBCCDD:voip",
+		"upstream_host":     "pbx.example.com",
+		"upstream_user":     "user1",
+		"upstream_password": "secret",
+	})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/devices/register", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.NotContains(t, w.Body.String(), "AABBCCDD")
+	mockDB.AssertExpectations(t)
+}
+
+func TestRegisterDevice_IOSRequiresUsablePushToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	box := newTestBox(t)
+	deviceID := "550e8400-e29b-41d4-a716-446655440000"
+
+	tests := []struct {
+		name  string
+		token string
+	}{
+		{name: "missing"},
+		{name: "remote only", token: "11223344:remote"},
+		{name: "malformed", token: "not-hex:voip"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mockDB := new(MockQuerier)
+			mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{}, pgx.ErrNoRows)
+			handler := &Handler{dbQueries: mockDB, box: box}
+			r := gin.Default()
+			r.POST("/v1/devices/register", handler.RegisterDevice)
+			body, _ := json.Marshal(map[string]interface{}{
+				"device_id":         deviceID,
+				"platform":          "ios",
+				"push_token":        tt.token,
+				"upstream_host":     "pbx.example.com",
+				"upstream_user":     "user1",
+				"upstream_password": "secret",
+			})
+			w := httptest.NewRecorder()
+			req, _ := http.NewRequest("POST", "/v1/devices/register", bytes.NewBuffer(body))
+			req.Header.Set("Content-Type", "application/json")
+			r.ServeHTTP(w, req)
+
+			assert.Equal(t, http.StatusBadRequest, w.Code)
+			if tt.token != "" {
+				assert.NotContains(t, w.Body.String(), tt.token)
+			}
+			mockDB.AssertNotCalled(t, "UpsertDevice", mock.Anything, mock.Anything)
+		})
+	}
+}
+
+func TestRegisterDevice_ExistingIOSPreservesTokenWhenOmitted(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	box := newTestBox(t)
+	existingToken, err := box.Encrypt([]byte("aabbccdd"))
+	require.NoError(t, err)
+	mockDB := new(MockQuerier)
+	deviceID := "550e8400-e29b-41d4-a716-446655440000"
+	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
+		DeviceID:  deviceID,
+		Platform:  "ios",
+		PushToken: existingToken,
+		Disabled:  true,
+	}, nil)
+	mockDB.On("UpsertDevice", mock.Anything, mock.MatchedBy(func(params db.UpsertDeviceParams) bool {
+		return bytes.Equal(params.PushToken, existingToken)
+	})).Return(nil)
+	handler := &Handler{dbQueries: mockDB, box: box, stack: &sipstack.Stack{}}
+
+	r := gin.Default()
+	r.POST("/v1/devices/register", handler.RegisterDevice)
+	body, _ := json.Marshal(map[string]interface{}{
+		"device_id":         deviceID,
+		"platform":          "ios",
+		"upstream_host":     "pbx.example.com",
+		"upstream_user":     "user1",
+		"upstream_password": "secret",
+	})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/v1/devices/register", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	mockDB.AssertExpectations(t)
+}
+
 func TestRegisterDevice_InvalidPort(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	handler := &Handler{}
@@ -1314,6 +1427,69 @@ func TestRefreshDevice_Success_NoTokenUpdate(t *testing.T) {
 	var resp map[string]interface{}
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	assert.Equal(t, "ok", resp["status"])
+}
+
+func TestRefreshDevice_IOSNormalizesPushKitToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	box := newTestBox(t)
+	oldToken, err := box.Encrypt([]byte("00112233"))
+	require.NoError(t, err)
+	mockDB := new(MockQuerier)
+	handler := &Handler{dbQueries: mockDB, box: box}
+	deviceID := "550e8400-e29b-41d4-a716-446655440000"
+	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
+		DeviceID:          deviceID,
+		Platform:          "ios",
+		PushToken:         oldToken,
+		UpstreamUser:      "user1",
+		UpstreamHost:      "pbx.example.com",
+		UpstreamPort:      5060,
+		UpstreamTransport: "udp",
+		UpstreamPassword:  []byte("encrypted"),
+	}, nil)
+	mockDB.On("UpsertDevice", mock.Anything, mock.MatchedBy(func(params db.UpsertDeviceParams) bool {
+		plaintext, err := box.Decrypt(params.PushToken)
+		return err == nil && string(plaintext) == "aabbccdd"
+	})).Return(nil)
+
+	r := gin.Default()
+	r.PUT("/v1/devices/:device_id/refresh", handler.RefreshDevice)
+	body, _ := json.Marshal(map[string]string{"push_token": "AABBCCDD:voip&11223344:remote"})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("PUT", "/v1/devices/"+deviceID+"/refresh", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.NotContains(t, w.Body.String(), "AABBCCDD")
+	mockDB.AssertExpectations(t)
+}
+
+func TestRefreshDevice_IOSRejectsMalformedPushKitToken(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	box := newTestBox(t)
+	oldToken, err := box.Encrypt([]byte("00112233"))
+	require.NoError(t, err)
+	mockDB := new(MockQuerier)
+	handler := &Handler{dbQueries: mockDB, box: box}
+	deviceID := "550e8400-e29b-41d4-a716-446655440000"
+	mockDB.On("GetDeviceByID", mock.Anything, deviceID).Return(db.Device{
+		DeviceID:  deviceID,
+		Platform:  "ios",
+		PushToken: oldToken,
+	}, nil)
+
+	r := gin.Default()
+	r.PUT("/v1/devices/:device_id/refresh", handler.RefreshDevice)
+	body, _ := json.Marshal(map[string]string{"push_token": "11223344:remote"})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("PUT", "/v1/devices/"+deviceID+"/refresh", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	assert.NotContains(t, w.Body.String(), "11223344")
+	mockDB.AssertNotCalled(t, "UpsertDevice", mock.Anything, mock.Anything)
 }
 
 // --------------- AuthMiddleware tests ---------------

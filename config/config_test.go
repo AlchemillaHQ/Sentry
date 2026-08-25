@@ -295,3 +295,107 @@ func TestLoad_RegistrarValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestPushConfigValidate(t *testing.T) {
+	tests := []struct {
+		name      string
+		cfg       PushConfig
+		wantMode  string
+		errorText string
+	}{
+		{name: "disabled", cfg: PushConfig{}, wantMode: "disabled"},
+		{
+			name: "token authentication",
+			cfg: PushConfig{
+				APNsKey:      "/run/secrets/AuthKey_TEST.p8",
+				APNsKeyID:    "KEYID",
+				APNsTeamID:   "TEAMID",
+				APNsBundleID: "com.difuse.phone",
+			},
+			wantMode: "token",
+		},
+		{
+			name: "certificate authentication",
+			cfg: PushConfig{
+				APNsCert:         "/run/secrets/voip.p12",
+				APNsCertPassword: "secret",
+				APNsBundleID:     "com.difuse.phone",
+			},
+			wantMode: "certificate",
+		},
+		{
+			name:      "missing token key",
+			cfg:       PushConfig{APNsKeyID: "KEYID", APNsTeamID: "TEAMID", APNsBundleID: "com.difuse.phone"},
+			errorText: "apns_key",
+		},
+		{
+			name:      "missing key id",
+			cfg:       PushConfig{APNsKey: "key.p8", APNsTeamID: "TEAMID", APNsBundleID: "com.difuse.phone"},
+			errorText: "apns_key_id",
+		},
+		{
+			name:      "missing team id",
+			cfg:       PushConfig{APNsKey: "key.p8", APNsKeyID: "KEYID", APNsBundleID: "com.difuse.phone"},
+			errorText: "apns_team_id",
+		},
+		{
+			name:      "missing bundle id",
+			cfg:       PushConfig{APNsCert: "voip.p12"},
+			errorText: "apns_bundle_id",
+		},
+		{
+			name: "conflicting modes",
+			cfg: PushConfig{
+				APNsKey:      "key.p8",
+				APNsKeyID:    "KEYID",
+				APNsTeamID:   "TEAMID",
+				APNsCert:     "voip.p12",
+				APNsBundleID: "com.difuse.phone",
+			},
+			errorText: "mutually exclusive",
+		},
+		{
+			name:      "certificate password without certificate",
+			cfg:       PushConfig{APNsCertPassword: "secret", APNsBundleID: "com.difuse.phone"},
+			errorText: "apns_cert",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.cfg.Validate()
+			if tt.errorText != "" {
+				assert.ErrorContains(t, err, tt.errorText)
+				return
+			}
+			assert.NoError(t, err)
+			assert.True(t, tt.cfg.APNsEnabled() || tt.wantMode == "disabled")
+			assert.Equal(t, tt.wantMode, tt.cfg.APNsAuthMode())
+		})
+	}
+}
+
+func TestLoad_RejectsPartialAPNsConfiguration(t *testing.T) {
+	content := `
+sip:
+  external_ip: "10.0.0.1"
+push:
+  apns_key: "/run/secrets/AuthKey_TEST.p8"
+  apns_bundle_id: "com.difuse.phone"
+`
+	tmpfile, err := os.CreateTemp("", "config*.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpfile.Name())
+	if _, err := tmpfile.Write([]byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tmpfile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(tmpfile.Name())
+	assert.Nil(t, cfg)
+	assert.ErrorContains(t, err, "apns_key_id")
+}

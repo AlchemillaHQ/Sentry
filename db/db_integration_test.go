@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 
 func setupDB(t *testing.T) (*Database, func()) {
 	t.Helper()
+	testcontainers.SkipIfProviderIsNotHealthy(t)
 
 	ctx := context.Background()
 	container, err := pgtest.Run(ctx,
@@ -195,30 +197,61 @@ func TestIntegration_PruneDevices(t *testing.T) {
 	defer cleanup()
 
 	now := time.Now()
-	err := db.Queries.UpsertDevice(context.Background(), UpsertDeviceParams{
-		DeviceID:          "prune-me-0001",
-		Platform:          "android",
-		PushToken:         []byte("t"),
-		UpstreamHost:      "h",
-		UpstreamPort:      5060,
-		UpstreamTransport: "udp",
-		UpstreamUser:      "user",
-		UpstreamPassword:  []byte("p"),
-		B2buaSipUser:      "user_prune-m",
-		ExpiresAt:         pgtype.Timestamptz{Time: now.Add(-1 * time.Hour), Valid: true},
-		LastSeen:          pgtype.Timestamptz{Time: now, Valid: true},
-	})
-	require.NoError(t, err)
+	type deviceFixture struct {
+		id       string
+		platform string
+		disabled bool
+		expires  time.Time
+		pruned   bool
+	}
+	fixtures := []deviceFixture{
+		{id: "expired-android-enabled", platform: "android", expires: now.Add(-time.Hour), pruned: true},
+		{id: "expired-android-disabled", platform: "android", disabled: true, expires: now.Add(-time.Hour), pruned: true},
+		{id: "expired-ios-enabled", platform: "ios", expires: now.Add(-time.Hour), pruned: false},
+		{id: "expired-ios-disabled", platform: "ios", disabled: true, expires: now.Add(-time.Hour), pruned: true},
+		{id: "current-android-enabled", platform: "android", expires: now.Add(time.Hour), pruned: false},
+		{id: "current-ios-enabled", platform: "ios", expires: now.Add(time.Hour), pruned: false},
+	}
+
+	for index, fixture := range fixtures {
+		err := db.Queries.UpsertDevice(context.Background(), UpsertDeviceParams{
+			DeviceID:          fixture.id,
+			Platform:          fixture.platform,
+			PushToken:         []byte("t"),
+			UpstreamHost:      "h",
+			UpstreamPort:      5060,
+			UpstreamTransport: "udp",
+			UpstreamUser:      "user",
+			UpstreamPassword:  []byte("p"),
+			B2buaSipUser:      fmt.Sprintf("user_prune_%d", index),
+			ExpiresAt:         pgtype.Timestamptz{Time: fixture.expires, Valid: true},
+			LastSeen:          pgtype.Timestamptz{Time: now, Valid: true},
+		})
+		require.NoError(t, err)
+		if fixture.disabled {
+			require.NoError(t, db.Queries.SetDeviceDisabled(context.Background(), SetDeviceDisabledParams{
+				DeviceID: fixture.id,
+				Disabled: true,
+			}))
+		}
+	}
 
 	pruned, err := db.Queries.PruneDevices(context.Background(), pgtype.Timestamptz{Time: now, Valid: true})
 	require.NoError(t, err)
-	require.Equal(t, []PruneDevicesRow{{
-		DeviceID:     "prune-me-0001",
-		B2buaSipUser: "user_prune-m",
-	}}, pruned)
+	require.ElementsMatch(t, []PruneDevicesRow{
+		{DeviceID: "expired-android-enabled", B2buaSipUser: "user_prune_0"},
+		{DeviceID: "expired-android-disabled", B2buaSipUser: "user_prune_1"},
+		{DeviceID: "expired-ios-disabled", B2buaSipUser: "user_prune_3"},
+	}, pruned)
 
-	_, err = db.Queries.GetDeviceByID(context.Background(), "prune-me-0001")
-	assert.Error(t, err)
+	for _, fixture := range fixtures {
+		_, err = db.Queries.GetDeviceByID(context.Background(), fixture.id)
+		if fixture.pruned {
+			assert.Error(t, err, fixture.id)
+		} else {
+			assert.NoError(t, err, fixture.id)
+		}
+	}
 }
 
 func TestIntegration_PendingCalls(t *testing.T) {
